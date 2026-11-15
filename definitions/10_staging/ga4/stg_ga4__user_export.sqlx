@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_ga4__user_export",
+  disabled: !constants.ENABLE.user_export,
+  description: "GA4 user data export (pseudonymous_users_*), latest state per device: GA4 audiences, GA4 own predictions (purchase/churn probability) and lifetime numbers. Only with enable_user_export",
+  bigquery: {
+    clusterBy: ["user_pseudo_id"],
+    labels: { layer: "staging", source: "ga4_user_export" }
+  },
+  tags: ["ga4", "staging", "daily", "optional"],
+  columns: {
+    user_pseudo_id: "GA4 pseudo user id (pseudo_user_id in the export)",
+    ga4_audiences: "GA4 audiences the device belongs to (name + membership dates)",
+    ga4_purchase_probability_7d: "GA4 predictive metric: purchase probability in 7 days",
+    ga4_churn_probability_7d: "GA4 predictive metric: churn probability in 7 days",
+    ga4_predicted_revenue_28d_usd: "GA4 predictive metric: revenue in the next 28 days (USD)"
+  }
+}
+
+-- the user export only has rows for users that changed that day, so we look at the
+-- last 60 shards and keep the most recent row of each device.
+WITH last_shards AS (
+  SELECT
+    *,
+    PARSE_DATE('%Y%m%d', _TABLE_SUFFIX) AS shard_date
+  FROM ${ref("pseudonymous_users_*")}
+  WHERE _TABLE_SUFFIX >= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY))
+    ${privacy.suppressionFilter(ref("priv_dsr_suppression_list"), { pseudoColumn: "pseudo_user_id", userIdColumn: null })}
+)
+
+SELECT
+  pseudo_user_id AS user_pseudo_id,
+  stream_id,
+  shard_date AS snapshot_date,
+  TIMESTAMP_MICROS(user_info.last_active_timestamp_micros) AS last_active_ts,
+  TIMESTAMP_MICROS(user_info.user_first_touch_timestamp_micros) AS first_touch_ts,
+  user_info.first_purchase_date AS first_purchase_date,
+  device.category AS device_category,
+  geo.country AS geo_country,
+  geo.region AS geo_region,
+  ARRAY(
+    SELECT AS STRUCT
+      a.name AS audience_name,
+      TIMESTAMP_MICROS(a.membership_start_timestamp_micros) AS member_since,
+      TIMESTAMP_MICROS(a.membership_expiry_timestamp_micros) AS member_until
+    FROM UNNEST(audiences) AS a
+  ) AS ga4_audiences,
+  predictions.purchase_score_7d AS ga4_purchase_probability_7d,
+  predictions.churn_score_7d AS ga4_churn_probability_7d,
+  predictions.revenue_28d_in_usd AS ga4_predicted_revenue_28d_usd,
+  user_ltv.revenue_in_usd AS ga4_lifetime_revenue_usd,
+  user_ltv.sessions AS ga4_lifetime_sessions,
+  user_ltv.purchases AS ga4_lifetime_purchases,
+  privacy_info.is_ads_personalization_allowed AS ga4_ads_personalization_allowed,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM last_shards
+QUALIFY ROW_NUMBER() OVER (PARTITION BY pseudo_user_id ORDER BY shard_date DESC) = 1

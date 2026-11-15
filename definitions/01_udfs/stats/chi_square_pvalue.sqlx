@@ -1,0 +1,22 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "chi_square_pvalue",
+  description: "Upper tail p value of a chi-square statistic. Exact for df = 1, Wilson-Hilferty approximation for df > 1",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- main use: SRM (sample ratio mismatch) check in A/B tests and Benford conformity
+CREATE OR REPLACE FUNCTION ${self()}(chi2 FLOAT64, df FLOAT64) RETURNS FLOAT64 AS (
+  CASE
+    WHEN chi2 IS NULL OR df IS NULL OR df <= 0 THEN NULL
+    WHEN chi2 <= 0 THEN 1.0
+    WHEN df = 1 THEN 2 * (1 - ${ref("normal_cdf")}(SQRT(chi2)))
+    ELSE 1 - ${ref("normal_cdf")}((POW(chi2 / df, 1.0 / 3) - (1 - 2 / (9 * df))) / SQRT(2 / (9 * df)))
+  END
+)
+OPTIONS (description = "Chi-square upper tail p value")

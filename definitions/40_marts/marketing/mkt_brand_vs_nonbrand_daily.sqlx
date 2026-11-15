@@ -1,0 +1,49 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_brand_vs_nonbrand_daily",
+  description: "Paid search split in Brand x Non-brand (campaign name or term with brand terms). Brand search mostly 'harvests' demand that other channels created, non-brand creates demand. Very different ROAS, very different decisions",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH paid_search AS (
+  SELECT
+    *,
+    REGEXP_CONTAINS(CONCAT(COALESCE(LOWER(session_campaign), ''), ' ', COALESCE(LOWER(session_term), '')), r'(?i)${helpers.regexFromList(cfg_project.brand_terms, false)}') AS is_brand
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    AND session_default_channel_group IN ('Paid Search', 'Organic Search')
+    ${helpers.martSessionFilter()}
+),
+
+agg AS (
+  SELECT
+    session_date,
+    session_default_channel_group,
+    IF(is_brand, 'brand', 'non_brand') AS search_type,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM paid_search
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(new_users, sessions) AS new_user_share,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

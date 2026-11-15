@@ -1,0 +1,69 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_user_profile_360",
+  description: "Everything we know about each user in one row: identity, acquisition, lifetime numbers, RFM, lifecycle, persona, engagement and value tiers, top categories, preferred daypart, price profile and consent. The table analysts open first when somebody asks 'who are our customers?'",
+  bigquery: {
+    clusterBy: ["lifecycle_stage", "value_tier"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"]
+}
+
+WITH top_categories AS (
+  SELECT user_key, ARRAY_AGG(item_category ORDER BY affinity_rank) AS top_categories
+  FROM ${ref("seg_category_affinity")}
+  GROUP BY user_key
+)
+
+SELECT
+  u.user_key,
+  u.user_id,
+  u.is_identified,
+  u.devices,
+  u.first_seen_date,
+  u.last_seen_date,
+  u.days_since_last_seen,
+  u.first_channel,
+  u.first_custom_channel,
+  u.first_source,
+  u.first_medium,
+  u.first_campaign,
+  u.main_channel,
+  u.main_device,
+  u.first_uf,
+  u.last_uf,
+  u.sessions,
+  u.engaged_sessions,
+  u.key_events,
+  u.transactions,
+  u.lifetime_revenue,
+  u.avg_order_value,
+  u.first_purchase_date,
+  u.last_purchase_date,
+  u.days_since_last_purchase,
+  r.rfm_code,
+  r.rfm_segment,
+  l.lifecycle_stage,
+  p.main_persona,
+  p.personas,
+  t.engagement_tier,
+  t.engagement_score,
+  t.value_tier,
+  c.top_categories,
+  d.preferred_daypart,
+  d.preferred_hour,
+  ps.price_profile,
+  u.latest_consent_ads,
+  u.latest_consent_analytics,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dim_users")} AS u
+LEFT JOIN ${ref("seg_rfm")} AS r USING (user_key)
+LEFT JOIN ${ref("seg_lifecycle")} AS l USING (user_key)
+LEFT JOIN ${ref("seg_personas")} AS p USING (user_key)
+LEFT JOIN ${ref("seg_engagement_and_value_tiers")} AS t USING (user_key)
+LEFT JOIN top_categories AS c USING (user_key)
+LEFT JOIN ${ref("seg_time_of_day_profiles")} AS d USING (user_key)
+LEFT JOIN ${ref("seg_price_sensitivity")} AS ps USING (user_key)

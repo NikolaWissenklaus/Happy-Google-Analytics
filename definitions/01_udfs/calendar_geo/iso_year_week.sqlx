@@ -1,0 +1,16 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "iso_year_week",
+  description: "ISO year-week label: 2026-01-01 -> '2026-W01', 2027-01-01 -> '2026-W53'",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "calendar"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(d DATE) RETURNS STRING AS (
+  FORMAT_DATE('%G-W%V', d)
+)
+OPTIONS (description = "ISO year week label")

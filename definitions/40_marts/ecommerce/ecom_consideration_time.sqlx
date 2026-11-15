@@ -1,0 +1,73 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_consideration_time",
+  description: "How long people think before buying, per category: time from the FIRST view of the item (by the same user) to the purchase of it, and how many sessions it took. Expensive categories need longer remarketing windows",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"]
+}
+
+WITH
+first_views AS (
+  SELECT
+    s.user_key,
+    i.item_id,
+    MIN(i.event_ts) AS first_view_ts
+  FROM ${ref("stg_ga4__event_items")} AS i
+  JOIN ${ref("int_ga4__user_stitching")} AS s USING (user_pseudo_id)
+  WHERE i.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND i.event_name = 'view_item'
+    AND i.item_id IS NOT NULL
+  GROUP BY 1, 2
+),
+
+purchases AS (
+  SELECT user_key, item_id, ANY_VALUE(item_category) AS item_category, MIN(transaction_ts) AS purchase_ts
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 150 DAY)
+    AND is_valid_for_revenue
+  GROUP BY 1, 2
+),
+
+viewed_then_bought AS (
+  SELECT
+    p.user_key,
+    p.item_id,
+    p.item_category,
+    v.first_view_ts,
+    p.purchase_ts,
+    TIMESTAMP_DIFF(p.purchase_ts, v.first_view_ts, MINUTE) / 1440 AS days_to_purchase
+  FROM purchases AS p
+  JOIN first_views AS v USING (user_key, item_id)
+  WHERE v.first_view_ts <= p.purchase_ts
+),
+
+count_sessions AS (
+  SELECT
+    b.user_key,
+    b.item_id,
+    ANY_VALUE(b.item_category) AS item_category,
+    ANY_VALUE(b.days_to_purchase) AS days_to_purchase,
+    COUNT(s.session_key) AS sessions_to_purchase
+  FROM viewed_then_bought AS b
+  LEFT JOIN ${ref("fct_sessions")} AS s
+    ON s.user_key = b.user_key
+    AND s.session_start_ts BETWEEN TIMESTAMP_SUB(b.first_view_ts, INTERVAL 1 HOUR) AND b.purchase_ts
+    AND s.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 181 DAY)
+  GROUP BY 1, 2
+)
+
+SELECT
+  COALESCE(item_category, '(not set)') AS item_category,
+  COUNT(*) AS purchases_with_view,
+  APPROX_QUANTILES(days_to_purchase, 4)[OFFSET(2)] AS median_days_to_purchase,
+  APPROX_QUANTILES(days_to_purchase, 10)[OFFSET(9)] AS p90_days_to_purchase,
+  AVG(sessions_to_purchase) AS avg_sessions_to_purchase,
+  SAFE_DIVIDE(COUNTIF(days_to_purchase < 1), COUNT(*)) AS same_day_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM count_sessions
+GROUP BY 1

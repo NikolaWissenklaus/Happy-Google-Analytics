@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_costs__manual_daily",
+  description: "Manual monthly costs (cfg_costs.js) spread evenly over the days of the month",
+  bigquery: {
+    partitionBy: "cost_date",
+    labels: { layer: "staging", source: "manual" }
+  },
+  tags: ["staging", "daily", "costs"]
+}
+
+-- monthly cost / days of the month. not perfect (an influencer post is one day, not 30),
+-- but for monthly ROAS and MER it's fine. if you have the exact date, put one row per day in the config.
+SELECT
+  cost_date,
+  platform,
+  LOWER(source) AS source,
+  LOWER(medium) AS medium,
+  LOWER(campaign) AS campaign,
+  cost / EXTRACT(DAY FROM LAST_DAY(cost_month)) AS cost,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("seed_manual_costs")},
+  UNNEST(GENERATE_DATE_ARRAY(cost_month, LAST_DAY(cost_month))) AS cost_date

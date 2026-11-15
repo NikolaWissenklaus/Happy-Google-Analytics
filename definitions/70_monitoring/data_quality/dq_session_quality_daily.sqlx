@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_session_quality_daily",
+  description: "Row level quality summed up per day (last 90 days): bot suspect share, average data quality score of the sessions, share of trusted sessions and how often each quality issue and each bot signal appears",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"]
+}
+
+WITH sessions AS (
+  SELECT session_date, data_quality_score, is_trusted_session, is_bot_suspect, data_quality_issues, bot_signals
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+),
+
+issue_counts AS (
+  SELECT session_date, ARRAY_AGG(STRUCT(issue, sessions) ORDER BY sessions DESC) AS issues
+  FROM (
+    SELECT session_date, issue, COUNT(*) AS sessions
+    FROM sessions, UNNEST(data_quality_issues) AS issue
+    GROUP BY 1, 2
+  )
+  GROUP BY 1
+),
+
+signal_counts AS (
+  SELECT session_date, ARRAY_AGG(STRUCT(signal, sessions) ORDER BY sessions DESC) AS bot_signals
+  FROM (
+    SELECT session_date, signal, COUNT(*) AS sessions
+    FROM sessions, UNNEST(bot_signals) AS signal
+    GROUP BY 1, 2
+  )
+  GROUP BY 1
+)
+
+SELECT
+  s.session_date,
+  COUNT(*) AS sessions,
+  AVG(s.data_quality_score) AS avg_session_quality_score,
+  SAFE_DIVIDE(COUNTIF(s.is_trusted_session), COUNT(*)) AS trusted_share,
+  SAFE_DIVIDE(COUNTIF(s.is_bot_suspect), COUNT(*)) AS bot_suspect_share,
+  ANY_VALUE(i.issues) AS issues,
+  ANY_VALUE(b.bot_signals) AS bot_signals,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions AS s
+LEFT JOIN issue_counts AS i USING (session_date)
+LEFT JOIN signal_counts AS b USING (session_date)
+GROUP BY s.session_date

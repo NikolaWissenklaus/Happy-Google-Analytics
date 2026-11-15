@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_user_clusters",
+  disabled: !constants.ENABLE.bqml,
+  description: "Cluster of each active user (k-means) and the profile of every cluster (size and average of each feature), so somebody can give them human names",
+  bigquery: {
+    clusterBy: ["cluster_id"],
+    labels: { layer: "data_science", domain: "segments" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional"],
+  columns: {
+    row_type: "user (one row per user) | profile (one row per cluster with the averages)"
+  }
+}
+
+WITH assignments AS (
+  SELECT
+    user_key,
+    CENTROID_ID AS cluster_id,
+    NEAREST_CENTROIDS_DISTANCE[SAFE_OFFSET(0)].DISTANCE AS distance_to_centroid,
+    ${cfg_ds.features.cluster_columns.join(",\n    ")}
+  FROM ML.PREDICT(
+    MODEL ${ref("ds_model_user_clusters")},
+    (SELECT user_key, ${cfg_ds.features.cluster_columns.map(c => `COALESCE(${c}, 0) AS ${c}`).join(", ")}
+     FROM ${ref("ds_feature_snapshots")} WHERE is_current_snapshot)
+  )
+)
+
+SELECT
+  'user' AS row_type,
+  user_key,
+  cluster_id,
+  distance_to_centroid,
+  CAST(NULL AS INT64) AS cluster_users,
+  ${cfg_ds.features.cluster_columns.map(c => `CAST(${c} AS FLOAT64) AS ${c}`).join(",\n  ")},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM assignments
+
+UNION ALL
+
+SELECT
+  'profile',
+  CAST(NULL AS STRING),
+  cluster_id,
+  AVG(distance_to_centroid),
+  COUNT(*),
+  ${cfg_ds.features.cluster_columns.map(c => `AVG(${c})`).join(",\n  ")},
+  CURRENT_TIMESTAMP()
+FROM assignments
+GROUP BY cluster_id

@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_export_schema_changes",
+  description: "Every change of the GA4 export schema, shard against the previous shard: fields added, removed and leaf fields that changed type. When this table gets a new row, read the GA4 release notes and check staging (ga4.RAW_EVENT_COLUMNS)",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    change_type: "added | removed | type_changed",
+    is_used_by_staging: "The top level column is in ga4.RAW_EVENT_COLUMNS. A removed / changed one here can break stg_ga4__events"
+  }
+}
+
+WITH
+schema_rows AS (
+  SELECT shard_date, field_path, data_type
+  FROM ${ref("watch_export_schema_by_shard")}
+),
+
+shards AS (
+  SELECT shard_date, LAG(shard_date) OVER (ORDER BY shard_date) AS previous_shard
+  FROM (SELECT DISTINCT shard_date FROM schema_rows)
+),
+
+current_with_previous AS (
+  SELECT s.shard_date, s.previous_shard, r.field_path, r.data_type
+  FROM shards AS s
+  JOIN schema_rows AS r USING (shard_date)
+  WHERE s.previous_shard IS NOT NULL
+),
+
+fields_added AS (
+  SELECT c.shard_date AS change_date, c.field_path, 'added' AS change_type, c.data_type, CAST(NULL AS STRING) AS previous_data_type
+  FROM current_with_previous AS c
+  LEFT JOIN schema_rows AS p ON p.shard_date = c.previous_shard AND p.field_path = c.field_path
+  WHERE p.field_path IS NULL
+),
+
+fields_removed AS (
+  SELECT s.shard_date AS change_date, p.field_path, 'removed' AS change_type, CAST(NULL AS STRING) AS data_type, p.data_type AS previous_data_type
+  FROM shards AS s
+  JOIN schema_rows AS p ON p.shard_date = s.previous_shard
+  LEFT JOIN schema_rows AS c ON c.shard_date = s.shard_date AND c.field_path = p.field_path
+  WHERE c.field_path IS NULL
+),
+
+-- only leaf fields: a STRUCT type changes every time a child is added, that is noise
+types_changed AS (
+  SELECT c.shard_date AS change_date, c.field_path, 'type_changed' AS change_type, c.data_type, p.data_type AS previous_data_type
+  FROM current_with_previous AS c
+  JOIN schema_rows AS p ON p.shard_date = c.previous_shard AND p.field_path = c.field_path
+  WHERE p.data_type != c.data_type
+    AND NOT STARTS_WITH(c.data_type, 'STRUCT')
+    AND NOT STARTS_WITH(c.data_type, 'ARRAY<STRUCT')
+),
+
+all_changes AS (
+  SELECT * FROM fields_added
+  UNION ALL SELECT * FROM fields_removed
+  UNION ALL SELECT * FROM types_changed
+)
+
+SELECT
+  *,
+  SPLIT(field_path, '.')[OFFSET(0)] IN (${helpers.sqlList(ga4.RAW_EVENT_COLUMNS)}) AS is_used_by_staging,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_changes

@@ -1,0 +1,125 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.lifts,
+  name: "lift_activation_holdouts",
+  disabled: !cfg_lifts.holdout.enabled,
+  description: "Real incrementality of the activation (needs cfg_lifts.holdout.enabled): for every audience and every CRM trigger, people that entered after holdout.start_date, split in treated (sent) and holdout (never sent, deterministic by user), and their purchases in the next outcome_window_days. 'The abandoned cart e-mail converts 9%' means nothing, '9% vs 6.5% in the holdout, +38%, p < 0.01' means money",
+  bigquery: {
+    labels: { layer: "marts", domain: "lifts" }
+  },
+  tags: ["marts", "lifts", "daily", "activation"],
+  columns: {
+    program_type: "audience | crm_trigger",
+    relative_lift: "(purchase rate treated - holdout) / holdout",
+    incremental_buyers: "(rate treated - rate holdout) x treated users: buyers that exist because of the program",
+    incremental_revenue: "(revenue per treated user - revenue per holdout user) x treated users",
+    verdict: "works | hurts | no_clear_effect | too_small (less than holdout.min_users_per_group in a group)"
+  }
+}
+
+js {
+  const h = cfg_lifts.holdout;
+}
+
+WITH
+audience_entries AS (
+  SELECT
+    audience_name AS program,
+    user_key,
+    MIN(snapshot_date) AS entry_date
+  FROM ${ref("aud_membership_history")}
+  WHERE snapshot_date >= DATE '${h.start_date}'
+    AND consent_ads_granted
+  GROUP BY 1, 2
+),
+
+trigger_entries AS (
+  SELECT
+    trigger_name AS program,
+    user_key,
+    MIN(trigger_date) AS entry_date,
+    LOGICAL_OR(is_holdout) AS is_holdout
+  FROM ${ref("act_crm_triggers_history")}
+  WHERE trigger_date >= DATE '${h.start_date}'
+  GROUP BY 1, 2
+),
+
+cohorts AS (
+  SELECT 'audience' AS program_type, program, user_key, entry_date, ${lifts.audienceHoldout("program", "user_key")} AS is_holdout
+  FROM audience_entries
+  UNION ALL
+  SELECT 'crm_trigger', program, user_key, entry_date, is_holdout
+  FROM trigger_entries
+),
+
+-- only people that already had the whole window to buy
+mature AS (
+  SELECT *
+  FROM cohorts
+  WHERE entry_date <= DATE_SUB(${helpers.today()}, INTERVAL ${h.outcome_window_days} DAY)
+),
+
+outcomes AS (
+  SELECT
+    m.program_type,
+    m.program,
+    m.user_key,
+    m.entry_date,
+    m.is_holdout,
+    COUNT(t.transaction_id) > 0 AS purchased,
+    COALESCE(SUM(t.revenue), 0) AS revenue
+  FROM mature AS m
+  LEFT JOIN ${ref("fct_transactions")} AS t
+    ON t.user_key = m.user_key
+    AND t.is_valid_for_revenue
+    AND t.transaction_date BETWEEN m.entry_date AND DATE_ADD(m.entry_date, INTERVAL ${h.outcome_window_days} DAY)
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+groups AS (
+  SELECT
+    program_type,
+    program,
+    MIN(entry_date) AS first_cohort,
+    MAX(entry_date) AS last_cohort,
+    COUNTIF(NOT is_holdout) AS users_treated,
+    COUNTIF(is_holdout) AS users_holdout,
+    COUNTIF(NOT is_holdout AND purchased) AS buyers_treated,
+    COUNTIF(is_holdout AND purchased) AS buyers_holdout,
+    SUM(IF(NOT is_holdout, revenue, 0)) AS revenue_treated,
+    SUM(IF(is_holdout, revenue, 0)) AS revenue_holdout
+  FROM outcomes
+  GROUP BY 1, 2
+),
+
+tested AS (
+  SELECT
+    *,
+    ${ref("z_test_proportions")}(buyers_holdout, users_holdout, buyers_treated, users_treated) AS test
+  FROM groups
+)
+
+SELECT
+  program_type,
+  program,
+  first_cohort,
+  last_cohort,
+  users_treated,
+  users_holdout,
+  SAFE_DIVIDE(buyers_treated, users_treated) AS purchase_rate_treated,
+  SAFE_DIVIDE(buyers_holdout, users_holdout) AS purchase_rate_holdout,
+  test.abs_diff AS absolute_lift,
+  test.rel_uplift AS relative_lift,
+  test.p_value,
+  ROUND(test.abs_diff * users_treated, 1) AS incremental_buyers,
+  ROUND((SAFE_DIVIDE(revenue_treated, users_treated) - SAFE_DIVIDE(revenue_holdout, users_holdout)) * users_treated, 2) AS incremental_revenue,
+  CASE
+    WHEN users_treated < ${h.min_users_per_group} OR users_holdout < ${h.min_users_per_group} THEN 'too_small'
+    WHEN test.p_value < 0.05 AND test.abs_diff > 0 THEN 'works'
+    WHEN test.p_value < 0.05 THEN 'hurts'
+    ELSE 'no_clear_effect'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM tested

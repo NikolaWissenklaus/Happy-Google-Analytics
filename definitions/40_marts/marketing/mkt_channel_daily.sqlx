@@ -1,0 +1,47 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_channel_daily",
+  description: "Daily performance by channel (default and custom), source / medium and device. The table behind 80% of the marketing dashboards",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_default_channel_group", "session_source_medium"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"],
+  columns: docs.pick("session_date", "session_default_channel_group", "session_custom_channel_group", "device_category", "sessions", "users_hll", "engaged_sessions", "transactions", "key_events", "conversion_rate")
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH aggregate_by_channel AS (
+  SELECT
+    session_date,
+    session_default_channel_group,
+    session_custom_channel_group,
+    session_source,
+    session_medium,
+    session_source_medium,
+    device_category,
+    ${metrics.sessionMetrics()},
+    COUNTIF(is_carried_over) AS sessions_carried_over,
+    COUNTIF(traffic_fix_applied IS NOT NULL) AS sessions_fixed
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5, 6, 7
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregate_by_channel
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

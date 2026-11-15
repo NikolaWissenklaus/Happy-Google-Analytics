@@ -1,0 +1,40 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "easter_date",
+  description: "Easter sunday of a year (anonymous gregorian algorithm / Meeus-Jones-Butcher). Carnaval, Sexta-feira Santa and Corpus Christi come from it",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "calendar"]
+}
+
+-- easter_date(2024) = 2024-03-31, easter_date(2025) = 2025-04-20, easter_date(2026) = 2026-04-05
+-- the nested selects are just to have "variables" inside a SQL UDF
+CREATE OR REPLACE FUNCTION ${self()}(year INT64) RETURNS DATE AS ((
+  SELECT DATE(year, DIV(h + l - 7 * m + 114, 31), MOD(h + l - 7 * m + 114, 31) + 1)
+  FROM (
+    SELECT h, l, DIV(a + 11 * h + 22 * l, 451) AS m
+    FROM (
+      SELECT a, h, MOD(32 + 2 * e + 2 * i - h - k, 7) AS l
+      FROM (
+        SELECT a, e, i, k, MOD(19 * a + b - d - g + 15, 30) AS h
+        FROM (
+          SELECT a, b, d, e, i, k, DIV(b - f + 1, 3) AS g
+          FROM (
+            SELECT
+              MOD(year, 19) AS a,
+              DIV(year, 100) AS b,
+              DIV(DIV(year, 100), 4) AS d,
+              MOD(DIV(year, 100), 4) AS e,
+              DIV(DIV(year, 100) + 8, 25) AS f,
+              DIV(MOD(year, 100), 4) AS i,
+              MOD(MOD(year, 100), 4) AS k
+          )
+        )
+      )
+    )
+  )
+))
+OPTIONS (description = "Easter sunday date")

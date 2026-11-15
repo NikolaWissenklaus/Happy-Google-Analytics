@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_abandoned_cart_items",
+  description: "Items most left behind in carts (last 30 days): how many carts, value abandoned, users, and the abandonment rate of the item vs its category. High item rate with normal category rate = problem with THAT product (price, shipping, stock, size)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "cro"]
+}
+
+WITH
+cart_items AS (
+  SELECT
+    i.item_id,
+    i.session_key,
+    i.user_pseudo_id,
+    i.item_value,
+    s.has_purchase
+  FROM ${ref("stg_ga4__event_items")} AS i
+  JOIN ${ref("fct_sessions")} AS s USING (session_key)
+  WHERE i.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND s.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY)
+    AND i.event_name = 'add_to_cart'
+    AND i.item_id IS NOT NULL
+    ${helpers.martSessionFilter("s")}
+),
+
+purchased_items AS (
+  SELECT DISTINCT session_key, item_id
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND event_name = 'purchase'
+),
+
+per_item AS (
+  SELECT
+    c.item_id,
+    COUNT(DISTINCT c.session_key) AS carts,
+    COUNT(DISTINCT IF(p.item_id IS NULL, c.session_key, NULL)) AS carts_abandoned,
+    COUNT(DISTINCT IF(p.item_id IS NULL, c.user_pseudo_id, NULL)) AS users_abandoned,
+    SUM(IF(p.item_id IS NULL, c.item_value, 0)) AS abandoned_value
+  FROM cart_items AS c
+  LEFT JOIN purchased_items AS p ON p.session_key = c.session_key AND p.item_id = c.item_id
+  GROUP BY c.item_id
+)
+
+SELECT
+  p.*,
+  d.item_name,
+  d.item_brand,
+  d.item_category,
+  d.current_price,
+  SAFE_DIVIDE(p.carts_abandoned, p.carts) AS item_abandonment_rate,
+  SAFE_DIVIDE(SUM(p.carts_abandoned) OVER (PARTITION BY d.item_category), SUM(p.carts) OVER (PARTITION BY d.item_category)) AS category_abandonment_rate,
+  SAFE_DIVIDE(p.carts_abandoned, p.carts)
+    - SAFE_DIVIDE(SUM(p.carts_abandoned) OVER (PARTITION BY d.item_category), SUM(p.carts) OVER (PARTITION BY d.item_category)) AS abandonment_gap_vs_category,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_item AS p
+LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+WHERE p.carts >= 10

@@ -1,0 +1,92 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_pii_findings",
+  description: "PII scanner on the RAW GA4 export (before our masking): every string event param, user property, user_id and the manual campaign fields of the last pii_scan_days, checked for email, CPF, CNPJ, phone, CEP, card number (Luhn) and sensitive url keys. Sending PII to GA4 is against the Google terms and a LGPD problem, this table tells you where it leaks. One shot full history scan: raise pii_scan_days and run with full refresh",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["pii_kind", "field"],
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    field: "Where it was found: event_params.<key>, user_properties.<key>, user_id, collected_traffic_source.<field>",
+    pii_kind: "email | cpf | cnpj | phone_br | cep | credit_card | sensitive_url_key",
+    masked_example: "One example with the PII masked. The real value is never stored here (not even hashed, a CPF hash is reversible in minutes)"
+  }
+}
+
+js {
+  const scanOnly = cfg_privacy.params_to_scan.length > 0 ? `AND p.key IN (${helpers.sqlList(cfg_privacy.params_to_scan)})` : ``;
+}
+
+pre_operations {
+  DECLARE run_from DATE DEFAULT ${helpers.daysAgo(constants.PRIVACY.pii_scan_days)};
+  ${incremental() ? `DELETE FROM ${self()} WHERE event_date >= run_from;` : ``}
+}
+
+WITH
+raw_events AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_date,
+    event_name,
+    user_pseudo_id,
+    user_id,
+    event_params,
+    user_properties,
+    collected_traffic_source
+  FROM ${ref("events_*")}
+  WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', run_from) AND FORMAT_DATE('%Y%m%d', ${helpers.today()})
+),
+
+all_text_values AS (
+  SELECT e.event_date, e.event_name, e.user_pseudo_id, CONCAT('event_params.', p.key) AS field, p.value.string_value AS value
+  FROM raw_events AS e, UNNEST(e.event_params) AS p
+  WHERE p.value.string_value IS NOT NULL ${scanOnly}
+
+  UNION ALL
+  SELECT e.event_date, e.event_name, e.user_pseudo_id, CONCAT('user_properties.', up.key), up.value.string_value
+  FROM raw_events AS e, UNNEST(e.user_properties) AS up
+  WHERE up.value.string_value IS NOT NULL
+
+  UNION ALL
+  SELECT event_date, event_name, user_pseudo_id, 'user_id', user_id
+  FROM raw_events
+  WHERE user_id IS NOT NULL
+
+  UNION ALL
+  SELECT e.event_date, e.event_name, e.user_pseudo_id, CONCAT('collected_traffic_source.', f.name), f.value
+  FROM raw_events AS e, UNNEST([
+    STRUCT('manual_source' AS name, e.collected_traffic_source.manual_source AS value),
+    STRUCT('manual_campaign_name', e.collected_traffic_source.manual_campaign_name),
+    STRUCT('manual_term', e.collected_traffic_source.manual_term),
+    STRUCT('manual_content', e.collected_traffic_source.manual_content)
+  ]) AS f
+  WHERE f.value IS NOT NULL
+),
+
+-- cheap regex first, the UDF (with check digits) only runs on what can be PII
+maybe_pii AS (
+  SELECT *
+  FROM all_text_values
+  WHERE REGEXP_CONTAINS(value, r'@|%40|\d{3}|=|-\d{2}\b')
+),
+
+found AS (
+  SELECT *, ${ref("detect_pii")}(value) AS pii_kinds
+  FROM maybe_pii
+)
+
+SELECT
+  f.event_date,
+  f.event_name,
+  f.field,
+  kind AS pii_kind,
+  COUNT(*) AS occurrences,
+  COUNT(DISTINCT f.user_pseudo_id) AS devices,
+  ANY_VALUE(${privacy.maskForSample("f.value")}) AS masked_example,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM found AS f, UNNEST(f.pii_kinds) AS kind
+GROUP BY 1, 2, 3, 4

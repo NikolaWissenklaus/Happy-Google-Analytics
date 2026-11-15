@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_owned_channels_daily",
+  description: "Owned channels (Email & CRM, SMS & Push, WhatsApp) by campaign and content (the utm_content usually says which link / block of the email). Revenue per session is the metric the CRM team lives for",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_custom_channel_group", "campaign"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "crm"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH agg AS (
+  SELECT
+    session_date,
+    session_custom_channel_group,
+    session_source,
+    session_medium,
+    COALESCE(LOWER(session_campaign), '(not set)') AS campaign,
+    COALESCE(LOWER(session_content), '(not set)') AS content,
+    ${metrics.sessionMetrics()},
+    COUNTIF(is_identified_user) AS sessions_logged_in
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    AND session_custom_channel_group IN ('Email & CRM', 'SMS & Push', 'WhatsApp')
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5, 6
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

@@ -1,0 +1,374 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_ga4__events",
+  description: "GA4 events, one row per event. Deduplicated, typed, most used params flattened, PII masked and the known export problems fixed. Nothing downstream reads the raw export, only this table.",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name", "user_pseudo_id", "session_key"],
+    labels: { layer: "staging", source: "ga4" }
+  },
+  tags: ["ga4", "staging", "daily"],
+  columns: Object.assign(
+    docs.pick("event_id", "event_date", "event_ts", "event_datetime_local", "event_name", "user_pseudo_id", "user_id",
+      "ga_session_id", "session_key", "consent_analytics_storage", "consent_ads_storage", "transaction_id", "loaded_at"),
+    {
+      source_table_type: "daily or intraday. intraday rows only exist for days without the daily shard yet",
+      is_cookieless: "TRUE when user_pseudo_id is NULL (consent denied pings, consent mode advanced)",
+      user_id_was_hashed: "user_id looked like an email/CPF, so it was replaced by its SHA256 (LGPD)",
+      is_session_engaged: "GA4 session_engaged param (comes as '1' string or 1 int, normalized here)",
+      page_path: "page path lower case, no query string, no trailing slash. '/' for home",
+      hostname: "hostname of the event (web_info.hostname, event_dimensions.hostname or page_location)",
+      event_source: "event level source: collected_traffic_source, else source param, else utm_source of the url",
+      ga4_session_default_channel_group: "GA4 own session channel (session_traffic_source_last_click), exported since jul/2024",
+      gclid: "Google Ads click id from collected_traffic_source, gclid param or the url",
+      event_value: "value param, whatever type it was sent",
+      is_internal_traffic: "traffic_type param matches cfg_project.internal_traffic_types",
+      is_debug: "debug_mode / debug_event param present (DebugView traffic)",
+      is_non_production_host: "hostname matches staging/dev/proxy patterns (cfg_project.non_production_hostname_patterns)",
+      duplicate_count: "how many identical rows existed in the export for this event (1 = no duplicate)"
+    }
+  )
+}
+
+js {
+  const nonProdPattern = cfg_project.non_production_hostname_patterns.join("|");
+  const internalTypes = helpers.sqlList(cfg_project.internal_traffic_types);
+  const emailOrCpf = "(@|%40)|^[0-9]{3}[.]?[0-9]{3}[.]?[0-9]{3}-?[0-9]{2}$";
+}
+
+pre_operations {
+  ${helpers.incrementalDeclares({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date" })}
+  DECLARE run_to DATE DEFAULT CURRENT_DATE('${constants.TIMEZONE}');
+  DECLARE last_load TIMESTAMP DEFAULT (${incremental() ? `SELECT MAX(loaded_at) FROM ${self()}` : `SELECT CAST(NULL AS TIMESTAMP)`});
+  -- GA4 rewrites daily shards after we read them (late hits up to 72h, and sometimes
+  -- reprocessing weeks later). __TABLES__ tells us which shards changed since our last load.
+  DECLARE shards_changed_from DATE DEFAULT (
+    SELECT MIN(SAFE.PARSE_DATE('%Y%m%d', SUBSTR(table_id, 8)))
+    FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.__TABLES__`
+    WHERE REGEXP_CONTAINS(table_id, r'^events_\d{8}$')
+      AND last_load IS NOT NULL
+      AND TIMESTAMP_MILLIS(last_modified_time) > last_load
+      AND SAFE.PARSE_DATE('%Y%m%d', SUBSTR(table_id, 8)) >= DATE_SUB(run_to, INTERVAL ${constants.AUTO_BACKFILL_MAX_DAYS} DAY)
+  );
+  DECLARE last_daily_shard DATE DEFAULT (
+    SELECT MAX(SAFE.PARSE_DATE('%Y%m%d', SUBSTR(table_id, 8)))
+    FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.__TABLES__`
+    WHERE REGEXP_CONTAINS(table_id, r'^events_\d{8}$')
+  );
+  SET run_from = LEAST(run_from, COALESCE(shards_changed_from, run_from));
+  ${constants.ENABLE.retention_purge ? `-- retention purge is on: never load what priv_retention_purge would delete
+  SET run_from = GREATEST(run_from, DATE_SUB(run_to, INTERVAL ${constants.PRIVACY.retention_months} MONTH));` : ``}
+  ${helpers.incrementalApply({ self: self(), incremental: incremental(), dateColumn: "event_date" })}
+}
+
+WITH
+-- daily shards. BETWEEN with 8 digits also keeps events_intraday_* and events_fresh_* out
+raw_daily AS (
+  SELECT
+    ${ga4.rawEventColumns()},
+    'daily' AS source_table_type
+  FROM ${ref("events_*")}
+  WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', run_from) AND FORMAT_DATE('%Y%m%d', run_to)
+    -- people deleted by a LGPD request never come back (priv_dsr_deletion)
+    ${privacy.suppressionFilter(ref("priv_dsr_suppression_list"))}
+),
+
+${constants.INCLUDE_INTRADAY ? `
+-- intraday only for the days that dont have the daily shard yet (no overlap, no double count)
+raw_intraday AS (
+  SELECT
+    ${ga4.rawEventColumns()},
+    'intraday' AS source_table_type
+  FROM ${ref("events_intraday_*")}
+  WHERE _TABLE_SUFFIX BETWEEN
+    FORMAT_DATE('%Y%m%d', GREATEST(run_from, DATE_ADD(COALESCE(last_daily_shard, DATE '1970-01-01'), INTERVAL 1 DAY)))
+    AND FORMAT_DATE('%Y%m%d', run_to)
+    ${privacy.suppressionFilter(ref("priv_dsr_suppression_list"))}
+),` : ``}
+
+raw_base AS (
+  SELECT * FROM raw_daily
+  ${constants.INCLUDE_INTRADAY ? `UNION ALL
+  SELECT * FROM raw_intraday` : ``}
+),
+
+add_event_id AS (
+  SELECT
+    *,
+    ${ga4.eventIdExpr()} AS event_id
+  FROM raw_base
+),
+
+-- exact duplicates happen (same row 2x in the export). keep one, remember how many there were
+remove_duplicates AS (
+  SELECT
+    *,
+    COUNT(*) OVER (PARTITION BY event_id) AS duplicate_count
+  FROM add_event_id
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY IF(source_table_type = 'daily', 0, 1)) = 1
+),
+
+pull_params AS (
+  SELECT
+    e.*,
+    ${ga4.paramInt("ga_session_id")} AS p_ga_session_id,
+    ${ga4.paramInt("ga_session_number")} AS p_ga_session_number,
+    ${ga4.paramInt("session_engaged")} AS p_session_engaged,
+    ${ga4.paramInt("engagement_time_msec")} AS p_engagement_time_msec,
+    ${ga4.paramInt("entrances")} AS p_entrances,
+    ${ga4.paramStr("page_location")} AS p_page_location,
+    ${ga4.paramStr("page_referrer")} AS p_page_referrer,
+    ${ga4.paramStr("page_title")} AS p_page_title,
+    ${ga4.paramStr("content_group")} AS p_content_group,
+    ${ga4.paramStr("firebase_screen")} AS p_screen_name,
+    ${ga4.paramStr("firebase_screen_class")} AS p_screen_class,
+    ${ga4.paramStr("source")} AS p_source,
+    ${ga4.paramStr("medium")} AS p_medium,
+    ${ga4.paramStr("campaign")} AS p_campaign,
+    ${ga4.paramStr("term")} AS p_term,
+    ${ga4.paramStr("content")} AS p_content,
+    ${ga4.paramStr("gclid")} AS p_gclid,
+    ${ga4.paramAny("ignore_referrer")} AS p_ignore_referrer,
+    ${ga4.paramStr("currency")} AS p_currency,
+    ${ga4.paramNum("value")} AS p_value,
+    ${ga4.paramAny("transaction_id")} AS p_transaction_id,
+    ${ga4.paramStr("coupon")} AS p_coupon,
+    ${ga4.paramStr("payment_type")} AS p_payment_type,
+    ${ga4.paramStr("shipping_tier")} AS p_shipping_tier,
+    ${ga4.paramNum("shipping")} AS p_shipping,
+    ${ga4.paramNum("tax")} AS p_tax,
+    ${ga4.paramStr("search_term")} AS p_search_term,
+    ${ga4.paramStr("link_url")} AS p_link_url,
+    ${ga4.paramStr("link_domain")} AS p_link_domain,
+    ${ga4.paramStr("link_text")} AS p_link_text,
+    ${ga4.paramAny("outbound")} AS p_outbound,
+    ${ga4.paramStr("file_name")} AS p_file_name,
+    ${ga4.paramStr("file_extension")} AS p_file_extension,
+    ${ga4.paramStr("video_title")} AS p_video_title,
+    ${ga4.paramStr("video_provider")} AS p_video_provider,
+    ${ga4.paramInt("video_percent")} AS p_video_percent,
+    ${ga4.paramAny("form_id")} AS p_form_id,
+    ${ga4.paramStr("form_name")} AS p_form_name,
+    ${ga4.paramStr("form_destination")} AS p_form_destination,
+    ${ga4.paramInt("percent_scrolled")} AS p_percent_scrolled,
+    ${ga4.paramStr("method")} AS p_method,
+    ${ga4.paramStr("content_type")} AS p_content_type,
+    ${ga4.paramStr("item_list_name")} AS p_item_list_name,
+    ${ga4.paramStr("promotion_name")} AS p_promotion_name,
+    ${ga4.paramStr("creative_name")} AS p_creative_name,
+    ${ga4.paramInt("fatal")} AS p_fatal,
+    ${ga4.paramAny("debug_mode")} AS p_debug_mode,
+    ${ga4.paramAny("debug_event")} AS p_debug_event,
+    ${ga4.paramStr("traffic_type")} AS p_traffic_type
+  FROM remove_duplicates AS e
+),
+
+-- PII never leaves this CTE unmasked (LGPD by design). the raw export keeps it,
+-- that's why priv_pii_findings scans the raw export and not this table
+fix_urls AS (
+  SELECT
+    *,
+    ${ga4.maybeMask("p_page_location")} AS page_location_masked,
+    ${ga4.maybeMask("p_page_referrer")} AS page_referrer_masked,
+    ${ga4.maybeMask("p_page_title")} AS page_title_masked,
+    ${ga4.maybeMask("p_link_url")} AS link_url_masked,
+    ${ga4.maybeMask("LOWER(TRIM(REPLACE(p_search_term, '+', ' ')))")} AS search_term_masked
+  FROM pull_params
+),
+
+fix_values AS (
+  SELECT
+    *,
+    ${ga4.urlHost("page_location_masked")} AS page_hostname_parsed,
+    ${ga4.cleanTraffic(`COALESCE(collected_traffic_source.manual_source, p_source, ${ga4.utmValue("page_location_masked", "utm_source")})`)} AS event_source_clean,
+    ${ga4.cleanTraffic(`COALESCE(collected_traffic_source.manual_medium, p_medium, ${ga4.utmValue("page_location_masked", "utm_medium")})`)} AS event_medium_clean,
+    ${ga4.cleanTraffic(`COALESCE(collected_traffic_source.manual_campaign_name, p_campaign, ${ga4.utmValue("page_location_masked", "utm_campaign")})`)} AS event_campaign_clean,
+    ${ga4.cleanString("user_id")} AS user_id_clean
+  FROM fix_urls
+)
+
+SELECT
+  -- ids and time
+  event_id,
+  PARSE_DATE('%Y%m%d', event_date) AS event_date,
+  TIMESTAMP_MICROS(event_timestamp) AS event_ts,
+  DATETIME(TIMESTAMP_MICROS(event_timestamp), '${constants.TIMEZONE}') AS event_datetime_local,
+  event_timestamp,
+  event_name,
+  stream_id,
+  platform,
+  source_table_type,
+
+  -- user
+  user_pseudo_id,
+  IF(REGEXP_CONTAINS(LOWER(user_id_clean), r'${emailOrCpf}') AND ${constants.MASK_PII}, TO_HEX(SHA256(LOWER(user_id_clean))), user_id_clean) AS user_id,
+  COALESCE(REGEXP_CONTAINS(LOWER(user_id_clean), r'${emailOrCpf}') AND ${constants.MASK_PII}, FALSE) AS user_id_was_hashed,
+  user_pseudo_id IS NULL AS is_cookieless,
+  TIMESTAMP_MICROS(user_first_touch_timestamp) AS user_first_touch_ts,
+  user_ltv.revenue AS user_ltv_revenue,
+  user_ltv.currency AS user_ltv_currency,
+  is_active_user,
+
+  -- session
+  p_ga_session_id AS ga_session_id,
+  p_ga_session_number AS ga_session_number,
+  ${ga4.sessionKey("user_pseudo_id", "p_ga_session_id")} AS session_key,
+  COALESCE(p_session_engaged = 1, FALSE) AS is_session_engaged,
+  p_engagement_time_msec AS engagement_time_msec,
+  p_entrances AS entrances,
+
+  -- page / screen
+  page_location_masked AS page_location,
+  COALESCE(page_hostname_parsed, LOWER(device.web_info.hostname)) AS page_hostname,
+  IF(page_location_masked IS NULL, NULL, ${ga4.urlPath("page_location_masked")}) AS page_path,
+  ${ga4.urlQuery("page_location_masked")} AS page_query,
+  page_title_masked AS page_title,
+  page_referrer_masked AS page_referrer,
+  ${ga4.urlHost("page_referrer_masked")} AS referrer_hostname,
+  ${ga4.cleanString("p_content_group")} AS content_group,
+  p_screen_name AS screen_name,
+  p_screen_class AS screen_class,
+  COALESCE(LOWER(device.web_info.hostname), LOWER(event_dimensions.hostname), page_hostname_parsed) AS hostname,
+
+  -- event level traffic (the raw material for the session attribution)
+  event_source_clean AS event_source,
+  event_medium_clean AS event_medium,
+  event_campaign_clean AS event_campaign,
+  COALESCE(collected_traffic_source.manual_campaign_id, ${ga4.urlParam("page_location_masked", "utm_id")}) AS event_campaign_id,
+  ${ga4.cleanTraffic(`COALESCE(collected_traffic_source.manual_term, p_term, ${ga4.utmValue("page_location_masked", "utm_term")})`)} AS event_term,
+  ${ga4.cleanTraffic(`COALESCE(collected_traffic_source.manual_content, p_content, ${ga4.utmValue("page_location_masked", "utm_content")})`)} AS event_content,
+  LOWER(collected_traffic_source.manual_source_platform) AS event_source_platform,
+  LOWER(collected_traffic_source.manual_creative_format) AS event_creative_format,
+  LOWER(collected_traffic_source.manual_marketing_tactic) AS event_marketing_tactic,
+  ${ga4.utmValue("page_location_masked", "utm_source")} AS utm_source,
+  ${ga4.utmValue("page_location_masked", "utm_medium")} AS utm_medium,
+  ${ga4.utmValue("page_location_masked", "utm_campaign")} AS utm_campaign,
+  ${ga4.utmValue("page_location_masked", "utm_term")} AS utm_term,
+  ${ga4.utmValue("page_location_masked", "utm_content")} AS utm_content,
+  ${ga4.urlParam("page_location_masked", "utm_id")} AS utm_id,
+  COALESCE(collected_traffic_source.gclid, p_gclid, ${ga4.urlParam("page_location_masked", "gclid")}) AS gclid,
+  ${ga4.urlParam("page_location_masked", "gbraid")} AS gbraid,
+  ${ga4.urlParam("page_location_masked", "wbraid")} AS wbraid,
+  COALESCE(collected_traffic_source.dclid, ${ga4.urlParam("page_location_masked", "dclid")}) AS dclid,
+  COALESCE(collected_traffic_source.srsltid, ${ga4.urlParam("page_location_masked", "srsltid")}) AS srsltid,
+  ${ga4.urlParam("page_location_masked", "fbclid")} AS fbclid,
+  ${ga4.urlParam("page_location_masked", "msclkid")} AS msclkid,
+  ${ga4.urlParam("page_location_masked", "ttclid")} AS ttclid,
+  COALESCE(LOWER(p_ignore_referrer) IN ('true', '1'), FALSE) AS ignore_referrer,
+
+  -- what GA4 itself says about the session (exported since jul/2024). great to reconcile with ours
+  LOWER(session_traffic_source_last_click.cross_channel_campaign.source) AS ga4_session_source,
+  LOWER(session_traffic_source_last_click.cross_channel_campaign.medium) AS ga4_session_medium,
+  session_traffic_source_last_click.cross_channel_campaign.campaign_name AS ga4_session_campaign,
+  session_traffic_source_last_click.cross_channel_campaign.campaign_id AS ga4_session_campaign_id,
+  session_traffic_source_last_click.cross_channel_campaign.default_channel_group AS ga4_session_default_channel_group,
+  session_traffic_source_last_click.cross_channel_campaign.primary_channel_group AS ga4_session_primary_channel_group,
+  session_traffic_source_last_click.google_ads_campaign.customer_id AS google_ads_customer_id,
+  session_traffic_source_last_click.google_ads_campaign.account_name AS google_ads_account_name,
+  session_traffic_source_last_click.google_ads_campaign.campaign_id AS google_ads_campaign_id,
+  session_traffic_source_last_click.google_ads_campaign.campaign_name AS google_ads_campaign_name,
+  session_traffic_source_last_click.google_ads_campaign.ad_group_id AS google_ads_ad_group_id,
+  session_traffic_source_last_click.google_ads_campaign.ad_group_name AS google_ads_ad_group_name,
+
+  -- first user acquisition (user scoped, from the export)
+  LOWER(traffic_source.source) AS first_user_source,
+  LOWER(traffic_source.medium) AS first_user_medium,
+  traffic_source.name AS first_user_campaign,
+
+  -- device / geo / app
+  LOWER(device.category) AS device_category,
+  device.operating_system AS device_os,
+  device.operating_system_version AS device_os_version,
+  COALESCE(device.web_info.browser, device.browser) AS device_browser,
+  COALESCE(device.web_info.browser_version, device.browser_version) AS device_browser_version,
+  LOWER(device.language) AS device_language,
+  device.mobile_brand_name AS device_brand,
+  device.mobile_model_name AS device_model,
+  device.mobile_marketing_name AS device_marketing_name,
+  device.is_limited_ad_tracking AS is_limited_ad_tracking,
+  geo.continent AS geo_continent,
+  geo.sub_continent AS geo_sub_continent,
+  geo.country AS geo_country,
+  geo.region AS geo_region,
+  geo.city AS geo_city,
+  geo.metro AS geo_metro,
+  app_info.id AS app_id,
+  app_info.version AS app_version,
+  app_info.install_source AS app_install_source,
+
+  -- consent (LGPD)
+  ${ga4.consentState("privacy_info.analytics_storage")} AS consent_analytics_storage,
+  ${ga4.consentState("privacy_info.ads_storage")} AS consent_ads_storage,
+  privacy_info.uses_transient_token AS uses_transient_token,
+
+  -- ecommerce
+  ${ga4.cleanId("COALESCE(ecommerce.transaction_id, p_transaction_id)")} AS transaction_id,
+  NULLIF(UPPER(TRIM(p_currency)), '') AS currency,
+  p_value AS event_value,
+  event_value_in_usd,
+  ecommerce.purchase_revenue AS purchase_revenue,
+  ecommerce.purchase_revenue_in_usd AS purchase_revenue_in_usd,
+  ecommerce.refund_value AS refund_value,
+  ecommerce.refund_value_in_usd AS refund_value_in_usd,
+  COALESCE(ecommerce.shipping_value, p_shipping) AS shipping_value,
+  ecommerce.shipping_value_in_usd AS shipping_value_in_usd,
+  COALESCE(ecommerce.tax_value, p_tax) AS tax_value,
+  ecommerce.tax_value_in_usd AS tax_value_in_usd,
+  ecommerce.total_item_quantity AS total_item_quantity,
+  ecommerce.unique_items AS unique_items,
+  NULLIF(UPPER(TRIM(${ga4.cleanString("p_coupon")})), '') AS coupon,
+  LOWER(${ga4.cleanString("p_payment_type")}) AS payment_type,
+  LOWER(${ga4.cleanString("p_shipping_tier")}) AS shipping_tier,
+  ARRAY_LENGTH(items) AS items_count,
+  items,
+
+  -- enhanced measurement and friends
+  NULLIF(search_term_masked, '') AS search_term,
+  link_url_masked AS link_url,
+  LOWER(p_link_domain) AS link_domain,
+  p_link_text AS link_text,
+  COALESCE(LOWER(p_outbound) IN ('true', '1'), FALSE) AS is_outbound,
+  p_file_name AS file_name,
+  LOWER(p_file_extension) AS file_extension,
+  p_video_title AS video_title,
+  LOWER(p_video_provider) AS video_provider,
+  p_video_percent AS video_percent,
+  p_form_id AS form_id,
+  p_form_name AS form_name,
+  p_form_destination AS form_destination,
+  p_percent_scrolled AS percent_scrolled,
+  LOWER(p_method) AS method,
+  LOWER(p_content_type) AS content_type,
+  p_item_list_name AS item_list_name,
+  p_promotion_name AS promotion_name,
+  p_creative_name AS creative_name,
+  COALESCE(p_fatal = 1, FALSE) AS is_fatal_exception,
+
+  -- noise flags. kept here, removed from sessions on (data quality wants to see them)
+  p_traffic_type AS traffic_type,
+  COALESCE(LOWER(p_traffic_type) IN (${internalTypes}), FALSE) AS is_internal_traffic,
+  COALESCE(LOWER(p_debug_mode) IN ('1', 'true') OR LOWER(p_debug_event) IN ('1', 'true'), FALSE) AS is_debug,
+  COALESCE(REGEXP_CONTAINS(COALESCE(LOWER(device.web_info.hostname), page_hostname_parsed, ''), r'${nonProdPattern}'), FALSE) AS is_non_production_host,
+
+  -- raw technical stuff
+  event_server_timestamp_offset,
+  TIMESTAMP_MICROS(event_previous_timestamp) AS event_previous_ts,
+  event_bundle_sequence_id,
+  batch_event_index,
+  batch_page_id,
+  batch_ordering_id,
+  duplicate_count,
+
+  -- the full arrays, for whatever custom param you need later (masked too)
+  ${ga4.maskedParams("event_params")} AS event_params,
+  ${ga4.maskedUserProperties("user_properties")} AS user_properties,
+
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fix_values
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

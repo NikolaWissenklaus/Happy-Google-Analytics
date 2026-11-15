@@ -1,0 +1,135 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_feature_snapshots",
+  description: "Feature store for the predictive models: one row per user per weekly snapshot (cfg_ds.features), features ONLY from before the snapshot and labels ONLY from after (no leakage). The current snapshot (today) has the features and no labels: that is the scoring set",
+  bigquery: {
+    partitionBy: "snapshot_date",
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "features" }
+  },
+  tags: ["data_science", "features", "daily"],
+  columns: {
+    will_purchase_7d: "Label: 1 if the user purchased in [snapshot, snapshot + propensity horizon)",
+    churned_30d: "Label (customers only): 1 if no session in [snapshot, snapshot + churn horizon)",
+    future_revenue_90d: "Label: revenue in [snapshot, snapshot + ltv horizon)",
+    is_current_snapshot: "TRUE = today, labels unknown, used for scoring"
+  }
+}
+
+js {
+  const f = cfg_ds.features;
+  // propensity and churn labels need this many days of future. LTV needs more, it gets NULL on the recent snapshots
+  const horizonMax = Math.max(cfg_ds.propensity.horizon_days, cfg_ds.churn.horizon_days);
+}
+
+WITH
+snapshots AS (
+  SELECT CURRENT_DATE('${constants.TIMEZONE}') AS snapshot_date, TRUE AS is_current_snapshot
+  UNION ALL
+  -- training snapshots: only the ones whose label window is already complete
+  SELECT DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL ${horizonMax} + n * ${f.snapshot_every_days} DAY), FALSE
+  FROM UNNEST(GENERATE_ARRAY(0, ${f.training_snapshots - 1})) AS n
+),
+
+sessions AS (
+  SELECT user_key, session_date, session_start_ts, is_engaged, engagement_time_sec, page_views, screen_views,
+         view_item_events, has_add_to_cart, has_begin_checkout, has_site_search, has_purchase, session_default_channel_group,
+         device_category, is_identified_user, platform
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL ${f.lookback_days + horizonMax + f.training_snapshots * f.snapshot_every_days} DAY)
+    ${helpers.martSessionFilter()}
+),
+
+orders AS (
+  SELECT user_key, transaction_date, revenue, coupon
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+),
+
+behaviour AS (
+  SELECT
+    sn.snapshot_date,
+    sn.is_current_snapshot,
+    s.user_key,
+    COUNTIF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 7 DAY)) AS sessions_7d,
+    COUNTIF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY)) AS sessions_30d,
+    COUNT(*) AS sessions_90d,
+    COUNTIF(s.is_engaged AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY)) AS engaged_sessions_30d,
+    SUM(IF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY), s.engagement_time_sec, 0)) AS engagement_sec_30d,
+    SUM(IF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY), s.page_views + s.screen_views, 0)) AS views_30d,
+    SUM(IF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY), s.view_item_events, 0)) AS product_views_30d,
+    COUNTIF(s.has_add_to_cart AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY)) AS cart_sessions_30d,
+    COUNTIF(s.has_add_to_cart AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 7 DAY)) AS cart_sessions_7d,
+    COUNTIF(s.has_begin_checkout AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY)) AS checkout_sessions_30d,
+    COUNTIF(s.has_site_search AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY)) AS search_sessions_30d,
+    COUNT(DISTINCT IF(s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL 30 DAY), s.session_date, NULL)) AS active_days_30d,
+    COUNT(DISTINCT s.session_default_channel_group) AS distinct_channels_90d,
+    DATE_DIFF(sn.snapshot_date, MAX(s.session_date), DAY) AS days_since_last_session,
+    APPROX_TOP_COUNT(s.session_default_channel_group, 1)[OFFSET(0)].value AS main_channel,
+    APPROX_TOP_COUNT(s.device_category, 1)[OFFSET(0)].value AS main_device,
+    LOGICAL_OR(s.is_identified_user) AS is_identified,
+    LOGICAL_OR(s.platform IN ('ANDROID', 'IOS')) AS uses_app
+  FROM snapshots AS sn
+  JOIN sessions AS s
+    ON s.session_date < sn.snapshot_date
+    AND s.session_date >= DATE_SUB(sn.snapshot_date, INTERVAL ${f.lookback_days} DAY)
+  GROUP BY 1, 2, 3
+),
+
+purchase_history AS (
+  SELECT
+    sn.snapshot_date,
+    o.user_key,
+    COUNT(*) AS purchases_before,
+    SUM(o.revenue) AS revenue_before,
+    DATE_DIFF(sn.snapshot_date, MAX(o.transaction_date), DAY) AS days_since_last_purchase,
+    SAFE_DIVIDE(COUNTIF(o.coupon IS NOT NULL), COUNT(*)) AS coupon_share_before
+  FROM snapshots AS sn
+  JOIN orders AS o ON o.transaction_date < sn.snapshot_date
+  GROUP BY 1, 2
+),
+
+labels AS (
+  SELECT
+    sn.snapshot_date,
+    s.user_key,
+    MAX(IF(s.has_purchase AND s.session_date < DATE_ADD(sn.snapshot_date, INTERVAL ${cfg_ds.propensity.horizon_days} DAY), 1, 0)) AS will_purchase_7d,
+    MAX(IF(s.session_date < DATE_ADD(sn.snapshot_date, INTERVAL ${cfg_ds.churn.horizon_days} DAY), 1, 0)) AS had_session_in_churn_window
+  FROM snapshots AS sn
+  JOIN sessions AS s
+    ON s.session_date >= sn.snapshot_date
+    AND s.session_date < DATE_ADD(sn.snapshot_date, INTERVAL ${horizonMax} DAY)
+  WHERE NOT sn.is_current_snapshot
+  GROUP BY 1, 2
+),
+
+future_revenue AS (
+  SELECT sn.snapshot_date, o.user_key, SUM(o.revenue) AS future_revenue_90d
+  FROM snapshots AS sn
+  JOIN orders AS o
+    ON o.transaction_date >= sn.snapshot_date
+    AND o.transaction_date < DATE_ADD(sn.snapshot_date, INTERVAL ${cfg_ds.ltv.horizon_days} DAY)
+  WHERE NOT sn.is_current_snapshot
+  GROUP BY 1, 2
+)
+
+SELECT
+  b.*,
+  COALESCE(p.purchases_before, 0) AS purchases_before,
+  COALESCE(p.revenue_before, 0) AS revenue_before,
+  p.days_since_last_purchase,
+  COALESCE(p.coupon_share_before, 0) AS coupon_share_before,
+  SAFE_DIVIDE(p.revenue_before, p.purchases_before) AS avg_order_value_before,
+  COALESCE(p.purchases_before, 0) > 0 AS is_customer,
+  IF(b.is_current_snapshot, NULL, COALESCE(l.will_purchase_7d, 0)) AS will_purchase_7d,
+  IF(b.is_current_snapshot OR COALESCE(p.purchases_before, 0) = 0, NULL, 1 - COALESCE(l.had_session_in_churn_window, 0)) AS churned_30d,
+  IF(b.is_current_snapshot OR b.snapshot_date > DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL ${cfg_ds.ltv.horizon_days} DAY),
+    NULL, COALESCE(r.future_revenue_90d, 0)) AS future_revenue_90d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM behaviour AS b
+LEFT JOIN purchase_history AS p USING (snapshot_date, user_key)
+LEFT JOIN labels AS l USING (snapshot_date, user_key)
+LEFT JOIN future_revenue AS r USING (snapshot_date, user_key)

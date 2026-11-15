@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_device_gap",
+  description: "Mobile vs desktop gap per landing page type and per top landing pages (last 30 days): conversion of each device, the gap, and the money if mobile converted at least 70% of desktop (a realistic target, mobile never matches desktop in Brazil)",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily"]
+}
+
+WITH
+by_page AS (
+  SELECT
+    landing_page_type,
+    landing_page_path,
+    COUNTIF(device_category = 'mobile') AS mobile_sessions,
+    COUNTIF(device_category = 'desktop') AS desktop_sessions,
+    COUNTIF(device_category = 'mobile' AND has_purchase) AS mobile_conversions,
+    COUNTIF(device_category = 'desktop' AND has_purchase) AS desktop_conversions,
+    SAFE_DIVIDE(SUM(IF(device_category = 'mobile', revenue, 0)), SUM(IF(device_category = 'mobile', transactions, 0))) AS mobile_aov
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(mobile_conversions, mobile_sessions) AS mobile_conversion_rate,
+  SAFE_DIVIDE(desktop_conversions, desktop_sessions) AS desktop_conversion_rate,
+  SAFE_DIVIDE(SAFE_DIVIDE(mobile_conversions, mobile_sessions), SAFE_DIVIDE(desktop_conversions, desktop_sessions)) AS mobile_to_desktop_ratio,
+  GREATEST(0.7 * SAFE_DIVIDE(desktop_conversions, desktop_sessions) - SAFE_DIVIDE(mobile_conversions, mobile_sessions), 0) * mobile_sessions * COALESCE(mobile_aov, 0) AS revenue_opportunity_30d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM by_page
+WHERE mobile_sessions >= 200 AND desktop_sessions >= 100

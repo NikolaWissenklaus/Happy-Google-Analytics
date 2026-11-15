@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_ai_assistant_traffic",
+  description: "Traffic from AI assistants (ChatGPT, Perplexity, Gemini, Copilot, Claude, DeepSeek...) by day, assistant and landing page. GA4 still calls it 'Referral', but this channel grows every month and the content team wants to know which pages the AIs recommend",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["ai_assistant"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "seo"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH ai_sessions AS (
+  SELECT
+    *,
+    -- session_only: we want the session that really came from the assistant, not the carry over
+    session_source_only AS ai_assistant
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    AND ${channels.isAiAssistant("session_source_only")}
+    ${helpers.martSessionFilter()}
+),
+
+agg AS (
+  SELECT
+    session_date,
+    ai_assistant,
+    landing_page_path,
+    landing_page_type,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM ai_sessions
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

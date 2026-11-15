@@ -1,0 +1,81 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_path_exploration",
+  description: "GA4 Explorations > Path exploration, for every session at once (last 30 days): the first 5 steps of the session as page titles AND as event names (consecutive repeats collapsed, like GA4 does), with sessions and conversion of each path. Feed it to a Sankey",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily"],
+  columns: {
+    node_type: "page_title | event_name",
+    step_1: "First node (session start = first page / first meaningful event)"
+  }
+}
+
+WITH
+page_steps AS (
+  SELECT
+    session_key,
+    ARRAY(
+      SELECT t FROM (
+        SELECT t, pos, LAG(t) OVER (ORDER BY pos) AS previous_t
+        FROM UNNEST(titles) AS t WITH OFFSET AS pos
+      )
+      WHERE previous_t IS NULL OR previous_t != t
+      ORDER BY pos
+      LIMIT 5
+    ) AS nodes
+  FROM (
+    SELECT session_key, ARRAY_AGG(COALESCE(page_title, page_path) ORDER BY page_number) AS titles
+    FROM ${ref("int_ga4__page_views")}
+    WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    GROUP BY session_key
+  )
+),
+
+event_steps AS (
+  SELECT
+    session_key,
+    ARRAY(
+      SELECT e FROM (
+        SELECT e, pos, LAG(e) OVER (ORDER BY pos) AS previous_e
+        FROM UNNEST(names) AS e WITH OFFSET AS pos
+      )
+      WHERE previous_e IS NULL OR previous_e != e
+      ORDER BY pos
+      LIMIT 5
+    ) AS nodes
+  FROM (
+    SELECT session_key, ARRAY_AGG(event_name ORDER BY event_ts, batch_ordering_id) AS names
+    FROM ${ref("stg_ga4__events")}
+    WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+      AND session_key IS NOT NULL
+      AND event_name NOT IN ('user_engagement', 'first_visit', 'scroll')
+      ${helpers.noiseFilter()}
+    GROUP BY session_key
+  )
+),
+
+all_paths AS (
+  SELECT 'page_title' AS node_type, session_key, nodes FROM page_steps
+  UNION ALL
+  SELECT 'event_name', session_key, nodes FROM event_steps
+)
+
+SELECT
+  p.node_type,
+  p.nodes[SAFE_OFFSET(0)] AS step_1,
+  p.nodes[SAFE_OFFSET(1)] AS step_2,
+  p.nodes[SAFE_OFFSET(2)] AS step_3,
+  p.nodes[SAFE_OFFSET(3)] AS step_4,
+  p.nodes[SAFE_OFFSET(4)] AS step_5,
+  COUNT(*) AS sessions,
+  SAFE_DIVIDE(COUNTIF(s.has_purchase), COUNT(*)) AS conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_paths AS p
+LEFT JOIN ${ref("fct_sessions")} AS s USING (session_key)
+GROUP BY 1, 2, 3, 4, 5, 6
+HAVING COUNT(*) >= 10

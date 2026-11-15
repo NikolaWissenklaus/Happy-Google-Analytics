@@ -1,0 +1,101 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_conversion_paths",
+  description: "One row per conversion (counted key event) with the ordered path of touches of the user inside the lookback window (conversion_lookback_days). Base of every attribution model and of the GA4 'Conversion paths' / UA MCF reports",
+  bigquery: {
+    partitionBy: "conversion_date",
+    clusterBy: ["key_event_name"],
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily"],
+  columns: {
+    touches: "Ordered array of touches (session, channel, source/medium, campaign, days before the conversion)",
+    channel_path: "'Paid Search > Email > Direct'",
+    channel_path_dedup: "Same path without consecutive repetitions: 'Email > Email > Direct' -> 'Email > Direct'",
+    time_lag_days: "Days between the first touch of the path and the conversion",
+    last_non_direct_index: "Position of the last non-direct touch (NULL when the path is only direct)",
+    first_cart_index: "Position of the first touch with add_to_cart (milestone of the W-shaped model)"
+  }
+}
+
+WITH
+conversions AS (
+  SELECT
+    key_event_id AS conversion_id,
+    key_event_name,
+    is_primary,
+    user_key,
+    event_ts AS conversion_ts,
+    event_date AS conversion_date,
+    key_event_value AS conversion_value,
+    session_key AS conversion_session_key
+  FROM ${ref("fct_key_events")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+    AND NOT is_bot_suspect
+),
+
+touches_in_window AS (
+  SELECT
+    c.conversion_id,
+    t.session_key,
+    t.session_start_ts,
+    t.channel,
+    t.source_medium,
+    t.campaign,
+    t.is_direct,
+    t.has_add_to_cart,
+    TIMESTAMP_DIFF(c.conversion_ts, t.session_start_ts, SECOND) / 86400 AS days_before_conversion
+  FROM conversions AS c
+  JOIN ${ref("attr_touchpoints")} AS t
+    ON t.user_key = c.user_key
+    AND t.session_start_ts <= c.conversion_ts
+    AND t.session_start_ts >= TIMESTAMP_SUB(c.conversion_ts, INTERVAL ${constants.CONVERSION_LOOKBACK_DAYS} DAY)
+),
+
+build_paths AS (
+  SELECT
+    conversion_id,
+    ARRAY_AGG(STRUCT(session_key, session_start_ts, channel, source_medium, campaign, is_direct, has_add_to_cart, days_before_conversion)
+      ORDER BY session_start_ts) AS touches
+  FROM touches_in_window
+  GROUP BY conversion_id
+),
+
+-- conversions without any touch (cookieless, first event of a new device...) stay with an
+-- "(unattributed)" touch so the totals of the models still match the total conversions
+paths_with_fallback AS (
+  SELECT
+    c.*,
+    COALESCE(p.touches, [STRUCT(
+      CAST(NULL AS STRING) AS session_key, c.conversion_ts AS session_start_ts, '(unattributed)' AS channel,
+      '(unattributed)' AS source_medium, '(not set)' AS campaign, FALSE AS is_direct, FALSE AS has_add_to_cart,
+      CAST(0 AS FLOAT64) AS days_before_conversion
+    )]) AS touches,
+    p.touches IS NULL AS is_unattributed
+  FROM conversions AS c
+  LEFT JOIN build_paths AS p USING (conversion_id)
+)
+
+SELECT
+  *,
+  ARRAY_LENGTH(touches) AS path_length,
+  ARRAY_TO_STRING(ARRAY(SELECT t.channel FROM UNNEST(touches) AS t WITH OFFSET AS pos ORDER BY pos), ' > ') AS channel_path,
+  ARRAY_TO_STRING(ARRAY(
+    SELECT channel FROM (
+      SELECT t.channel, pos, LAG(t.channel) OVER (ORDER BY pos) AS previous_channel
+      FROM UNNEST(touches) AS t WITH OFFSET AS pos
+    )
+    WHERE previous_channel IS NULL OR previous_channel != channel
+    ORDER BY pos
+  ), ' > ') AS channel_path_dedup,
+  ARRAY_TO_STRING(ARRAY(SELECT t.source_medium FROM UNNEST(touches) AS t WITH OFFSET AS pos ORDER BY pos), ' > ') AS source_medium_path,
+  touches[OFFSET(0)].channel AS first_channel,
+  touches[OFFSET(ARRAY_LENGTH(touches) - 1)].channel AS last_channel,
+  (SELECT MAX(pos) + 1 FROM UNNEST(touches) AS t WITH OFFSET AS pos WHERE NOT t.is_direct) AS last_non_direct_index,
+  (SELECT MIN(pos) + 1 FROM UNNEST(touches) AS t WITH OFFSET AS pos WHERE t.has_add_to_cart) AS first_cart_index,
+  touches[OFFSET(0)].days_before_conversion AS time_lag_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM paths_with_fallback

@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "custom_channel_group",
+  description: "Custom channel group: GA4 default + AI Assistants, WhatsApp, Marketplaces, Cashback & Coupons, Influencers, Brand x Non-brand",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(source STRING, medium STRING, campaign STRING) RETURNS STRING AS ((
+  SELECT ${channels.customChannelGroup("src", "med", "camp", "dcg")}
+  FROM (
+    SELECT src, med, camp, ${channels.defaultChannelGroup("src", "med", "camp")} AS dcg
+    FROM (
+      SELECT
+        ${channels.normalizeSource("LOWER(TRIM(source))")} AS src,
+        LOWER(TRIM(medium)) AS med,
+        LOWER(TRIM(campaign)) AS camp
+    )
+  )
+))
+OPTIONS (description = "Custom channel group")

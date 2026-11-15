@@ -1,0 +1,52 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_metric_correlations",
+  description: "Correlation matrix of the daily metrics (last 365 days): Pearson (linear) and Spearman (rank, robust to outliers and non linear monotonic relations) for every pair. 'Does paid social traffic move revenue at all?' starts here",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily"],
+  columns: {
+    spearman: "Pearson correlation of the ranks"
+  }
+}
+
+js {
+  const channelList = ["Direct", "Organic Search", "Paid Search", "Paid Social", "Organic Social", "Email", "Referral", "Display", "Paid Shopping", "Cross-network"];
+  const metricCols = ["sessions", "users", "new_users", "engagement_rate", "transactions", "revenue", "conversion_rate", "average_order_value", "add_to_cart_rate", "mobile_share", "ads_consent_denied_share"]
+    .concat(channelList.map(c => "sessions_" + c.toLowerCase().replace(/[^a-z0-9]+/g, "_")));
+}
+
+WITH
+long_format AS (
+  SELECT metric_date, m.metric, m.value
+  FROM ${ref("ds_daily_metrics_wide")},
+    UNNEST([${metricCols.map(c => `STRUCT('${c}' AS metric, CAST(${c} AS FLOAT64) AS value)`).join(", ")}]) AS m
+  WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND m.value IS NOT NULL
+),
+
+ranked AS (
+  SELECT *, RANK() OVER (PARTITION BY metric ORDER BY value) AS value_rank
+  FROM long_format
+)
+
+SELECT
+  a.metric AS metric_a,
+  b.metric AS metric_b,
+  COUNT(*) AS days,
+  CORR(a.value, b.value) AS pearson,
+  CORR(a.value_rank, b.value_rank) AS spearman,
+  CASE
+    WHEN ABS(CORR(a.value_rank, b.value_rank)) >= 0.7 THEN 'strong'
+    WHEN ABS(CORR(a.value_rank, b.value_rank)) >= 0.4 THEN 'moderate'
+    WHEN ABS(CORR(a.value_rank, b.value_rank)) >= 0.2 THEN 'weak'
+    ELSE 'none'
+  END AS strength,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ranked AS a
+JOIN ranked AS b ON a.metric_date = b.metric_date AND a.metric < b.metric
+GROUP BY 1, 2

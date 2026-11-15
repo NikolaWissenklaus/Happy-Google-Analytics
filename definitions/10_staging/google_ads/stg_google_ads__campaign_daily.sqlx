@@ -1,0 +1,67 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_google_ads__campaign_daily",
+  disabled: !constants.ENABLE.google_ads,
+  description: "Google Ads cost / clicks / impressions per day and campaign, with the latest campaign name and type (Data Transfer Service)",
+  bigquery: {
+    partitionBy: "cost_date",
+    clusterBy: ["campaign_id"],
+    labels: { layer: "staging", source: "google_ads" }
+  },
+  tags: ["staging", "daily", "google_ads", "optional"],
+  columns: {
+    cost_date: "Date (Google Ads account timezone)",
+    cost: "Cost in the account currency (metrics_cost_micros / 1e6)",
+    ads_conversions: "Conversions as Google Ads sees them (not GA4!)"
+  }
+}
+
+WITH latest_campaign AS (
+  SELECT
+    CAST(campaign_id AS STRING) AS campaign_id,
+    campaign_name,
+    campaign_status,
+    campaign_advertising_channel_type,
+    campaign_advertising_channel_sub_type,
+    campaign_bidding_strategy_type
+  FROM ${ref(`ads_Campaign_${constants.GOOGLE_ADS.customer_id}`)}
+  WHERE _DATA_DATE = _LATEST_DATE
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _DATA_DATE DESC) = 1
+),
+
+stats AS (
+  SELECT
+    segments_date AS cost_date,
+    CAST(customer_id AS STRING) AS customer_id,
+    CAST(campaign_id AS STRING) AS campaign_id,
+    SUM(metrics_cost_micros) / 1e6 AS cost,
+    SUM(metrics_clicks) AS clicks,
+    SUM(metrics_impressions) AS impressions,
+    SUM(metrics_conversions) AS ads_conversions,
+    SUM(metrics_conversions_value) AS ads_conversions_value
+  FROM ${ref(`ads_CampaignBasicStats_${constants.GOOGLE_ADS.customer_id}`)}
+  WHERE segments_date >= DATE '${constants.START_DATE}'
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  s.cost_date,
+  s.customer_id,
+  s.campaign_id,
+  COALESCE(c.campaign_name, CONCAT('campaign ', s.campaign_id)) AS campaign_name,
+  LOWER(c.campaign_name) AS campaign_name_lower,
+  c.campaign_status,
+  c.campaign_advertising_channel_type AS channel_type,
+  c.campaign_advertising_channel_sub_type AS channel_sub_type,
+  c.campaign_bidding_strategy_type AS bidding_strategy,
+  s.cost,
+  s.clicks,
+  s.impressions,
+  s.ads_conversions,
+  s.ads_conversions_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM stats AS s
+LEFT JOIN latest_campaign AS c USING (campaign_id)

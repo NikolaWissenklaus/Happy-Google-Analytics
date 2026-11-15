@@ -1,0 +1,27 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_404_broken_links",
+  description: "Broken pages (404 by the page title) of the last 30 days and WHERE people came from: internal page (broken internal link, fix today) or external referrer / campaign (broken ad or backlink, ask for redirect)",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "seo", "alerts"]
+}
+
+SELECT
+  page_path AS broken_page,
+  COALESCE(previous_page_path, IF(is_entrance, CONCAT('(entrance) ', COALESCE(session_source, '(direct)'), ' / ', COALESCE(session_medium, '(none)')), '(unknown)')) AS came_from,
+  IF(previous_page_path IS NOT NULL, 'internal_link', 'external_or_campaign') AS origin_type,
+  COUNT(*) AS views,
+  COUNT(DISTINCT session_key) AS sessions,
+  MIN(event_date) AS first_seen,
+  MAX(event_date) AS last_seen,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_page_views")}
+WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  AND is_not_found_page
+  AND NOT COALESCE(is_bot_suspect, FALSE)
+GROUP BY 1, 2, 3

@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_coupon_hijacking",
+  description: "Last click hijacking by cashback / coupon sites: the user was ALREADY in the checkout, left, came back through Meliuz / Cuponomia / Pelando & co and bought within 24h. The affiliate gets the commission for a sale that was already happening. Revenue and orders affected, by site and month",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily", "attribution"],
+  columns: {
+    hijacked_orders: "Orders where the converting session came from a cashback/coupon site AND the same user had begun checkout in the previous 24h from another channel",
+    hijacked_share: "hijacked orders / all orders attributed to the site. 0.5 = half of what you pay to the site was already yours"
+  }
+}
+
+WITH
+cashback_sessions AS (
+  SELECT session_key, user_key, session_start_ts, session_source_only AS cashback_site, session_date, revenue, transactions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart(180)}
+    AND session_custom_channel_only = 'Cashback & Coupons'
+    AND has_purchase
+),
+
+previous_checkouts AS (
+  SELECT user_key, session_start_ts, session_custom_channel_only AS checkout_channel
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(${helpers.martWindowStart(180)}, INTERVAL 1 DAY)
+    AND has_begin_checkout
+    AND NOT has_purchase
+    AND session_custom_channel_only != 'Cashback & Coupons'
+),
+
+flag_hijack AS (
+  SELECT
+    c.session_key,
+    c.cashback_site,
+    DATE_TRUNC(c.session_date, MONTH) AS order_month,
+    c.revenue,
+    c.transactions,
+    ARRAY_AGG(p.checkout_channel IGNORE NULLS ORDER BY p.session_start_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS channel_of_abandoned_checkout
+  FROM cashback_sessions AS c
+  LEFT JOIN previous_checkouts AS p
+    ON p.user_key = c.user_key
+    AND p.session_start_ts < c.session_start_ts
+    AND p.session_start_ts >= TIMESTAMP_SUB(c.session_start_ts, INTERVAL 24 HOUR)
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  order_month,
+  cashback_site,
+  SUM(transactions) AS orders_via_site,
+  SUM(revenue) AS revenue_via_site,
+  SUM(IF(channel_of_abandoned_checkout IS NOT NULL, transactions, 0)) AS hijacked_orders,
+  SUM(IF(channel_of_abandoned_checkout IS NOT NULL, revenue, 0)) AS hijacked_revenue,
+  SAFE_DIVIDE(SUM(IF(channel_of_abandoned_checkout IS NOT NULL, transactions, 0)), SUM(transactions)) AS hijacked_share,
+  APPROX_TOP_COUNT(channel_of_abandoned_checkout, 3) AS channels_robbed,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM flag_hijack
+GROUP BY 1, 2

@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_source_shards",
+  description: "Every shard of the GA4 export (daily, intraday, fresh) with row count, size, when it was created and last modified, the export delay and the late rewrites. Row count vs the median of the last 28 shards catches export problems before any dashboard",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"],
+  columns: {
+    export_delay_hours: "Hours between the end of the day (property timezone) and the creation of the daily shard",
+    rewritten_after_hours: "Hours between creation and last modification (GA4 adds late hits up to 72h, more than that is unusual)",
+    row_count_vs_median_28: "row_count / median row count of the previous 28 daily shards"
+  }
+}
+
+WITH
+shards AS (
+  SELECT
+    table_id,
+    CASE
+      WHEN REGEXP_CONTAINS(table_id, r'^events_\d{8}$') THEN 'daily'
+      WHEN REGEXP_CONTAINS(table_id, r'^events_intraday_\d{8}$') THEN 'intraday'
+      WHEN REGEXP_CONTAINS(table_id, r'^events_fresh_\d{8}$') THEN 'fresh'
+      WHEN REGEXP_CONTAINS(table_id, r'^pseudonymous_users_\d{8}$') THEN 'user_export_pseudo'
+      WHEN REGEXP_CONTAINS(table_id, r'^users_\d{8}$') THEN 'user_export_uid'
+      ELSE 'other'
+    END AS shard_type,
+    SAFE.PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(table_id, r'(\d{8})$')) AS shard_date,
+    row_count,
+    size_bytes,
+    TIMESTAMP_MILLIS(creation_time) AS created_at,
+    TIMESTAMP_MILLIS(last_modified_time) AS last_modified_at
+  FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.__TABLES__`
+),
+
+median_last_28 AS (
+  SELECT
+    a.table_id,
+    APPROX_QUANTILES(b.row_count, 2)[OFFSET(1)] AS median_row_count_28
+  FROM shards AS a
+  JOIN shards AS b
+    ON a.shard_type = 'daily'
+    AND b.shard_type = 'daily'
+    AND b.shard_date BETWEEN DATE_SUB(a.shard_date, INTERVAL 28 DAY) AND DATE_SUB(a.shard_date, INTERVAL 1 DAY)
+  GROUP BY a.table_id
+)
+
+SELECT
+  s.*,
+  ROUND(s.size_bytes / POW(1024, 2), 1) AS size_mb,
+  IF(s.shard_type = 'daily',
+    TIMESTAMP_DIFF(s.created_at, TIMESTAMP(DATE_ADD(s.shard_date, INTERVAL 1 DAY), '${constants.TIMEZONE}'), MINUTE) / 60, NULL) AS export_delay_hours,
+  TIMESTAMP_DIFF(s.last_modified_at, s.created_at, MINUTE) / 60 AS rewritten_after_hours,
+  m.median_row_count_28,
+  SAFE_DIVIDE(s.row_count, m.median_row_count_28) AS row_count_vs_median_28,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM shards AS s
+LEFT JOIN median_last_28 AS m USING (table_id)
+WHERE s.shard_type != 'other'

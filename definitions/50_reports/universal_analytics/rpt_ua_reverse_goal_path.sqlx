@@ -1,0 +1,44 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_reverse_goal_path",
+  description: "UA Conversions > Goals > Reverse Goal Path (last 30 days): for each key event (goal), the page where it happened and the 3 pages before it, with completions. Shows the real road to conversion, not the one in the funnel slide",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily", "conversions"]
+}
+
+WITH
+goals AS (
+  SELECT key_event_name, session_key, event_ts
+  FROM ${ref("fct_key_events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+),
+
+pages_before AS (
+  SELECT
+    g.key_event_name,
+    g.session_key,
+    g.event_ts,
+    ARRAY_AGG(v.page_path ORDER BY v.event_ts DESC LIMIT 4) AS last_pages
+  FROM goals AS g
+  JOIN ${ref("int_ga4__page_views")} AS v
+    ON v.session_key = g.session_key
+    AND v.event_ts <= g.event_ts
+    AND v.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY)
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  key_event_name AS goal,
+  last_pages[SAFE_OFFSET(0)] AS goal_completion_location,
+  COALESCE(last_pages[SAFE_OFFSET(1)], '(entrance)') AS goal_previous_step_1,
+  last_pages[SAFE_OFFSET(2)] AS goal_previous_step_2,
+  last_pages[SAFE_OFFSET(3)] AS goal_previous_step_3,
+  COUNT(*) AS goal_completions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pages_before
+GROUP BY 1, 2, 3, 4, 5

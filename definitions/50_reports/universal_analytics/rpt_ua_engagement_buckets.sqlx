@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_engagement_buckets",
+  description: "UA Audience > Behavior > Engagement (last 30 days): sessions and pageviews by Session Duration buckets (0-10s, 11-30s, 31-60s, 61-180s, 181-600s, 601-1800s, 1801+) and by Page Depth (1..20+)",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"]
+}
+
+WITH sessions AS (
+  SELECT session_duration_sec, page_views
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+)
+
+SELECT
+  'session_duration' AS report,
+  CASE
+    WHEN session_duration_sec <= 10 THEN '0-10 seconds'
+    WHEN session_duration_sec <= 30 THEN '11-30 seconds'
+    WHEN session_duration_sec <= 60 THEN '31-60 seconds'
+    WHEN session_duration_sec <= 180 THEN '61-180 seconds'
+    WHEN session_duration_sec <= 600 THEN '181-600 seconds'
+    WHEN session_duration_sec <= 1800 THEN '601-1800 seconds'
+    ELSE '1801+ seconds'
+  END AS bucket,
+  CASE
+    WHEN session_duration_sec <= 10 THEN 1 WHEN session_duration_sec <= 30 THEN 2 WHEN session_duration_sec <= 60 THEN 3
+    WHEN session_duration_sec <= 180 THEN 4 WHEN session_duration_sec <= 600 THEN 5 WHEN session_duration_sec <= 1800 THEN 6 ELSE 7
+  END AS bucket_order,
+  COUNT(*) AS sessions,
+  SUM(page_views) AS pageviews,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions
+GROUP BY bucket, bucket_order
+
+UNION ALL
+
+SELECT
+  'page_depth',
+  IF(page_views >= 20, '20+', CAST(page_views AS STRING)),
+  LEAST(page_views, 20),
+  COUNT(*),
+  SUM(page_views),
+  CURRENT_TIMESTAMP()
+FROM sessions
+GROUP BY 2, 3

@@ -1,0 +1,110 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.audiences,
+  name: "aud_user_features",
+  description: "Feature table behind every audience of cfg_audiences.js (one row per user): open cart / checkout, recent views, purchases, RFM, value tier, propensity and churn scores (BQML when enabled, heuristic otherwise), replenishment date, leads, consent. Write the audience conditions over these columns",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "marts", domain: "audiences" }
+  },
+  tags: ["marts", "audiences", "daily", "activation"],
+  columns: {
+    has_open_cart: "Last add_to_cart is after the last purchase (or the user never bought)",
+    predicted_next_purchase_date: "last purchase + average days between orders (repeat customers only)",
+    consent_ads_granted: "Last known ads_storage = granted. Activation only sends these"
+  }
+}
+
+WITH
+recent_sessions AS (
+  SELECT
+    user_key,
+    SUM(IF(session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 14 DAY), view_item_events, 0)) AS view_item_14d,
+    COUNTIF(session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 14 DAY) AND has_add_to_cart) AS add_to_cart_14d,
+    COUNTIF(is_engaged) AS engaged_sessions_30d,
+    MAX(IF(has_add_to_cart, session_start_ts, NULL)) AS last_add_to_cart_ts,
+    MAX(IF(has_begin_checkout, session_start_ts, NULL)) AS last_begin_checkout_ts,
+    ARRAY_AGG(IF(has_begin_checkout, checkout_value, NULL) IGNORE NULLS ORDER BY session_start_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_checkout_value,
+    ARRAY_AGG(IF(has_add_to_cart, cart_value, NULL) IGNORE NULLS ORDER BY session_start_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_cart_value
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY user_key
+),
+
+purchases AS (
+  SELECT
+    user_key,
+    MAX(transaction_ts) AS last_purchase_ts,
+    COUNTIF(transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)) AS purchases_30d,
+    SAFE_DIVIDE(COUNTIF(coupon IS NOT NULL), COUNT(*)) AS coupon_order_share
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+  GROUP BY user_key
+),
+
+leads AS (
+  SELECT
+    user_key,
+    COUNTIF(key_event_category = 'lead') AS leads_total,
+    MAX(IF(key_event_category = 'lead', event_ts, NULL)) AS last_lead_ts,
+    LOGICAL_OR(key_event_name = 'sign_up') AS has_signed_up
+  FROM ${ref("fct_key_events")}
+  GROUP BY user_key
+),
+
+scores AS (
+  ${constants.ENABLE.bqml
+    ? `SELECT p.user_key, p.purchase_propensity, c.churn_risk, 'bqml' AS score_method
+  FROM ${ref("ds_scores_purchase_propensity")} AS p
+  FULL OUTER JOIN ${ref("ds_scores_churn")} AS c USING (user_key)`
+    : `SELECT user_key, purchase_propensity, churn_risk, 'heuristic' AS score_method
+  FROM ${ref("ds_heuristic_scores")}`}
+)
+
+SELECT
+  u.user_key,
+  u.user_id,
+  u.last_user_pseudo_id AS user_pseudo_id,
+  u.is_identified,
+  u.first_seen_date,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), u.first_seen_date, DAY) AS days_since_first_seen,
+  u.days_since_last_seen,
+  u.last_device_category,
+  u.last_uf,
+  COALESCE(rs.view_item_14d, 0) AS view_item_14d,
+  COALESCE(rs.add_to_cart_14d, 0) AS add_to_cart_14d,
+  COALESCE(rs.engaged_sessions_30d, 0) AS engaged_sessions_30d,
+  rs.last_add_to_cart_ts,
+  rs.last_begin_checkout_ts,
+  rs.last_add_to_cart_ts IS NOT NULL AND (p.last_purchase_ts IS NULL OR p.last_purchase_ts < rs.last_add_to_cart_ts) AS has_open_cart,
+  rs.last_begin_checkout_ts IS NOT NULL AND (p.last_purchase_ts IS NULL OR p.last_purchase_ts < rs.last_begin_checkout_ts) AS has_open_checkout,
+  COALESCE(rs.last_checkout_value, 0) AS open_checkout_value,
+  COALESCE(rs.last_cart_value, 0) AS open_cart_value,
+  u.transactions AS purchases_total,
+  COALESCE(p.purchases_30d, 0) AS purchases_30d,
+  u.lifetime_revenue,
+  u.days_since_last_purchase,
+  COALESCE(p.coupon_order_share, 0) AS coupon_order_share,
+  IF(u.transactions >= 2 AND u.avg_days_between_orders IS NOT NULL,
+    DATE_ADD(u.last_purchase_date, INTERVAL CAST(ROUND(u.avg_days_between_orders) AS INT64) DAY), NULL) AS predicted_next_purchase_date,
+  COALESCE(l.leads_total, 0) AS leads_total,
+  l.last_lead_ts,
+  COALESCE(l.has_signed_up, FALSE) AS has_signed_up,
+  r.rfm_segment,
+  t.value_tier,
+  t.engagement_tier,
+  s.purchase_propensity,
+  s.churn_risk,
+  s.score_method,
+  u.latest_consent_ads = 'granted' AS consent_ads_granted,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dim_users")} AS u
+LEFT JOIN recent_sessions AS rs USING (user_key)
+LEFT JOIN purchases AS p USING (user_key)
+LEFT JOIN leads AS l USING (user_key)
+LEFT JOIN ${ref("seg_rfm")} AS r USING (user_key)
+LEFT JOIN ${ref("seg_engagement_and_value_tiers")} AS t USING (user_key)
+LEFT JOIN scores AS s USING (user_key)

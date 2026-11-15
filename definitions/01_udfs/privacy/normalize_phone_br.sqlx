@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "normalize_phone_br",
+  description: "Brazilian phone to E.164: '(11) 98765-4321' -> '+5511987654321'. NULL when it does not look like a BR phone",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+-- 10 digits = landline with DDD, 11 = mobile with DDD (9 in front).
+-- 12/13 starting with 55 = already has the country code.
+CREATE OR REPLACE FUNCTION ${self()}(phone STRING) RETURNS STRING AS ((
+  SELECT
+    CASE
+      WHEN d IS NULL OR d = '' THEN NULL
+      WHEN LENGTH(d) IN (10, 11) THEN CONCAT('+55', d)
+      WHEN STARTS_WITH(d, '55') AND LENGTH(d) IN (12, 13) THEN CONCAT('+', d)
+      ELSE NULL
+    END
+  FROM (SELECT REGEXP_REPLACE(REGEXP_REPLACE(phone, r'\D', ''), r'^0+', '') AS d)
+))
+OPTIONS (description = "BR phone normalization to E.164")

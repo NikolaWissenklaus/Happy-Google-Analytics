@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_app_versions_health",
+  description: "App health by version (Firebase / GA4 app streams, last 30 days): users, sessions, crash events (app_exception fatal), crash free users, engagement and conversion per version. The release that broke the checkout shows up in one day",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "app"]
+}
+
+WITH
+app_events AS (
+  SELECT
+    platform,
+    app_version,
+    user_pseudo_id,
+    event_name,
+    is_fatal_exception
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND platform IN ('ANDROID', 'IOS')
+    ${helpers.noiseFilter()}
+),
+
+crashes AS (
+  SELECT
+    platform,
+    app_version,
+    COUNT(DISTINCT user_pseudo_id) AS users,
+    COUNTIF(event_name = '${cfg_project.app_crash_event}' AND is_fatal_exception) AS fatal_crashes,
+    COUNTIF(event_name = '${cfg_project.app_crash_event}') AS all_exceptions,
+    COUNT(DISTINCT IF(event_name = '${cfg_project.app_crash_event}' AND is_fatal_exception, user_pseudo_id, NULL)) AS users_with_crash
+  FROM app_events
+  GROUP BY 1, 2
+),
+
+sessions AS (
+  SELECT
+    platform,
+    app_version,
+    COUNT(*) AS sessions,
+    SAFE_DIVIDE(COUNTIF(is_engaged), COUNT(*)) AS engagement_rate,
+    SAFE_DIVIDE(SUM(transactions), COUNT(*)) AS conversion_rate
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND platform IN ('ANDROID', 'IOS')
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+)
+
+SELECT
+  c.platform,
+  c.app_version,
+  c.users,
+  s.sessions,
+  c.fatal_crashes,
+  c.all_exceptions,
+  c.users_with_crash,
+  1 - SAFE_DIVIDE(c.users_with_crash, c.users) AS crash_free_users_rate,
+  s.engagement_rate,
+  s.conversion_rate,
+  SAFE_DIVIDE(c.users, SUM(c.users) OVER (PARTITION BY c.platform)) AS version_adoption_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM crashes AS c
+LEFT JOIN sessions AS s USING (platform, app_version)

@@ -1,0 +1,65 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_discount_depth",
+  description: "Discount depth vs results (last 365 days): orders bucketed by % of discount (item discount param), with AOV, new customer share and the repeat rate in 90 days of the customers acquired in each bucket. Big discounts bring customers that never come back?",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily", "pricing"],
+  columns: {
+    repeat_90d_rate: "Share of first-time buyers of the bucket that bought again within 90 days (only orders older than 90 days)"
+  }
+}
+
+WITH
+order_discount AS (
+  SELECT
+    t.transaction_id,
+    t.transaction_date,
+    t.user_key,
+    t.revenue,
+    t.is_first_purchase,
+    SAFE_DIVIDE(SUM(COALESCE(i.item_discount, 0) * COALESCE(i.quantity, 1)), t.revenue + SUM(COALESCE(i.item_discount, 0) * COALESCE(i.quantity, 1))) AS discount_pct
+  FROM ${ref("fct_transactions")} AS t
+  LEFT JOIN ${ref("fct_transaction_items")} AS i USING (transaction_id)
+  WHERE t.transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND t.is_valid_for_revenue
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+next_orders AS (
+  SELECT
+    o.transaction_id,
+    LOGICAL_OR(n.transaction_ts IS NOT NULL) AS repeated_90d
+  FROM order_discount AS o
+  LEFT JOIN ${ref("fct_transactions")} AS n
+    ON n.user_key = o.user_key
+    AND n.is_valid_for_revenue
+    AND n.transaction_date > o.transaction_date
+    AND n.transaction_date <= DATE_ADD(o.transaction_date, INTERVAL 90 DAY)
+  WHERE o.is_first_purchase
+    AND o.transaction_date <= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY 1
+)
+
+SELECT
+  CASE
+    WHEN COALESCE(o.discount_pct, 0) = 0 THEN '0%'
+    WHEN o.discount_pct < 0.1 THEN '0-10%'
+    WHEN o.discount_pct < 0.2 THEN '10-20%'
+    WHEN o.discount_pct < 0.3 THEN '20-30%'
+    WHEN o.discount_pct < 0.5 THEN '30-50%'
+    ELSE '50%+'
+  END AS discount_bucket,
+  COUNT(*) AS orders,
+  SUM(o.revenue) AS revenue,
+  SAFE_DIVIDE(SUM(o.revenue), COUNT(*)) AS average_order_value,
+  SAFE_DIVIDE(COUNTIF(o.is_first_purchase), COUNT(*)) AS new_customer_share,
+  SAFE_DIVIDE(COUNTIF(n.repeated_90d), COUNT(n.repeated_90d)) AS repeat_90d_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM order_discount AS o
+LEFT JOIN next_orders AS n USING (transaction_id)
+GROUP BY 1

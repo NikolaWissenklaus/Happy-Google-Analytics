@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_active_users_daily",
+  description: "DAU, WAU (7d), MAU (28d) rolling and stickiness (DAU/MAU), with HLL sketches so the rolling distinct users are right and cheap. Same idea of the GA4 'User activity over time' card",
+  bigquery: {
+    partitionBy: "activity_date",
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"],
+  columns: {
+    stickiness: "DAU / MAU. 0.2 = the average user comes 6 of 30 days"
+  }
+}
+
+WITH
+daily_sketches AS (
+  SELECT
+    activity_date,
+    COUNT(DISTINCT user_key) AS dau,
+    COUNTIF(is_first_day) AS new_users,
+    HLL_COUNT.INIT(user_key) AS users_sketch
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= DATE_SUB(${helpers.martWindowStart()}, INTERVAL 28 DAY)
+  GROUP BY activity_date
+)
+
+SELECT
+  d.activity_date,
+  ANY_VALUE(d.dau) AS dau,
+  ANY_VALUE(d.new_users) AS new_users,
+  HLL_COUNT.MERGE(IF(w.activity_date > DATE_SUB(d.activity_date, INTERVAL 7 DAY), w.users_sketch, NULL)) AS wau,
+  HLL_COUNT.MERGE(w.users_sketch) AS mau,
+  SAFE_DIVIDE(ANY_VALUE(d.dau), HLL_COUNT.MERGE(w.users_sketch)) AS stickiness,
+  SAFE_DIVIDE(HLL_COUNT.MERGE(IF(w.activity_date > DATE_SUB(d.activity_date, INTERVAL 7 DAY), w.users_sketch, NULL)), HLL_COUNT.MERGE(w.users_sketch)) AS wau_mau_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM daily_sketches AS d
+JOIN daily_sketches AS w
+  ON w.activity_date BETWEEN DATE_SUB(d.activity_date, INTERVAL 27 DAY) AND d.activity_date
+WHERE d.activity_date >= ${helpers.martWindowStart()}
+GROUP BY d.activity_date

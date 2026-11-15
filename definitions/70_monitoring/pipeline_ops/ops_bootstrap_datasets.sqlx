@@ -1,0 +1,13 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  schema: constants.SCHEMAS.ops,
+  name: "ops_bootstrap_datasets",
+  description: "Creates every dataset of the project (IF NOT EXISTS). UDFs and the watermark table need the dataset before CREATE",
+  tags: ["ops", "daily", "bootstrap"]
+}
+
+-- Dataform creates datasets for tables and views, but not for operations (UDFs).
+-- one dataset per layer/context, same location of the project.
+${Object.values(constants.SCHEMAS).map(s => `CREATE SCHEMA IF NOT EXISTS \`${constants.PROJECT}.${s}\` OPTIONS (location = '${constants.LOCATION}');`).join("\n")}

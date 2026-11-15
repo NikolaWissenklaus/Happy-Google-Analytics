@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.core,
+  name: "fct_ad_costs_daily",
+  description: "Marketing costs per day / platform / campaign (Google Ads, Meta Ads, manual), same shape for every source",
+  tags: ["core", "daily", "costs"]
+}
+
+SELECT
+  cost_date,
+  platform,
+  sub_platform,
+  source,
+  medium,
+  campaign,
+  campaign_id,
+  cost,
+  clicks,
+  impressions,
+  SAFE_DIVIDE(cost, clicks) AS cpc,
+  SAFE_DIVIDE(cost * 1000, impressions) AS cpm,
+  SAFE_DIVIDE(clicks, impressions) AS ctr
+FROM ${ref("int_costs__unified_daily")}

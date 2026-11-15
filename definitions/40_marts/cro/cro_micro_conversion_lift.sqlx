@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_micro_conversion_lift",
+  description: "Micro conversions that predict the macro one (last 30 days): for every event name, purchase rate of sessions that had it vs sessions that did not, lift, phi correlation and coverage. Good to pick the micro goals for media optimization (when purchases are too few for the algorithm)",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "stats"]
+}
+
+WITH
+sessions AS (
+  SELECT session_key, has_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+),
+
+events_in_sessions AS (
+  SELECT DISTINCT event_name, session_key
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND session_key IS NOT NULL
+    AND event_name NOT IN ('purchase', 'session_start', 'first_visit', 'user_engagement')
+    ${helpers.noiseFilter()}
+),
+
+totals AS (
+  SELECT COUNT(*) AS n, COUNTIF(has_purchase) AS buyers FROM sessions
+),
+
+per_event AS (
+  SELECT e.event_name, COUNT(*) AS sessions_with_event, COUNTIF(s.has_purchase) AS buyers_with_event
+  FROM events_in_sessions AS e
+  JOIN sessions AS s USING (session_key)
+  GROUP BY 1
+)
+
+SELECT
+  p.event_name,
+  p.sessions_with_event,
+  SAFE_DIVIDE(p.sessions_with_event, t.n) AS coverage,
+  SAFE_DIVIDE(p.buyers_with_event, p.sessions_with_event) AS purchase_rate_with_event,
+  SAFE_DIVIDE(t.buyers - p.buyers_with_event, t.n - p.sessions_with_event) AS purchase_rate_without_event,
+  SAFE_DIVIDE(SAFE_DIVIDE(p.buyers_with_event, p.sessions_with_event), SAFE_DIVIDE(t.buyers - p.buyers_with_event, t.n - p.sessions_with_event)) AS lift,
+  SAFE_DIVIDE(p.buyers_with_event, t.buyers) AS share_of_buyers_with_event,
+  SAFE_DIVIDE(
+    CAST(p.buyers_with_event AS FLOAT64) * ((t.n - p.sessions_with_event) - (t.buyers - p.buyers_with_event))
+      - CAST(p.sessions_with_event - p.buyers_with_event AS FLOAT64) * (t.buyers - p.buyers_with_event),
+    SQRT(CAST(p.sessions_with_event AS FLOAT64) * (t.n - p.sessions_with_event) * t.buyers * (t.n - t.buyers))
+  ) AS phi,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_event AS p
+CROSS JOIN totals AS t
+WHERE p.sessions_with_event >= 100

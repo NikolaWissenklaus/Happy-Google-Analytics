@@ -1,0 +1,70 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_revenue_bridge",
+  description: "Revenue bridge (waterfall): why revenue changed between two periods, split EXACTLY into traffic effect, conversion effect and ticket (AOV) effect with LMDI decomposition. Month vs previous month and vs same month last year. 'We grew 12%: +15% traffic, -5% conversion, +2% ticket'",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    sessions_effect: "Revenue change explained by traffic (R$)",
+    conversion_effect: "Revenue change explained by conversion rate (R$)",
+    aov_effect: "Revenue change explained by average order value (R$). The 3 effects sum exactly to revenue_change"
+  }
+}
+
+-- Revenue = Sessions x CR x AOV. LMDI: effect_i = L(R1, R0) * ln(i1 / i0), L(a, b) = (a - b) / (ln a - ln b).
+-- additive and exact, no "interaction term" left over like the old % shares method
+WITH
+months AS (
+  SELECT
+    DATE_TRUNC(kpi_date, MONTH) AS month_start,
+    SUM(sessions) AS sessions,
+    SUM(orders) AS orders,
+    SUM(valid_revenue) AS revenue
+  FROM ${ref("ecom_daily_kpis")}
+  WHERE kpi_date < DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH)
+  GROUP BY 1
+),
+
+pairs AS (
+  SELECT 'vs_previous_month' AS comparison, c.month_start, c.sessions AS s1, c.orders AS o1, c.revenue AS r1, p.sessions AS s0, p.orders AS o0, p.revenue AS r0
+  FROM months AS c JOIN months AS p ON p.month_start = DATE_SUB(c.month_start, INTERVAL 1 MONTH)
+  UNION ALL
+  SELECT 'vs_same_month_last_year', c.month_start, c.sessions, c.orders, c.revenue, p.sessions, p.orders, p.revenue
+  FROM months AS c JOIN months AS p ON p.month_start = DATE_SUB(c.month_start, INTERVAL 1 YEAR)
+),
+
+ratios AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(o1, s1) AS cr1, SAFE_DIVIDE(o0, s0) AS cr0,
+    SAFE_DIVIDE(r1, o1) AS aov1, SAFE_DIVIDE(r0, o0) AS aov0,
+    IF(r1 = r0, r1, SAFE_DIVIDE(r1 - r0, LN(r1) - LN(r0))) AS log_mean
+  FROM pairs
+  WHERE s1 > 0 AND s0 > 0 AND o1 > 0 AND o0 > 0 AND r1 > 0 AND r0 > 0
+)
+
+SELECT
+  comparison,
+  month_start,
+  r0 AS revenue_before,
+  r1 AS revenue_after,
+  r1 - r0 AS revenue_change,
+  SAFE_DIVIDE(r1 - r0, r0) AS revenue_change_pct,
+  log_mean * LN(s1 / s0) AS sessions_effect,
+  log_mean * LN(cr1 / cr0) AS conversion_effect,
+  log_mean * LN(aov1 / aov0) AS aov_effect,
+  SAFE_DIVIDE(s1 - s0, s0) AS sessions_change_pct,
+  SAFE_DIVIDE(cr1 - cr0, cr0) AS conversion_change_pct,
+  SAFE_DIVIDE(aov1 - aov0, aov0) AS aov_change_pct,
+  CASE
+    WHEN ABS(log_mean * LN(s1 / s0)) >= GREATEST(ABS(log_mean * LN(cr1 / cr0)), ABS(log_mean * LN(aov1 / aov0))) THEN 'traffic'
+    WHEN ABS(log_mean * LN(cr1 / cr0)) >= ABS(log_mean * LN(aov1 / aov0)) THEN 'conversion'
+    ELSE 'ticket'
+  END AS main_driver,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ratios

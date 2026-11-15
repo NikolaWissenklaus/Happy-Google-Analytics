@@ -1,0 +1,88 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_recommendations",
+  description: "Top 10 recommendations per item from two signals: bought together (basket lift) and viewed together in the same session (last 90 days). Ready to feed the 'you may also like' block or the CRM emails",
+  bigquery: {
+    clusterBy: ["item_id"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "data_science", "activation"],
+  columns: {
+    score: "0.7 * normalized basket lift + 0.3 * normalized co-view lift. Bought together weights more than looked together"
+  }
+}
+
+WITH
+co_purchase AS (
+  SELECT item_a AS item_id, item_b AS recommended_item_id, lift AS purchase_lift, orders_with_both
+  FROM ${ref("ecom_market_basket_rules")}
+),
+
+views AS (
+  SELECT DISTINCT session_key, item_id
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+    AND session_key IS NOT NULL
+),
+
+view_counts AS (SELECT item_id, COUNT(*) AS sessions_viewed FROM views GROUP BY 1),
+total_view_sessions AS (SELECT COUNT(DISTINCT session_key) AS sessions FROM views),
+
+co_view AS (
+  SELECT
+    a.item_id,
+    b.item_id AS recommended_item_id,
+    COUNT(*) AS sessions_both,
+    SAFE_DIVIDE(COUNT(*) * ANY_VALUE(t.sessions), ANY_VALUE(va.sessions_viewed) * ANY_VALUE(vb.sessions_viewed)) AS view_lift
+  FROM views AS a
+  JOIN views AS b ON a.session_key = b.session_key AND a.item_id != b.item_id
+  JOIN view_counts AS va ON va.item_id = a.item_id
+  JOIN view_counts AS vb ON vb.item_id = b.item_id
+  CROSS JOIN total_view_sessions AS t
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= 5
+),
+
+combined AS (
+  SELECT
+    COALESCE(p.item_id, v.item_id) AS item_id,
+    COALESCE(p.recommended_item_id, v.recommended_item_id) AS recommended_item_id,
+    p.purchase_lift,
+    p.orders_with_both,
+    v.view_lift,
+    v.sessions_both
+  FROM co_purchase AS p
+  FULL OUTER JOIN co_view AS v
+    ON v.item_id = p.item_id AND v.recommended_item_id = p.recommended_item_id
+),
+
+scored AS (
+  SELECT
+    *,
+    0.7 * COALESCE(SAFE_DIVIDE(purchase_lift, MAX(purchase_lift) OVER (PARTITION BY item_id)), 0)
+      + 0.3 * COALESCE(SAFE_DIVIDE(view_lift, MAX(view_lift) OVER (PARTITION BY item_id)), 0) AS score
+  FROM combined
+)
+
+SELECT
+  s.item_id,
+  ROW_NUMBER() OVER (PARTITION BY s.item_id ORDER BY s.score DESC) AS recommendation_rank,
+  s.recommended_item_id,
+  d.item_name AS recommended_item_name,
+  d.current_price AS recommended_item_price,
+  s.score,
+  s.purchase_lift,
+  s.orders_with_both,
+  s.view_lift,
+  s.sessions_both,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored AS s
+LEFT JOIN ${ref("dim_items")} AS d ON d.item_id = s.recommended_item_id
+-- dont recommend things that left the catalog
+WHERE COALESCE(d.days_since_last_seen, 0) <= 30
+QUALIFY recommendation_rank <= 10

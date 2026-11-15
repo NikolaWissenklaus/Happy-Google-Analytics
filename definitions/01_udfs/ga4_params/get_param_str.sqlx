@@ -1,0 +1,21 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_param_str",
+  description: "String value of a GA4 param. Works with event_params, user_properties and items.item_params",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- the one you will use 50 times a day:
+--   SELECT ga4_udf.get_param_str(event_params, 'page_location') FROM ...
+CREATE OR REPLACE FUNCTION ${self()}(params ANY TYPE, param_key STRING) AS ((
+  SELECT p.value.string_value
+  FROM UNNEST(params) AS p
+  WHERE p.key = param_key
+  LIMIT 1
+))
+OPTIONS (description = "String value of a GA4 param (event_params, user_properties or item_params)")

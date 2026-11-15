@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_time_to_value",
+  description: "Time to value: from the first visit to the first occurrence of each key event (median, p75, p90 in days, and how many sessions it took), by first channel. Users acquired in the last 365 days",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"]
+}
+
+WITH
+first_key_event AS (
+  SELECT user_key, key_event_name, MIN(event_ts) AS first_key_event_ts, MIN(session_number) AS session_number_of_first
+  FROM ${ref("fct_key_events")}
+  GROUP BY 1, 2
+)
+
+SELECT
+  k.key_event_name,
+  u.first_channel,
+  COUNT(*) AS users_converted,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(k.first_key_event_ts, u.first_seen_ts, MINUTE) / 1440, 100)[OFFSET(50)] AS median_days,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(k.first_key_event_ts, u.first_seen_ts, MINUTE) / 1440, 100)[OFFSET(75)] AS p75_days,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(k.first_key_event_ts, u.first_seen_ts, MINUTE) / 1440, 100)[OFFSET(90)] AS p90_days,
+  AVG(k.session_number_of_first) AS avg_session_number,
+  SAFE_DIVIDE(COUNTIF(TIMESTAMP_DIFF(k.first_key_event_ts, u.first_seen_ts, HOUR) < 1), COUNT(*)) AS first_hour_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM first_key_event AS k
+JOIN ${ref("dim_users")} AS u USING (user_key)
+WHERE u.first_seen_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+  AND k.first_key_event_ts >= u.first_seen_ts
+GROUP BY 1, 2

@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_list_performance",
+  description: "Product list performance (UA 'Product List Performance', GA4 item list reports) with list attribution done right: the last list where the item was clicked in the session gets the add to cart and the purchase of that item. Last 90 days",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "ua_report"],
+  columns: {
+    attributed_add_to_carts: "add_to_cart of the item after it was selected from this list (same session)",
+    attributed_revenue: "item revenue of purchases after it was selected from this list (same session)"
+  }
+}
+
+WITH
+item_events AS (
+  SELECT
+    session_key,
+    event_ts,
+    event_name,
+    item_id,
+    item_list_name,
+    item_revenue_fixed,
+    -- list carried forward from the last select_item (or view_item_list) of the same item in the session
+    LAST_VALUE(IF(event_name IN ('select_item', 'view_item_list'), item_list_name, NULL) IGNORE NULLS) OVER (
+      PARTITION BY session_key, item_id ORDER BY event_ts, IF(event_name = 'view_item_list', 0, 1)
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS attributed_list
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND item_id IS NOT NULL
+    AND session_key IS NOT NULL
+    AND NOT is_internal_traffic
+    AND event_name IN ('view_item_list', 'select_item', 'view_item', 'add_to_cart', 'purchase')
+)
+
+SELECT
+  COALESCE(attributed_list, '(no list)') AS item_list_name,
+  COUNTIF(event_name = 'view_item_list') AS impressions,
+  COUNTIF(event_name = 'select_item') AS clicks,
+  SAFE_DIVIDE(COUNTIF(event_name = 'select_item'), COUNTIF(event_name = 'view_item_list')) AS ctr,
+  COUNTIF(event_name = 'view_item') AS attributed_detail_views,
+  COUNTIF(event_name = 'add_to_cart') AS attributed_add_to_carts,
+  COUNTIF(event_name = 'purchase') AS attributed_item_purchases,
+  SUM(IF(event_name = 'purchase', item_revenue_fixed, 0)) AS attributed_revenue,
+  SAFE_DIVIDE(SUM(IF(event_name = 'purchase', item_revenue_fixed, 0)), COUNTIF(event_name = 'view_item_list')) AS revenue_per_impression,
+  COUNT(DISTINCT item_id) AS distinct_items,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM item_events
+GROUP BY 1

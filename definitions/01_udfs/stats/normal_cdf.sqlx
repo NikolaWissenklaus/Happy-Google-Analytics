@@ -1,0 +1,24 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "normal_cdf",
+  description: "Standard normal CDF (Abramowitz & Stegun 7.1.26, error < 1.5e-7). BigQuery has no NORM.DIST, so here it is",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- normal_cdf(1.96) = 0.975
+-- p value of a two sided z test = 2 * (1 - normal_cdf(ABS(z)))
+CREATE OR REPLACE FUNCTION ${self()}(x FLOAT64) RETURNS FLOAT64 AS ((
+  SELECT
+    IF(
+      x IS NULL,
+      NULL,
+      0.5 * (1 + SIGN(x) * (1 - t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429)))) * EXP(-x * x / 2)))
+    )
+  FROM (SELECT 1 / (1 + 0.3275911 * ABS(x) / SQRT(2)) AS t)
+))
+OPTIONS (description = "Standard normal cumulative distribution")

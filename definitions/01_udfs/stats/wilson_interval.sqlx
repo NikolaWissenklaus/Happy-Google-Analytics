@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "wilson_interval",
+  description: "Wilson score interval for a rate (successes / trials). Use .low to rank pages/products without the small sample noise",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- ranking landing pages by raw conversion rate puts a page with 1 session and 1 sale at the top.
+-- ranking by wilson_interval(conversions, sessions, 1.96).low fixes that. Reddit uses this for comments.
+CREATE OR REPLACE FUNCTION ${self()}(successes FLOAT64, trials FLOAT64, z FLOAT64)
+RETURNS STRUCT<low FLOAT64, high FLOAT64> AS ((
+  SELECT
+    IF(
+      n IS NULL OR n <= 0 OR s IS NULL,
+      NULL,
+      STRUCT(
+        GREATEST(0.0, (p + zz / (2 * n) - zv * SQRT(GREATEST(0.0, (p * (1 - p) + zz / (4 * n)) / n))) / (1 + zz / n)) AS low,
+        LEAST(1.0, (p + zz / (2 * n) + zv * SQRT(GREATEST(0.0, (p * (1 - p) + zz / (4 * n)) / n))) / (1 + zz / n)) AS high
+      )
+    )
+  FROM (
+    SELECT
+      successes AS s,
+      trials AS n,
+      LEAST(1.0, GREATEST(0.0, SAFE_DIVIDE(successes, trials))) AS p,
+      COALESCE(z, 1.96) AS zv,
+      COALESCE(z, 1.96) * COALESCE(z, 1.96) AS zz
+  )
+))
+OPTIONS (description = "Wilson score interval")

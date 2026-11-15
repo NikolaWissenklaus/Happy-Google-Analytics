@@ -1,0 +1,72 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_content_decay",
+  description: "Content decay: landing pages losing organic traffic. Last 28 days vs previous 28 and vs the same 28 days last year, plus the weekly trend (OLS slope of the last 12 weeks). Old posts that used to rank and are dying = cheap refresh wins",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo" }
+  },
+  tags: ["marts", "seo", "daily", "content"],
+  columns: {
+    weekly_trend_pct: "slope of weekly sessions / average weekly sessions. -0.05 = losing ~5% per week",
+    decay_status: "decaying | growing | stable | new"
+  }
+}
+
+WITH
+daily AS (
+  SELECT session_date, landing_page_path, SUM(sessions) AS sessions, SUM(revenue) AS revenue
+  FROM ${ref("seo_organic_daily")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 400 DAY)
+  GROUP BY 1, 2
+),
+
+periods AS (
+  SELECT
+    landing_page_path,
+    SUM(IF(session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY), sessions, 0)) AS sessions_last_28,
+    SUM(IF(session_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 56 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 29 DAY), sessions, 0)) AS sessions_prev_28,
+    SUM(IF(session_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 392 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY), sessions, 0)) AS sessions_same_28_last_year,
+    SUM(IF(session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY), revenue, 0)) AS revenue_last_28
+  FROM daily
+  GROUP BY 1
+),
+
+weekly AS (
+  SELECT
+    landing_page_path,
+    DATE_DIFF(DATE_TRUNC(session_date, WEEK(MONDAY)), DATE_TRUNC(DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 84 DAY), WEEK(MONDAY)), WEEK) AS week_index,
+    SUM(sessions) AS sessions
+  FROM daily
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 84 DAY)
+    AND session_date < DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), WEEK(MONDAY))
+  GROUP BY 1, 2
+),
+
+trend AS (
+  SELECT
+    landing_page_path,
+    SAFE_DIVIDE(SAFE_DIVIDE(COVAR_SAMP(week_index, sessions), VAR_SAMP(week_index)), AVG(sessions)) AS weekly_trend_pct,
+    COUNT(*) AS weeks_with_data
+  FROM weekly
+  GROUP BY 1
+)
+
+SELECT
+  p.*,
+  ${helpers.pctChange("p.sessions_last_28", "p.sessions_prev_28")} AS change_vs_prev_28,
+  ${helpers.pctChange("p.sessions_last_28", "p.sessions_same_28_last_year")} AS change_vs_last_year,
+  t.weekly_trend_pct,
+  t.weeks_with_data,
+  CASE
+    WHEN p.sessions_prev_28 = 0 AND p.sessions_same_28_last_year = 0 THEN 'new'
+    WHEN t.weekly_trend_pct < -0.03 AND p.sessions_last_28 < p.sessions_prev_28 THEN 'decaying'
+    WHEN t.weekly_trend_pct > 0.03 AND p.sessions_last_28 > p.sessions_prev_28 THEN 'growing'
+    ELSE 'stable'
+  END AS decay_status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM periods AS p
+LEFT JOIN trend AS t USING (landing_page_path)
+WHERE p.sessions_last_28 + p.sessions_prev_28 + p.sessions_same_28_last_year >= 50

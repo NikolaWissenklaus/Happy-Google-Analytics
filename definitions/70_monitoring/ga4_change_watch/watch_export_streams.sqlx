@@ -1,0 +1,40 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_export_streams",
+  description: "Every data stream (web / app) in the export: first and last day, events of the last 7 days against the 7 before and status. A stream that stops (app SDK broken, web tag removed in a deploy) or a new one nobody told you about",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    status: "new | stopped (nothing in 2 days) | dropping (< 50% of the week before) | ok"
+  }
+}
+
+WITH per_stream AS (
+  SELECT
+    stream_id,
+    ANY_VALUE(platform) AS platform,
+    MIN(event_date) AS first_seen_date,
+    MAX(IF(events > 0, event_date, NULL)) AS last_seen_date,
+    SUM(IF(event_date >= ${helpers.daysAgo(7)}, events, 0)) AS events_last_7d,
+    SUM(IF(event_date BETWEEN ${helpers.daysAgo(14)} AND ${helpers.daysAgo(8)}, events, 0)) AS events_previous_7d,
+    SUM(IF(event_date >= ${helpers.daysAgo(7)}, cookieless_events, 0)) AS cookieless_last_7d
+  FROM ${ref("dq_daily_volumes")}
+  GROUP BY stream_id
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(events_last_7d - events_previous_7d, NULLIF(events_previous_7d, 0)) AS change_vs_previous_week,
+  CASE
+    WHEN first_seen_date >= ${helpers.daysAgo(7)} THEN 'new'
+    WHEN last_seen_date < ${helpers.daysAgo(2)} THEN 'stopped'
+    WHEN events_previous_7d > 0 AND events_last_7d < 0.5 * events_previous_7d THEN 'dropping'
+    ELSE 'ok'
+  END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_stream

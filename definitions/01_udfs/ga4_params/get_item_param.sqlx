@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_item_param",
+  description: "Item custom param (items.item_params) as STRING. ex: discount, size, color",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+--   SELECT i.item_id, ga4_udf.get_item_param(i.item_params, 'discount')
+--   FROM `...events_*`, UNNEST(items) AS i
+CREATE OR REPLACE FUNCTION ${self()}(item_params ANY TYPE, param_key STRING) AS ((
+  SELECT COALESCE(
+    p.value.string_value,
+    CAST(p.value.int_value AS STRING),
+    CAST(p.value.double_value AS STRING),
+    CAST(p.value.float_value AS STRING)
+  )
+  FROM UNNEST(item_params) AS p
+  WHERE p.key = param_key
+  LIMIT 1
+))
+OPTIONS (description = "Item custom param as STRING")

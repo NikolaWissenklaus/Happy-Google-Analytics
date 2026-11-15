@@ -1,0 +1,40 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_zscore",
+  description: "Method 1 - classic z-score against the previous 28 days (mean and standard deviation, current day excluded). Simple and fast, but weekdays and outliers in the window hurt it, that is why there are 7 more methods",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"]
+}
+
+WITH stats AS (
+  SELECT
+    *,
+    AVG(value) OVER w AS expected,
+    STDDEV_SAMP(value) OVER w AS sd,
+    COUNT(value) OVER w AS history_points
+  FROM ${ref("anom_metric_series_daily")}
+  WINDOW w AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date) RANGE BETWEEN ${cfg_anomaly.zscore.window_days} PRECEDING AND 1 PRECEDING)
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  expected,
+  expected - ${cfg_anomaly.zscore.threshold} * sd AS lower_bound,
+  expected + ${cfg_anomaly.zscore.threshold} * sd AS upper_bound,
+  SAFE_DIVIDE(value - expected, sd) AS score,
+  history_points >= ${cfg_anomaly.min_history_points} AND ABS(SAFE_DIVIDE(value - expected, sd)) > ${cfg_anomaly.zscore.threshold} AS is_anomaly,
+  'zscore' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM stats
+WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)

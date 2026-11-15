@@ -1,0 +1,13 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.activation,
+  name: "act_crm_triggers",
+  description: "CRM triggers to send today: act_crm_triggers_all without the holdout group. This is the one the CRM / automation tool reads (e-mail / WhatsApp opt-ins are checked on the CRM side)",
+  tags: ["activation", "daily", "crm"]
+}
+
+SELECT * EXCEPT (is_holdout)
+FROM ${ref("act_crm_triggers_all")}
+WHERE NOT is_holdout

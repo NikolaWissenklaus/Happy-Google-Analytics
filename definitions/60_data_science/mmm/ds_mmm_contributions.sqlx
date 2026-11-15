@@ -1,0 +1,39 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_mmm_contributions",
+  disabled: !constants.ENABLE.bqml,
+  description: "Contribution of each platform to the revenue per month according to the MMM (weight x saturated adstock), spend, and the incremental ROAS of the model. Compare with the last click ROAS of mkt_paid_media_performance and prepare the popcorn",
+  bigquery: {
+    labels: { layer: "data_science", domain: "mmm" }
+  },
+  tags: ["data_science", "bqml", "weekly", "optional", "mmm"]
+}
+
+js {
+  const platforms = ["manual"].concat(constants.ENABLE.google_ads ? ["google_ads"] : []).concat(constants.ENABLE.meta_ads ? ["meta_ads"] : []);
+}
+
+WITH
+weights AS (
+  SELECT processed_input, weight
+  FROM ML.WEIGHTS(MODEL ${ref("ds_model_mmm")})
+),
+
+daily AS (
+  SELECT * FROM ${ref("ds_mmm_dataset")}
+)
+
+${platforms.map(p => `SELECT
+  DATE_TRUNC(d.metric_date, MONTH) AS month_start,
+  '${p}' AS platform,
+  SUM(d.cost_${p}) AS spend,
+  SUM(d.sat_${p} * w.weight) AS modeled_contribution,
+  SAFE_DIVIDE(SUM(d.sat_${p} * w.weight), SUM(d.cost_${p})) AS incremental_roas,
+  ANY_VALUE(w.weight) AS model_weight,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM daily AS d
+CROSS JOIN (SELECT weight FROM weights WHERE processed_input = 'sat_${p}') AS w
+GROUP BY 1`).join("\nUNION ALL\n")}

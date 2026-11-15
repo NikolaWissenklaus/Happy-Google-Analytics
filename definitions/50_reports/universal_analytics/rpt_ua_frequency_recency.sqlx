@@ -1,0 +1,86 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_frequency_recency",
+  description: "UA Audience > Behavior > Frequency & Recency (last 30 days): sessions and pageviews by 'Count of Sessions' and by 'Days Since Last Session', with the exact UA buckets",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"],
+  columns: {
+    report: "count_of_sessions | days_since_last_session"
+  }
+}
+
+WITH sessions AS (
+  SELECT
+    session_number,
+    page_views,
+    DATE_DIFF(session_date, LAG(session_date) OVER (PARTITION BY user_pseudo_id ORDER BY session_start_ts), DAY) AS days_since_last_session,
+    session_date
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 400 DAY)
+),
+
+recent AS (
+  SELECT * FROM sessions WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+),
+
+buckets AS (
+  SELECT
+    'count_of_sessions' AS report,
+    CASE
+      WHEN session_number <= 8 THEN CAST(session_number AS STRING)
+      WHEN session_number <= 14 THEN '9-14'
+      WHEN session_number <= 25 THEN '15-25'
+      WHEN session_number <= 50 THEN '26-50'
+      WHEN session_number <= 100 THEN '51-100'
+      WHEN session_number <= 200 THEN '101-200'
+      ELSE '201+'
+    END AS bucket,
+    CASE
+      WHEN session_number <= 8 THEN session_number
+      WHEN session_number <= 14 THEN 9
+      WHEN session_number <= 25 THEN 15
+      WHEN session_number <= 50 THEN 26
+      WHEN session_number <= 100 THEN 51
+      WHEN session_number <= 200 THEN 101
+      ELSE 201
+    END AS bucket_order,
+    page_views
+  FROM recent
+  UNION ALL
+  SELECT
+    'days_since_last_session',
+    CASE
+      WHEN days_since_last_session IS NULL OR days_since_last_session <= 7 THEN CAST(COALESCE(days_since_last_session, 0) AS STRING)
+      WHEN days_since_last_session <= 14 THEN '8-14'
+      WHEN days_since_last_session <= 30 THEN '15-30'
+      WHEN days_since_last_session <= 60 THEN '31-60'
+      WHEN days_since_last_session <= 120 THEN '61-120'
+      ELSE '121-364'
+    END,
+    CASE
+      WHEN days_since_last_session IS NULL OR days_since_last_session <= 7 THEN COALESCE(days_since_last_session, 0)
+      WHEN days_since_last_session <= 14 THEN 8
+      WHEN days_since_last_session <= 30 THEN 15
+      WHEN days_since_last_session <= 60 THEN 31
+      WHEN days_since_last_session <= 120 THEN 61
+      ELSE 121
+    END,
+    page_views
+  FROM recent
+)
+
+SELECT
+  report,
+  bucket,
+  bucket_order,
+  COUNT(*) AS sessions,
+  SUM(page_views) AS pageviews,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY report)) AS share_of_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM buckets
+GROUP BY report, bucket, bucket_order

@@ -1,0 +1,72 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_site_search_overview_daily",
+  description: "UA Behavior > Site Search > Overview per day (last 90 days): sessions with search, total and unique searches, results pageviews / search, % search exits, % search refinements, time after search and average search depth",
+  bigquery: {
+    partitionBy: "event_date",
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily", "product"],
+  columns: {
+    time_after_search_sec: "Average seconds between the first search and the end of the session",
+    search_depth: "Average page views after the first search"
+  }
+}
+
+WITH
+searches AS (
+  SELECT event_date, session_key, event_ts, search_term
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name = 'view_search_results'
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+per_session AS (
+  SELECT
+    s.event_date,
+    s.session_key,
+    COUNT(*) AS searches,
+    COUNT(DISTINCT s.search_term) AS unique_terms,
+    MIN(s.event_ts) AS first_search_ts,
+    MAX(s.event_ts) AS last_search_ts
+  FROM searches AS s
+  GROUP BY 1, 2
+),
+
+after_search AS (
+  SELECT
+    p.session_key,
+    ANY_VALUE(p.event_date) AS event_date,
+    ANY_VALUE(p.searches) AS searches,
+    ANY_VALUE(p.unique_terms) AS unique_terms,
+    COUNTIF(v.event_ts > p.first_search_ts) AS pageviews_after_search,
+    COUNTIF(v.event_ts > p.last_search_ts) AS pageviews_after_last_search,
+    TIMESTAMP_DIFF(MAX(b.session_end_ts), ANY_VALUE(p.first_search_ts), SECOND) AS seconds_after_search
+  FROM per_session AS p
+  LEFT JOIN ${ref("int_ga4__page_views")} AS v
+    ON v.session_key = p.session_key
+    AND v.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 91 DAY)
+  LEFT JOIN ${ref("int_ga4__sessions_base")} AS b
+    ON b.session_key = p.session_key
+    AND b.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 91 DAY)
+  GROUP BY p.session_key
+)
+
+SELECT
+  event_date,
+  COUNT(*) AS sessions_with_search,
+  SUM(searches) AS total_searches,
+  SUM(unique_terms) AS total_unique_searches,
+  SAFE_DIVIDE(SUM(searches), SUM(unique_terms)) AS results_pageviews_per_search,
+  SAFE_DIVIDE(COUNTIF(pageviews_after_last_search = 0), COUNT(*)) AS pct_search_exits,
+  SAFE_DIVIDE(COUNTIF(searches > 1), COUNT(*)) AS pct_search_refinements,
+  AVG(seconds_after_search) AS time_after_search_sec,
+  AVG(pageviews_after_search) AS search_depth,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM after_search
+GROUP BY event_date

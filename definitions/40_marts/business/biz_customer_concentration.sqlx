@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_customer_concentration",
+  description: "How concentrated is the revenue of the last 365 days: share of the top 1% / 5% / 10% / 20% customers (Pareto) and the Gini coefficient. High concentration = VIP program is mandatory and losing 50 customers hurts",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    gini: "0 = everybody spends the same, 1 = one customer has all the revenue"
+  }
+}
+
+WITH
+customer_revenue AS (
+  SELECT user_key, SUM(revenue) AS revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+  GROUP BY user_key
+),
+
+ranked AS (
+  SELECT
+    revenue,
+    ROW_NUMBER() OVER (ORDER BY revenue DESC) AS rank_desc,
+    ROW_NUMBER() OVER (ORDER BY revenue ASC) AS rank_asc,
+    COUNT(*) OVER () AS n,
+    SUM(revenue) OVER () AS total_revenue
+  FROM customer_revenue
+)
+
+SELECT
+  ANY_VALUE(n) AS customers,
+  ANY_VALUE(total_revenue) AS total_revenue,
+  SAFE_DIVIDE(SUM(IF(rank_desc <= GREATEST(1, CAST(n * 0.01 AS INT64)), revenue, 0)), ANY_VALUE(total_revenue)) AS top_1_pct_share,
+  SAFE_DIVIDE(SUM(IF(rank_desc <= GREATEST(1, CAST(n * 0.05 AS INT64)), revenue, 0)), ANY_VALUE(total_revenue)) AS top_5_pct_share,
+  SAFE_DIVIDE(SUM(IF(rank_desc <= GREATEST(1, CAST(n * 0.10 AS INT64)), revenue, 0)), ANY_VALUE(total_revenue)) AS top_10_pct_share,
+  SAFE_DIVIDE(SUM(IF(rank_desc <= GREATEST(1, CAST(n * 0.20 AS INT64)), revenue, 0)), ANY_VALUE(total_revenue)) AS top_20_pct_share,
+  -- Gini with the sorted formula: G = (2 * sum(i * x_i)) / (n * sum(x)) - (n + 1) / n
+  SAFE_DIVIDE(2 * SUM(rank_asc * revenue), ANY_VALUE(n) * ANY_VALUE(total_revenue)) - SAFE_DIVIDE(ANY_VALUE(n) + 1, ANY_VALUE(n)) AS gini,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ranked

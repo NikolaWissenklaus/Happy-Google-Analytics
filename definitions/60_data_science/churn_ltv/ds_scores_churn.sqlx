@@ -1,0 +1,28 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_scores_churn",
+  disabled: !constants.ENABLE.bqml,
+  description: "Churn risk (no session in the next 30 days) of every active customer today, BQML model, with risk band",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "scores" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional"]
+}
+
+SELECT
+  user_key,
+  (SELECT p.prob FROM UNNEST(predicted_churned_30d_probs) AS p WHERE p.label = 1) AS churn_risk,
+  CASE
+    WHEN (SELECT p.prob FROM UNNEST(predicted_churned_30d_probs) AS p WHERE p.label = 1) >= 0.7 THEN 'high'
+    WHEN (SELECT p.prob FROM UNNEST(predicted_churned_30d_probs) AS p WHERE p.label = 1) >= 0.4 THEN 'medium'
+    ELSE 'low'
+  END AS churn_band,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ML.PREDICT(
+  MODEL ${ref("ds_model_churn")},
+  (SELECT * FROM ${ref("ds_feature_snapshots")} WHERE is_current_snapshot AND is_customer)
+)

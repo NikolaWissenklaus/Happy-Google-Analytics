@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_halo_effect",
+  description: "Halo effect of internal promotions (last 90 days): in sessions that clicked a promotion, how much was spent on items that were NOT part of the promotion, vs sessions that did not click. The banner of the cheap item that sells the expensive one",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily"]
+}
+
+WITH
+promo_clicks AS (
+  SELECT DISTINCT session_key, promotion_name
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name = 'select_promotion'
+),
+
+promo_items AS (
+  -- items shown inside a promotion = items with promotion_name in view/select promotion events
+  SELECT DISTINCT promotion_name, item_id
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name IN ('view_promotion', 'select_promotion')
+    AND item_id IS NOT NULL
+),
+
+purchased_lines AS (
+  SELECT t.session_key, i.item_id, i.item_revenue
+  FROM ${ref("fct_transaction_items")} AS i
+  JOIN ${ref("fct_transactions")} AS t USING (transaction_id)
+  WHERE i.transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND i.is_valid_for_revenue
+),
+
+clicked_session_revenue AS (
+  SELECT
+    c.promotion_name,
+    c.session_key,
+    SUM(IF(pi.item_id IS NOT NULL, l.item_revenue, 0)) AS promo_item_revenue,
+    SUM(IF(pi.item_id IS NULL, l.item_revenue, 0)) AS non_promo_item_revenue
+  FROM promo_clicks AS c
+  LEFT JOIN purchased_lines AS l USING (session_key)
+  LEFT JOIN promo_items AS pi ON pi.promotion_name = c.promotion_name AND pi.item_id = l.item_id
+  GROUP BY 1, 2
+),
+
+no_click_baseline AS (
+  SELECT SAFE_DIVIDE(SUM(s.revenue), COUNT(*)) AS revenue_per_session_no_click
+  FROM ${ref("fct_sessions")} AS s
+  LEFT JOIN (SELECT DISTINCT session_key FROM promo_clicks) AS c USING (session_key)
+  WHERE s.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND c.session_key IS NULL
+    ${helpers.martSessionFilter("s")}
+)
+
+SELECT
+  promotion_name,
+  COUNT(*) AS sessions_with_click,
+  SUM(promo_item_revenue) AS promo_item_revenue,
+  SUM(non_promo_item_revenue) AS non_promo_item_revenue,
+  SAFE_DIVIDE(SUM(non_promo_item_revenue), SUM(promo_item_revenue) + SUM(non_promo_item_revenue)) AS halo_share,
+  SAFE_DIVIDE(SUM(promo_item_revenue) + SUM(non_promo_item_revenue), COUNT(*)) AS revenue_per_clicking_session,
+  ANY_VALUE(b.revenue_per_session_no_click) AS revenue_per_session_no_click,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM clicked_session_revenue
+CROSS JOIN no_click_baseline AS b
+GROUP BY promotion_name

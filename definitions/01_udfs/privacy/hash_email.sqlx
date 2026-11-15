@@ -1,0 +1,31 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "hash_email",
+  description: "SHA256 hex of a normalized email (lower, trim). remove_gmail_dots = TRUE follows the Google Ads rule for gmail.com",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+-- Google Ads (enhanced conversions / customer match): lower + trim, and for gmail.com
+-- and googlemail.com remove the dots before the @. Meta: only lower + trim.
+-- invalid emails return NULL, never hash garbage (match rate goes down and nobody knows why)
+CREATE OR REPLACE FUNCTION ${self()}(email STRING, remove_gmail_dots BOOL) RETURNS STRING AS ((
+  SELECT
+    IF(
+      e IS NULL OR NOT REGEXP_CONTAINS(e, r'^[^@\s]+@[^@\s]+\.[^@\s]+$'),
+      NULL,
+      TO_HEX(SHA256(
+        IF(
+          COALESCE(remove_gmail_dots, FALSE) AND REGEXP_CONTAINS(e, r'@(gmail|googlemail)\.com$'),
+          CONCAT(REPLACE(SPLIT(e, '@')[SAFE_OFFSET(0)], '.', ''), '@', SPLIT(e, '@')[SAFE_OFFSET(1)]),
+          e
+        )
+      ))
+    )
+  FROM (SELECT LOWER(TRIM(email)) AS e)
+))
+OPTIONS (description = "Normalized + hashed email for ads platforms")

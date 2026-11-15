@@ -1,0 +1,31 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "path_level",
+  description: "UA style 'page path level N': path_level('/blog/2024/post-x', 1) = '/blog/', level 3 = '/post-x'",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- who remembers the UA content drilldown report? this is the base of it.
+CREATE OR REPLACE FUNCTION ${self()}(path STRING, level INT64) RETURNS STRING AS ((
+  SELECT
+    CASE
+      WHEN path IS NULL OR level IS NULL OR level < 1 THEN NULL
+      WHEN ARRAY_LENGTH(segments) = 0 THEN IF(level = 1, '/', NULL)
+      WHEN level > ARRAY_LENGTH(segments) THEN NULL
+      ELSE CONCAT('/', segments[OFFSET(level - 1)], IF(level < ARRAY_LENGTH(segments), '/', ''))
+    END
+  FROM (
+    SELECT ARRAY(
+      SELECT segment
+      FROM UNNEST(SPLIT(REGEXP_EXTRACT(path, r'^([^?#]*)'), '/')) AS segment WITH OFFSET AS pos
+      WHERE segment != ''
+      ORDER BY pos
+    ) AS segments
+  )
+))
+OPTIONS (description = "UA content drilldown page path level")

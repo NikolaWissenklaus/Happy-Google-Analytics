@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "br_uf_from_region",
+  description: "Brazilian UF (SP, RJ, MG...) from GA4 country + region ('State of Sao Paulo', 'São Paulo', 'Federal District'...)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "calendar"]
+}
+
+-- GA4 writes the states in english, sometimes with "State of", sometimes with accents.
+-- the business wants "SP". here we go.
+CREATE OR REPLACE FUNCTION ${self()}(country STRING, region STRING) RETURNS STRING AS ((
+  SELECT
+    IF(
+      LOWER(country) NOT IN ('brazil', 'brasil', 'br'),
+      NULL,
+      CASE r
+        WHEN 'acre' THEN 'AC'
+        WHEN 'alagoas' THEN 'AL'
+        WHEN 'amapa' THEN 'AP'
+        WHEN 'amazonas' THEN 'AM'
+        WHEN 'bahia' THEN 'BA'
+        WHEN 'ceara' THEN 'CE'
+        WHEN 'federal district' THEN 'DF'
+        WHEN 'distrito federal' THEN 'DF'
+        WHEN 'brasilia' THEN 'DF'
+        WHEN 'espirito santo' THEN 'ES'
+        WHEN 'goias' THEN 'GO'
+        WHEN 'maranhao' THEN 'MA'
+        WHEN 'mato grosso' THEN 'MT'
+        WHEN 'mato grosso do sul' THEN 'MS'
+        WHEN 'minas gerais' THEN 'MG'
+        WHEN 'para' THEN 'PA'
+        WHEN 'paraiba' THEN 'PB'
+        WHEN 'parana' THEN 'PR'
+        WHEN 'pernambuco' THEN 'PE'
+        WHEN 'piaui' THEN 'PI'
+        WHEN 'rio de janeiro' THEN 'RJ'
+        WHEN 'rio grande do norte' THEN 'RN'
+        WHEN 'rio grande do sul' THEN 'RS'
+        WHEN 'rondonia' THEN 'RO'
+        WHEN 'roraima' THEN 'RR'
+        WHEN 'santa catarina' THEN 'SC'
+        WHEN 'sao paulo' THEN 'SP'
+        WHEN 'sergipe' THEN 'SE'
+        WHEN 'tocantins' THEN 'TO'
+        ELSE NULL
+      END
+    )
+  FROM (
+    SELECT TRIM(REGEXP_REPLACE(
+      LOWER(REGEXP_REPLACE(NORMALIZE(region, NFD), r'\p{M}', '')),
+      r'^(state of|estado de|estado do|estado da)\s+', ''
+    )) AS r
+  )
+))
+OPTIONS (description = "Brazilian state code from GA4 region")

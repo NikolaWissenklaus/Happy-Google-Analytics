@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_top_conversion_paths",
+  description: "GA4 'Conversion paths' / UA MCF 'Top Conversion Paths': most common channel paths to each key event (last 90 days), with conversions, value, average path length and days to convert",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "ua_report"]
+}
+
+WITH paths AS (
+  SELECT
+    key_event_name,
+    channel_path_dedup AS channel_path,
+    COUNT(*) AS conversions,
+    SUM(conversion_value) AS conversion_value,
+    AVG(path_length) AS avg_touches,
+    AVG(time_lag_days) AS avg_days_to_convert,
+    APPROX_QUANTILES(time_lag_days, 2)[OFFSET(1)] AS median_days_to_convert
+  FROM ${ref("attr_conversion_paths")}
+  WHERE conversion_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  ARRAY_LENGTH(SPLIT(channel_path, ' > ')) AS distinct_steps,
+  SAFE_DIVIDE(conversions, SUM(conversions) OVER (PARTITION BY key_event_name)) AS share_of_conversions,
+  ROW_NUMBER() OVER (PARTITION BY key_event_name ORDER BY conversions DESC) AS path_rank,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM paths
+QUALIFY path_rank <= 500

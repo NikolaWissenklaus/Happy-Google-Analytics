@@ -1,0 +1,44 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_propensity_gains",
+  disabled: !constants.ENABLE.bqml,
+  description: "Gains / lift table of the propensity model on the out of time holdout (newest training snapshot, never seen in training): purchase rate per decile, lift vs average and cumulative share of buyers captured. 'Top 20% of the score has 63% of the buyers' is how you sell a model to marketing",
+  bigquery: {
+    labels: { layer: "data_science", domain: "models" }
+  },
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+WITH
+holdout AS (
+  SELECT *
+  FROM ${ref("ds_feature_snapshots")}
+  WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM ${ref("ds_feature_snapshots")} WHERE NOT is_current_snapshot)
+),
+
+scored AS (
+  SELECT
+    will_purchase_7d,
+    (SELECT p.prob FROM UNNEST(predicted_will_purchase_7d_probs) AS p WHERE p.label = 1) AS score
+  FROM ML.PREDICT(MODEL ${ref("ds_model_purchase_propensity")}, (SELECT * FROM holdout))
+),
+
+deciles AS (
+  SELECT *, 11 - NTILE(10) OVER (ORDER BY score) AS decile_from_top FROM scored
+)
+
+SELECT
+  decile_from_top,
+  COUNT(*) AS users,
+  SUM(will_purchase_7d) AS buyers,
+  AVG(will_purchase_7d) AS purchase_rate,
+  SAFE_DIVIDE(AVG(will_purchase_7d), (SELECT AVG(will_purchase_7d) FROM deciles)) AS lift,
+  SAFE_DIVIDE(SUM(SUM(will_purchase_7d)) OVER (ORDER BY decile_from_top), (SELECT SUM(will_purchase_7d) FROM deciles)) AS cumulative_buyers_captured,
+  MIN(score) AS min_score,
+  MAX(score) AS max_score,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM deciles
+GROUP BY decile_from_top

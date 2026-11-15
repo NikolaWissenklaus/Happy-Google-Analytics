@@ -1,0 +1,64 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_ensemble",
+  description: "The judge: joins the 8 detection methods (+ BQML ARIMA_PLUS when enable_bqml) and raises an alert only when enough of them agree. Holidays and retail dates (from dim_calendar) need more votes, a Black Friday spike is not an incident. Severity by votes and size of the deviation",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["is_alert", "metric"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily", "alerts"],
+  columns: {
+    votes: "How many methods flagged the point",
+    methods_flagged: "Names of the methods that flagged it",
+    deviation_pct: "(value - expected) / expected, with expected = same weekday baseline",
+    severity: "critical | high | medium | low"
+  }
+}
+
+js {
+  const methods = ["anom_zscore", "anom_same_weekday", "anom_mad", "anom_iqr", "anom_ewma", "anom_cusum", "anom_spc_nelson_rules", "anom_level_shift"];
+}
+
+WITH
+all_methods AS (
+  ${methods.map(m => `SELECT metric_date, metric, breakdown, breakdown_value, value, expected, score, is_anomaly, method FROM ${ref(m)}`).join("\n  UNION ALL\n  ")}
+  ${constants.ENABLE.bqml ? `UNION ALL
+  SELECT metric_date, metric, 'all', 'all', value, expected, anomaly_probability, is_anomaly, 'arima_plus' FROM ${ref("ds_kpi_forecast_anomalies")}` : ""}
+),
+
+votes AS (
+  SELECT
+    metric_date,
+    metric,
+    breakdown,
+    breakdown_value,
+    ANY_VALUE(value) AS value,
+    ANY_VALUE(IF(method = 'same_weekday', expected, NULL)) AS expected_same_weekday,
+    ANY_VALUE(IF(method = 'zscore', score, NULL)) AS zscore,
+    COUNTIF(is_anomaly) AS votes,
+    COUNT(DISTINCT method) AS methods_available,
+    ARRAY_AGG(IF(is_anomaly, method, NULL) IGNORE NULLS ORDER BY method) AS methods_flagged
+  FROM all_methods
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  v.*,
+  SAFE_DIVIDE(v.value - v.expected_same_weekday, ABS(v.expected_same_weekday)) AS deviation_pct,
+  IF(v.value >= v.expected_same_weekday, 'up', 'down') AS direction,
+  COALESCE(c.is_special_day, FALSE) AS is_special_day,
+  COALESCE(c.holiday_name, c.retail_event) AS special_day_name,
+  v.votes >= IF(COALESCE(c.is_special_day, FALSE), ${cfg_anomaly.ensemble_min_votes_on_special_days}, ${cfg_anomaly.ensemble_min_votes}) AS is_alert,
+  CASE
+    WHEN v.votes >= 7 OR ABS(COALESCE(v.zscore, 0)) >= 6 THEN 'critical'
+    WHEN v.votes >= 5 THEN 'high'
+    WHEN v.votes >= ${cfg_anomaly.ensemble_min_votes} THEN 'medium'
+    ELSE 'low'
+  END AS severity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM votes AS v
+LEFT JOIN ${ref("dim_calendar")} AS c ON c.date_day = v.metric_date

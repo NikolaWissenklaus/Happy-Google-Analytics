@@ -1,0 +1,24 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_scores_ltv",
+  disabled: !constants.ENABLE.bqml,
+  description: "Predicted revenue of the next 90 days for every active user (BQML regressor), with LTV decile. Bid more for the users that will be worth more (value based bidding / lookalikes)",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "scores" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional"]
+}
+
+SELECT
+  user_key,
+  GREATEST(predicted_future_revenue_90d, 0) AS predicted_revenue_90d,
+  NTILE(10) OVER (ORDER BY predicted_future_revenue_90d) AS ltv_decile,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ML.PREDICT(
+  MODEL ${ref("ds_model_ltv")},
+  (SELECT * FROM ${ref("ds_feature_snapshots")} WHERE is_current_snapshot)
+)

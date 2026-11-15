@@ -1,0 +1,24 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_param_any",
+  description: "Any GA4 param value converted to STRING. Good for exploring params you dont know the type",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(params ANY TYPE, param_key STRING) AS ((
+  SELECT COALESCE(
+    p.value.string_value,
+    CAST(p.value.int_value AS STRING),
+    CAST(p.value.double_value AS STRING),
+    CAST(p.value.float_value AS STRING)
+  )
+  FROM UNNEST(params) AS p
+  WHERE p.key = param_key
+  LIMIT 1
+))
+OPTIONS (description = "Any GA4 param as STRING")

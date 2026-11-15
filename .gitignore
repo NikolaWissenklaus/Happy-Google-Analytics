@@ -1,0 +1,24 @@
+# author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+# dataform
+.df-credentials.json
+node_modules/
+tools/node_modules/
+compiled.json
+tools/out/
+
+# python stuff from the helper scripts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# never commit exports with real user data
+*.csv
+!docs/**/*.csv

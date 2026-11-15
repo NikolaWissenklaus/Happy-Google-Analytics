@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_retention_weekly",
+  description: "Weekly cohorts (week of the first visit of the user) x weeks since the first visit (0..12): active users and retention. The GA4 cohort exploration with stitched users and any time range",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "retention"],
+  columns: {
+    weeks_since_first_visit: "0 = the week of the first visit",
+    retention: "active users in the week / cohort size",
+    is_complete: "FALSE when the week did not finish yet (do not compare it with the others)"
+  }
+}
+
+WITH
+activity AS (
+  SELECT
+    user_key,
+    DATE_TRUNC(first_seen_date, WEEK(MONDAY)) AS cohort_week,
+    DATE_DIFF(DATE_TRUNC(activity_date, WEEK(MONDAY)), DATE_TRUNC(first_seen_date, WEEK(MONDAY)), WEEK) AS weeks_since_first_visit,
+    transactions,
+    revenue
+  FROM ${ref("fct_user_daily")}
+  WHERE first_seen_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 26 WEEK)
+),
+
+cohort_size AS (
+  SELECT cohort_week, COUNT(DISTINCT user_key) AS cohort_users
+  FROM activity
+  WHERE weeks_since_first_visit = 0
+  GROUP BY 1
+)
+
+SELECT
+  a.cohort_week,
+  a.weeks_since_first_visit,
+  c.cohort_users,
+  COUNT(DISTINCT a.user_key) AS active_users,
+  SAFE_DIVIDE(COUNT(DISTINCT a.user_key), c.cohort_users) AS retention,
+  COUNT(DISTINCT IF(a.transactions > 0, a.user_key, NULL)) AS buyers,
+  SUM(a.revenue) AS revenue,
+  DATE_ADD(a.cohort_week, INTERVAL a.weeks_since_first_visit + 1 WEEK) <= CURRENT_DATE('${constants.TIMEZONE}') AS is_complete,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM activity AS a
+JOIN cohort_size AS c USING (cohort_week)
+WHERE a.weeks_since_first_visit BETWEEN 0 AND 12
+GROUP BY 1, 2, 3

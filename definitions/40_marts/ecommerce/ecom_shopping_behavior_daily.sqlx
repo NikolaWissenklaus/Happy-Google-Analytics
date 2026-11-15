@@ -1,0 +1,54 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_shopping_behavior_daily",
+  description: "UA Enhanced Ecommerce 'Shopping Behavior Analysis': all sessions -> with product views -> with add to cart -> with checkout -> with transactions, with the abandonment rates, by day, device, channel and new/returning",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "ua_report"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH agg AS (
+  SELECT
+    session_date,
+    device_category,
+    session_default_channel_group,
+    IF(is_new_user, 'new', 'returning') AS user_type,
+    COUNT(*) AS all_sessions,
+    COUNTIF(has_view_item) AS sessions_with_product_views,
+    COUNTIF(has_add_to_cart) AS sessions_with_add_to_cart,
+    COUNTIF(has_begin_checkout) AS sessions_with_checkout,
+    COUNTIF(has_purchase) AS sessions_with_transactions,
+    COUNTIF(NOT has_view_item AND NOT has_add_to_cart) AS no_shopping_activity,
+    COUNTIF(has_view_item AND NOT has_add_to_cart) AS no_cart_addition,
+    COUNTIF(is_cart_abandoned AND NOT has_begin_checkout) AS cart_abandonment,
+    COUNTIF(is_checkout_abandoned) AS check_out_abandonment
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(sessions_with_product_views, all_sessions) AS product_view_rate,
+  SAFE_DIVIDE(sessions_with_add_to_cart, sessions_with_product_views) AS view_to_cart_rate,
+  SAFE_DIVIDE(sessions_with_checkout, sessions_with_add_to_cart) AS cart_to_checkout_rate,
+  SAFE_DIVIDE(sessions_with_transactions, sessions_with_checkout) AS checkout_to_purchase_rate,
+  SAFE_DIVIDE(no_cart_addition, sessions_with_product_views) AS no_cart_addition_rate,
+  SAFE_DIVIDE(cart_abandonment, sessions_with_add_to_cart) AS cart_abandonment_rate,
+  SAFE_DIVIDE(check_out_abandonment, sessions_with_checkout) AS checkout_abandonment_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

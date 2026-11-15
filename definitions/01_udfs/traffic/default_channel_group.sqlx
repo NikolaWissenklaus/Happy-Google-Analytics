@@ -1,0 +1,24 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "default_channel_group",
+  description: "GA4 default channel group from source / medium / campaign. Same rules (and order) GA4 uses",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- ga4_udf.default_channel_group('l.facebook.com', 'referral', NULL) = 'Organic Social'
+-- ga4_udf.default_channel_group('google', 'cpc', 'pmax_cross-network') = 'Cross-network'
+CREATE OR REPLACE FUNCTION ${self()}(source STRING, medium STRING, campaign STRING) RETURNS STRING AS ((
+  SELECT ${channels.defaultChannelGroup("src", "med", "camp")}
+  FROM (
+    SELECT
+      ${channels.normalizeSource("LOWER(TRIM(source))")} AS src,
+      LOWER(TRIM(medium)) AS med,
+      LOWER(TRIM(campaign)) AS camp
+  )
+))
+OPTIONS (description = "GA4 default channel group")

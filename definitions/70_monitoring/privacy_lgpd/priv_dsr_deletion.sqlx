@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_deletion",
+  disabled: !constants.ENABLE.dsr_deletion,
+  description: "LGPD deletion (art. 18 VI) of the approved requests: deletes the rows of every device / user_id / user_key of the request from all user level tables of the project, logs it in priv_dsr_deletion_log and puts the hashed ids in priv_dsr_suppression_list so staging never loads them again. OFF by default (enable_dsr_deletion). Raw export only with dsr_include_raw_export",
+  dependencies: ["priv_dsr_deletion_preview"],
+  tags: ["monitoring", "lgpd", "daily"]
+}
+
+-- read docs/lgpd.md before turning this on. BigQuery keeps deleted rows in time travel
+-- (up to 7 days, set max_time_travel_hours on the datasets to make it shorter) + 7 days
+-- of fail-safe, tell the DPO that when answering the titular.
+DECLARE requests ARRAY<STRING> DEFAULT ${privacy.pendingDeletionRequestsSql(ref("priv_dsr_identifiers"), ref("priv_dsr_deletion_log"))};
+DECLARE run_id STRING DEFAULT GENERATE_UUID();
+
+IF COALESCE(ARRAY_LENGTH(requests), 0) > 0 THEN
+
+  -- 1) block first, so a run that fails in the middle still keeps them out of staging
+  INSERT INTO ${ref("priv_dsr_suppression_list")} (id_type, value_sha256, request_id, added_at)
+  SELECT DISTINCT i.id_type, TO_HEX(SHA256(i.value)), i.request_id, CURRENT_TIMESTAMP()
+  FROM ${ref("priv_dsr_identifiers")} AS i
+  WHERE i.request_id IN UNNEST(requests)
+    AND i.id_type IN ('user_pseudo_id', 'user_id')
+    AND NOT EXISTS (
+      SELECT 1 FROM ${ref("priv_dsr_suppression_list")} AS s
+      WHERE s.id_type = i.id_type AND s.value_sha256 = TO_HEX(SHA256(i.value))
+    );
+
+  -- 2) delete from every user level table of the project (matching by the hashes of the list)
+  FOR t IN (${privacy.userLevelTablesSql(ref("priv_dsr_suppression_list"), "hashed")}) DO
+    EXECUTE IMMEDIATE FORMAT(
+      "DELETE FROM `${constants.PROJECT}.%s.%s` WHERE %s",
+      t.table_schema, t.table_name, t.id_condition
+    ) USING requests AS requests;
+    INSERT INTO ${ref("priv_dsr_deletion_log")} (run_id, target_table, rows_deleted, request_ids, deleted_at)
+    VALUES (run_id, CONCAT(t.table_schema, '.', t.table_name), @@row_count, requests, CURRENT_TIMESTAMP());
+  END FOR;
+
+  ${constants.PRIVACY.dsr_include_raw_export ? `
+  -- 3) the raw GA4 export (the GA4 User Deletion API does not clean BigQuery)
+  FOR t IN (${privacy.rawExportTablesSql(ref("priv_dsr_suppression_list"), "hashed")}) DO
+    EXECUTE IMMEDIATE FORMAT(
+      "DELETE FROM \`${constants.GA4_PROJECT}.${constants.GA4_DATASET}.%s\` WHERE %s",
+      t.table_name, t.id_condition
+    ) USING requests AS requests;
+    INSERT INTO ${ref("priv_dsr_deletion_log")} (run_id, target_table, rows_deleted, request_ids, deleted_at)
+    VALUES (run_id, CONCAT('${constants.GA4_DATASET}.', t.table_name), @@row_count, requests, CURRENT_TIMESTAMP());
+  END FOR;` : `
+  -- raw export NOT cleaned (dsr_include_raw_export = false). The suppression list keeps the
+  -- person out of every table here, but the raw dataset still has them`}
+
+END IF;

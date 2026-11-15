@@ -1,0 +1,98 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_retention_overview",
+  description: "GA4 Reports > Retention, the 4 cards in one long table: new vs returning users per day, user retention by days since first visit (day 0..42), engagement per user by cohort day, and lifetime value per user by days since first visit (day 0..120). section says which card",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "retention"],
+  columns: {
+    section: "new_vs_returning | user_retention | user_engagement | lifetime_value"
+  }
+}
+
+WITH
+activity AS (
+  SELECT *
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 162 DAY)
+),
+
+cohort_users AS (
+  SELECT user_key, first_seen_date
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 42 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 DAY)
+),
+
+ltv_users AS (
+  SELECT user_key, first_seen_date
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 162 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 121 DAY)
+)
+
+SELECT
+  'new_vs_returning' AS section,
+  activity_date AS metric_date,
+  CAST(NULL AS INT64) AS day_number,
+  COUNTIF(is_first_day) AS value_1,
+  COUNTIF(NOT is_first_day) AS value_2,
+  CAST(NULL AS FLOAT64) AS rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM activity
+WHERE activity_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 42 DAY)
+GROUP BY activity_date
+
+UNION ALL
+
+-- share of the users of the last 42 days cohorts that were active N days after the first visit
+SELECT
+  'user_retention',
+  CAST(NULL AS DATE),
+  a.days_since_first_seen,
+  COUNT(DISTINCT a.user_key),
+  ANY_VALUE(t.cohort_size),
+  SAFE_DIVIDE(COUNT(DISTINCT a.user_key), ANY_VALUE(t.cohort_size)),
+  CURRENT_TIMESTAMP()
+FROM activity AS a
+JOIN cohort_users AS c USING (user_key)
+CROSS JOIN (SELECT COUNT(*) AS cohort_size FROM cohort_users) AS t
+WHERE a.days_since_first_seen BETWEEN 0 AND 42
+GROUP BY a.days_since_first_seen
+
+UNION ALL
+
+SELECT
+  'user_engagement',
+  CAST(NULL AS DATE),
+  a.days_since_first_seen,
+  COUNT(DISTINCT a.user_key),
+  CAST(SUM(a.engagement_time_sec) AS INT64),
+  SAFE_DIVIDE(SUM(a.engagement_time_sec), COUNT(DISTINCT a.user_key)),
+  CURRENT_TIMESTAMP()
+FROM activity AS a
+JOIN cohort_users AS c USING (user_key)
+WHERE a.days_since_first_seen BETWEEN 0 AND 42
+GROUP BY a.days_since_first_seen
+
+UNION ALL
+
+-- cumulative revenue per acquired user up to day N (cohorts old enough to have 120 days)
+SELECT
+  'lifetime_value',
+  CAST(NULL AS DATE),
+  d AS day_number,
+  ANY_VALUE(t.cohort_size),
+  CAST(NULL AS INT64),
+  SAFE_DIVIDE(SUM(IF(a.days_since_first_seen <= d, a.revenue, 0)), ANY_VALUE(t.cohort_size)),
+  CURRENT_TIMESTAMP()
+FROM UNNEST(GENERATE_ARRAY(0, 120)) AS d
+CROSS JOIN (SELECT COUNT(*) AS cohort_size FROM ltv_users) AS t
+LEFT JOIN (
+  SELECT a.user_key, a.days_since_first_seen, a.revenue
+  FROM activity AS a
+  JOIN ltv_users AS l USING (user_key)
+) AS a ON TRUE
+GROUP BY d

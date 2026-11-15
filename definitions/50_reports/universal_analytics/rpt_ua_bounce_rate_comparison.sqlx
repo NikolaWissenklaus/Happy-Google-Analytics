@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_bounce_rate_comparison",
+  description: "The 'why did our bounce rate drop after GA4' table (last 90 days): UA bounce (1 page, no interaction) vs GA4 bounce (not engaged) per landing page and channel, and the sessions that explain the gap (single page sessions that GA4 counts as engaged because of 10s+ or a key event)",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"],
+  columns: {
+    gap_pp: "UA bounce rate - GA4 bounce rate, in percentage points",
+    single_page_engaged_sessions: "Bounces for UA, engaged for GA4. They are most of the gap",
+    multi_page_not_engaged_sessions: "The opposite (rare): more than one page but GA4 says not engaged, usually missing session_engaged param"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT
+    COALESCE(landing_page_path, '(not set)') AS landing_page_path,
+    COALESCE(session_default_channel_group, 'Unassigned') AS channel,
+    is_bounce_ua,
+    is_bounce_ga4,
+    page_views + screen_views AS views
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+)
+
+SELECT
+  landing_page_path,
+  channel,
+  COUNT(*) AS sessions,
+  SAFE_DIVIDE(COUNTIF(is_bounce_ua), COUNT(*)) AS ua_bounce_rate,
+  SAFE_DIVIDE(COUNTIF(is_bounce_ga4), COUNT(*)) AS ga4_bounce_rate,
+  100 * (SAFE_DIVIDE(COUNTIF(is_bounce_ua), COUNT(*)) - SAFE_DIVIDE(COUNTIF(is_bounce_ga4), COUNT(*))) AS gap_pp,
+  COUNTIF(is_bounce_ua AND NOT is_bounce_ga4) AS single_page_engaged_sessions,
+  COUNTIF(NOT is_bounce_ua AND is_bounce_ga4 AND views > 1) AS multi_page_not_engaged_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions
+GROUP BY landing_page_path, channel
+HAVING COUNT(*) >= 30

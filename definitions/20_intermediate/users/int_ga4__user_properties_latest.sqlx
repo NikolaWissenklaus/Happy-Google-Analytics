@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__user_properties_latest",
+  description: "Latest value of each user property per device, plus when it was seen for the first and the last time",
+  bigquery: {
+    clusterBy: ["user_pseudo_id", "property_key"],
+    labels: { layer: "intermediate", domain: "users" }
+  },
+  tags: ["ga4", "intermediate", "daily", "users"]
+}
+
+SELECT
+  user_pseudo_id,
+  property_key,
+  ARRAY_AGG(property_value ORDER BY event_date DESC, set_ts DESC LIMIT 1)[OFFSET(0)] AS property_value,
+  ARRAY_AGG(value_type ORDER BY event_date DESC LIMIT 1)[OFFSET(0)] AS value_type,
+  MIN(event_date) AS first_seen_date,
+  MAX(event_date) AS last_seen_date,
+  COUNT(DISTINCT property_value) AS distinct_values_seen,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__user_properties")}
+WHERE property_value IS NOT NULL
+GROUP BY 1, 2

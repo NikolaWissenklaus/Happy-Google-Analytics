@@ -1,0 +1,48 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_item_param_registry",
+  description: "Custom item params (items.item_params, the 'item scoped custom dimensions') seen in the last 90 days, per event: types, distinct values, items with it, first / last day and status. Standard properties allow only 10 item scoped dimensions",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily", "ecommerce"]
+}
+
+WITH unnest_params AS (
+  SELECT
+    i.event_date,
+    i.event_name,
+    p.key AS param_key,
+    CASE
+      WHEN p.value.string_value IS NOT NULL THEN 'string'
+      WHEN p.value.int_value IS NOT NULL THEN 'int'
+      WHEN p.value.double_value IS NOT NULL THEN 'double'
+      WHEN p.value.float_value IS NOT NULL THEN 'float'
+      ELSE 'null'
+    END AS value_type,
+    COALESCE(p.value.string_value, CAST(p.value.int_value AS STRING), CAST(p.value.double_value AS STRING), CAST(p.value.float_value AS STRING)) AS value_as_string
+  FROM ${ref("stg_ga4__event_items")} AS i,
+    UNNEST(i.item_params) AS p
+  WHERE i.event_date >= ${helpers.daysAgo(90)}
+)
+
+SELECT
+  event_name,
+  param_key,
+  MIN(event_date) AS first_seen_date,
+  MAX(event_date) AS last_seen_date,
+  ARRAY_AGG(DISTINCT value_type) AS value_types,
+  APPROX_COUNT_DISTINCT(value_as_string) AS distinct_values,
+  COUNT(*) AS item_rows,
+  CASE
+    WHEN MIN(event_date) >= ${helpers.daysAgo(7)} THEN 'new'
+    WHEN MAX(event_date) < ${helpers.daysAgo(3)} THEN 'gone'
+    WHEN COUNTIF(value_type = 'string') > 0 AND COUNTIF(value_type IN ('int', 'double', 'float')) > 0 THEN 'type_drift'
+    ELSE 'ok'
+  END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM unnest_params
+GROUP BY event_name, param_key

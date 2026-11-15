@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "is_ai_assistant",
+  description: "TRUE when the source is an AI assistant (chatgpt, perplexity, gemini, copilot, claude, deepseek...)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(source STRING) RETURNS BOOL AS ((
+  SELECT COALESCE(${channels.isAiAssistant("s")}, FALSE)
+  FROM (SELECT ${channels.normalizeSource("LOWER(TRIM(source))")} AS s)
+))
+OPTIONS (description = "AI assistant referral check")

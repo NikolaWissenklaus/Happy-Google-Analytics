@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_organic_daily",
+  description: "Organic search per day, search engine, landing page and device (session own source, no carry over: this is what organic really brought that day). Works without Search Console",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["search_engine", "landing_page_path"],
+    labels: { layer: "marts", domain: "seo" }
+  },
+  tags: ["marts", "seo", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH agg AS (
+  SELECT
+    session_date,
+    session_source_only AS search_engine,
+    landing_page_path,
+    landing_page_type,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    AND session_channel_only IN ('Organic Search', 'Organic Shopping')
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

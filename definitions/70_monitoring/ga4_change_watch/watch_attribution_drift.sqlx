@@ -1,0 +1,50 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_attribution_drift",
+  description: "Our default channel group against the one GA4 itself exports (session_traffic_source_last_click), per day: agreement rate, the top disagreements and a drift flag. When GA4 changes the channel rules (it already did: Paid Shopping, Cross-network, Mobile Push...) or our cfg_channels breaks, the agreement drops here first",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily", "attribution"],
+  columns: {
+    agreement_rate: "Sessions where our channel = GA4 channel / sessions where GA4 sent a channel",
+    is_drift: "Agreement more than 5 points below the 28 days before"
+  }
+}
+
+WITH
+pairs AS (
+  SELECT
+    session_date,
+    COALESCE(session_default_channel_group, 'Unassigned') AS our_channel,
+    ga4_native_default_channel_group AS ga4_channel,
+    COUNT(*) AS sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(120)}
+    AND ga4_native_default_channel_group IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+per_day AS (
+  SELECT
+    session_date,
+    SUM(sessions) AS sessions_with_ga4_channel,
+    SAFE_DIVIDE(SUM(IF(LOWER(our_channel) = LOWER(ga4_channel), sessions, 0)), SUM(sessions)) AS agreement_rate,
+    ARRAY_AGG(
+      IF(LOWER(our_channel) != LOWER(ga4_channel), STRUCT(our_channel, ga4_channel, sessions), NULL)
+      IGNORE NULLS ORDER BY sessions DESC LIMIT 5
+    ) AS top_disagreements
+  FROM pairs
+  GROUP BY session_date
+)
+
+SELECT
+  *,
+  AVG(agreement_rate) OVER (ORDER BY UNIX_DATE(session_date) RANGE BETWEEN 28 PRECEDING AND 1 PRECEDING) AS agreement_rate_28d_before,
+  COALESCE(agreement_rate < AVG(agreement_rate) OVER (ORDER BY UNIX_DATE(session_date) RANGE BETWEEN 28 PRECEDING AND 1 PRECEDING) - 0.05, FALSE) AS is_drift,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_day

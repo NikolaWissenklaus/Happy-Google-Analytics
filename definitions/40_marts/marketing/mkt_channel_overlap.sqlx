@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_channel_overlap",
+  description: "Channel synergy: for each pair of channels, how many users touched both in the last 90 days and how the conversion of those users compares with users that touched only one of them. Lift > 1 = channels that work better together",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "attribution"],
+  columns: {
+    conversion_rate_both: "Share of users with both channels that purchased",
+    lift_vs_single: "conversion_rate_both / conversion rate of users that touched only channel_a or only channel_b"
+  }
+}
+
+WITH
+user_channels AS (
+  SELECT
+    user_key,
+    ARRAY_AGG(DISTINCT session_default_channel_group) AS channels,
+    LOGICAL_OR(has_purchase) AS purchased
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY user_key
+),
+
+channel_list AS (
+  SELECT DISTINCT channel FROM user_channels, UNNEST(channels) AS channel
+),
+
+pairs AS (
+  SELECT a.channel AS channel_a, b.channel AS channel_b
+  FROM channel_list AS a
+  JOIN channel_list AS b ON a.channel < b.channel
+),
+
+per_pair AS (
+  SELECT
+    p.channel_a,
+    p.channel_b,
+    COUNTIF(p.channel_a IN UNNEST(u.channels) AND p.channel_b IN UNNEST(u.channels)) AS users_both,
+    COUNTIF(p.channel_a IN UNNEST(u.channels) AND p.channel_b IN UNNEST(u.channels) AND u.purchased) AS buyers_both,
+    COUNTIF((p.channel_a IN UNNEST(u.channels)) != (p.channel_b IN UNNEST(u.channels))) AS users_only_one,
+    COUNTIF((p.channel_a IN UNNEST(u.channels)) != (p.channel_b IN UNNEST(u.channels)) AND u.purchased) AS buyers_only_one,
+    COUNTIF(p.channel_a IN UNNEST(u.channels)) AS users_a,
+    COUNTIF(p.channel_b IN UNNEST(u.channels)) AS users_b
+  FROM pairs AS p
+  CROSS JOIN user_channels AS u
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(users_both, users_a + users_b - users_both) AS jaccard_overlap,
+  SAFE_DIVIDE(buyers_both, users_both) AS conversion_rate_both,
+  SAFE_DIVIDE(buyers_only_one, users_only_one) AS conversion_rate_only_one,
+  SAFE_DIVIDE(SAFE_DIVIDE(buyers_both, users_both), SAFE_DIVIDE(buyers_only_one, users_only_one)) AS lift_vs_single,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_pair
+WHERE users_both >= 30

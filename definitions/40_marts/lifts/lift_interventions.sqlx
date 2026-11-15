@@ -1,0 +1,104 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.lifts,
+  name: "lift_interventions",
+  description: "Did the change work? One row per intervention x metric of cfg_lifts.js: post period actual vs counterfactual, lift %, 95% interval, p value, cumulative effect (additive metrics) and a verdict that also says when the pre period fit is too poor to trust. 'CausalImpact-lite' in SQL: the interval assumes independent days, so read the p value as optimistic",
+  bigquery: {
+    labels: { layer: "marts", domain: "lifts" }
+  },
+  tags: ["marts", "lifts", "daily"],
+  columns: {
+    pre_fit_mape: "Mean absolute % error of the counterfactual in the pre period. Above 25% the model does not explain the series, the verdict says so",
+    lift_pct: "average daily effect / average counterfactual of the post period",
+    cumulative_effect: "Sum of the daily effects (only for additive metrics: sessions, transactions, revenue...)",
+    verdict: "significant_positive | significant_negative | no_clear_effect | pre_period_fit_too_poor | not_enough_post_days"
+  }
+}
+
+js {
+  const additive = ["sessions", "engaged_sessions", "transactions", "revenue"];
+}
+
+WITH
+days AS (
+  SELECT * FROM ${ref("lift_interventions_daily")}
+),
+
+pre_fit AS (
+  SELECT
+    intervention_name,
+    metric,
+    COUNT(*) AS pre_days_used,
+    STDDEV(effect) AS residual_sd,
+    AVG(ABS(SAFE_DIVIDE(effect, actual))) AS pre_fit_mape
+  FROM days
+  WHERE period = 'pre'
+  GROUP BY 1, 2
+),
+
+post AS (
+  SELECT
+    intervention_name,
+    metric,
+    ANY_VALUE(method) AS method,
+    COUNT(*) AS post_days_used,
+    AVG(actual) AS post_actual_avg,
+    AVG(counterfactual) AS post_counterfactual_avg,
+    AVG(effect) AS avg_daily_effect,
+    SUM(effect) AS cumulative_effect
+  FROM days
+  WHERE period = 'post'
+  GROUP BY 1, 2
+),
+
+tested AS (
+  SELECT
+    p.*,
+    f.pre_days_used,
+    f.pre_fit_mape,
+    SAFE_DIVIDE(f.residual_sd, SQRT(p.post_days_used)) AS se_avg_effect
+  FROM post AS p
+  JOIN pre_fit AS f USING (intervention_name, metric)
+),
+
+with_p AS (
+  SELECT
+    *,
+    2 * (1 - ${ref("normal_cdf")}(ABS(SAFE_DIVIDE(avg_daily_effect, se_avg_effect)))) AS p_value
+  FROM tested
+)
+
+SELECT
+  i.intervention_name,
+  i.description,
+  i.start_date,
+  i.end_date,
+  w.metric,
+  w.method,
+  i.segment_dimension,
+  i.segment_value,
+  i.control_dimension,
+  i.control_value,
+  w.pre_days_used,
+  w.post_days_used,
+  ROUND(w.pre_fit_mape, 4) AS pre_fit_mape,
+  w.post_actual_avg,
+  w.post_counterfactual_avg,
+  w.avg_daily_effect,
+  IF(w.metric IN (${helpers.sqlList(additive)}), w.cumulative_effect, NULL) AS cumulative_effect,
+  SAFE_DIVIDE(w.avg_daily_effect, w.post_counterfactual_avg) AS lift_pct,
+  SAFE_DIVIDE(w.avg_daily_effect - 1.96 * w.se_avg_effect, w.post_counterfactual_avg) AS lift_ci_low,
+  SAFE_DIVIDE(w.avg_daily_effect + 1.96 * w.se_avg_effect, w.post_counterfactual_avg) AS lift_ci_high,
+  w.p_value,
+  CASE
+    WHEN w.post_days_used < 7 THEN 'not_enough_post_days'
+    WHEN w.pre_fit_mape > 0.25 THEN 'pre_period_fit_too_poor'
+    WHEN w.p_value < 0.05 AND w.avg_daily_effect > 0 THEN 'significant_positive'
+    WHEN w.p_value < 0.05 THEN 'significant_negative'
+    ELSE 'no_clear_effect'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_p AS w
+JOIN ${ref("seed_lift_interventions")} AS i USING (intervention_name)

@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_new_values",
+  description: "Values seen for the first time in the last 7 days (new hostname = site clone / scraper / new subdomain, new app_version = release, new currency or payment type = someone changed the checkout...)",
+  tags: ["monitoring", "ga4_watch", "daily"]
+}
+
+SELECT
+  dimension,
+  value,
+  first_seen_date,
+  last_seen_date,
+  recent_events,
+  CASE
+    WHEN dimension = 'hostname' AND NOT (${constants.SITE_HOSTNAMES.length > 0 ? `LOWER(value) IN (${helpers.sqlList(constants.SITE_HOSTNAMES)})` : `FALSE`}) THEN 'warning'
+    WHEN dimension IN ('stream_id', 'currency', 'traffic_type') THEN 'warning'
+    ELSE 'info'
+  END AS severity
+FROM ${ref("watch_dimension_values")}
+WHERE first_seen_date >= ${helpers.daysAgo(7)}
+  -- the first load would list everything as new
+  AND first_seen_date > (SELECT MIN(first_seen_date) FROM ${ref("watch_dimension_values")})

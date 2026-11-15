@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_first_touch_quality",
+  description: "Quality of the acquisition: users grouped by acquisition month and FIRST channel, with conversion and revenue per user after 7 / 30 / 90 days and 30 day return rate. Cheap traffic that never buys shows up here",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "cohorts"],
+  columns: {
+    acquisition_month: "Month of the first session of the user",
+    revenue_per_user_90d: "Revenue in the first 90 days / new users. Only filled for cohorts older than 90 days (no half baked numbers)",
+    returned_30d_rate: "Users with another active day between day 1 and day 30 after the first one"
+  }
+}
+
+WITH
+new_users AS (
+  SELECT user_key, first_seen_date, first_channel, first_custom_channel, first_source, first_medium, first_device_category
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= ${helpers.martWindowStart()}
+),
+
+user_outcomes AS (
+  SELECT
+    n.user_key,
+    SUM(IF(d.days_since_first_seen <= 7, d.revenue, 0)) AS revenue_7d,
+    SUM(IF(d.days_since_first_seen <= 30, d.revenue, 0)) AS revenue_30d,
+    SUM(IF(d.days_since_first_seen <= 90, d.revenue, 0)) AS revenue_90d,
+    LOGICAL_OR(d.days_since_first_seen <= 7 AND d.transactions > 0) AS bought_7d,
+    LOGICAL_OR(d.days_since_first_seen <= 30 AND d.transactions > 0) AS bought_30d,
+    LOGICAL_OR(d.days_since_first_seen <= 90 AND d.transactions > 0) AS bought_90d,
+    LOGICAL_OR(d.days_since_first_seen BETWEEN 1 AND 30) AS returned_30d
+  FROM new_users AS n
+  JOIN ${ref("fct_user_daily")} AS d USING (user_key)
+  GROUP BY n.user_key
+)
+
+SELECT
+  DATE_TRUNC(n.first_seen_date, MONTH) AS acquisition_month,
+  n.first_channel,
+  n.first_custom_channel,
+  n.first_device_category,
+  COUNT(*) AS new_users,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), LAST_DAY(DATE_TRUNC(n.first_seen_date, MONTH)), DAY) AS days_since_cohort_end,
+  SAFE_DIVIDE(COUNTIF(o.bought_7d), COUNT(*)) AS conversion_7d,
+  SAFE_DIVIDE(COUNTIF(o.bought_30d), COUNT(*)) AS conversion_30d,
+  IF(DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), LAST_DAY(DATE_TRUNC(n.first_seen_date, MONTH)), DAY) >= 90, SAFE_DIVIDE(COUNTIF(o.bought_90d), COUNT(*)), NULL) AS conversion_90d,
+  SAFE_DIVIDE(SUM(o.revenue_7d), COUNT(*)) AS revenue_per_user_7d,
+  SAFE_DIVIDE(SUM(o.revenue_30d), COUNT(*)) AS revenue_per_user_30d,
+  IF(DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), LAST_DAY(DATE_TRUNC(n.first_seen_date, MONTH)), DAY) >= 90, SAFE_DIVIDE(SUM(o.revenue_90d), COUNT(*)), NULL) AS revenue_per_user_90d,
+  SAFE_DIVIDE(COUNTIF(o.returned_30d), COUNT(*)) AS returned_30d_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM new_users AS n
+LEFT JOIN user_outcomes AS o USING (user_key)
+GROUP BY 1, 2, 3, 4

@@ -1,0 +1,52 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_category_brand_daily",
+  description: "Category and brand performance per day (rollup of ecom_item_performance_daily with the CURRENT catalog attributes from dim_items, so renamed categories dont split the history)",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["item_category", "item_brand"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["ecom_item_performance_daily"] })}
+}
+
+WITH agg AS (
+  SELECT
+    p.event_date,
+    COALESCE(d.item_category, p.item_category, '(not set)') AS item_category,
+    COALESCE(d.item_category2, '(not set)') AS item_category2,
+    COALESCE(d.item_brand, p.item_brand, '(not set)') AS item_brand,
+    COUNT(DISTINCT p.item_id) AS active_items,
+    SUM(p.list_impressions) AS list_impressions,
+    SUM(p.list_clicks) AS list_clicks,
+    SUM(p.detail_views) AS detail_views,
+    SUM(p.add_to_carts) AS add_to_carts,
+    SUM(p.checkouts) AS checkouts,
+    SUM(p.unique_purchases) AS unique_purchases,
+    SUM(p.units_sold) AS units_sold,
+    SUM(p.item_revenue) AS item_revenue,
+    SUM(p.item_refund_value) AS item_refund_value
+  FROM ${ref("ecom_item_performance_daily")} AS p
+  LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+  WHERE p.event_date >= run_from
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(add_to_carts, detail_views) AS cart_to_detail_rate,
+  SAFE_DIVIDE(unique_purchases, detail_views) AS buy_to_detail_rate,
+  SAFE_DIVIDE(item_revenue, SUM(item_revenue) OVER (PARTITION BY event_date)) AS revenue_share_of_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

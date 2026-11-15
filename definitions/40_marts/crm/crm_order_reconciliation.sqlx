@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.crm,
+  name: "crm_order_reconciliation",
+  disabled: !constants.ENABLE.crm,
+  description: "Order by order reconciliation of the last 180 days between GA4 and the backend: matched, missing_in_ga4 (tracking loss: adblock, ITP, consent, thank you page not loaded, boleto paid later), missing_in_backend (tests, fake orders, duplicated ids) and the value difference. The audit trail finance asks for every month",
+  bigquery: {
+    partitionBy: "order_date",
+    clusterBy: ["match_status"],
+    labels: { layer: "marts", domain: "crm" }
+  },
+  tags: ["marts", "crm", "daily", "optional", "data_quality"],
+  columns: {
+    match_status: "matched | missing_in_ga4 | missing_in_backend",
+    value_difference: "backend order value - GA4 revenue (shipping and discounts explain small differences)"
+  }
+}
+
+WITH
+backend AS (
+  SELECT *
+  FROM ${ref("stg_crm__orders")}
+  WHERE order_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND COALESCE(sales_channel, 'site') IN ('site', 'app', 'web', 'ecommerce')
+),
+
+ga4 AS (
+  SELECT *
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 182 DAY)
+)
+
+SELECT
+  COALESCE(b.order_date, g.transaction_date) AS order_date,
+  COALESCE(b.ga4_transaction_id, g.transaction_id) AS transaction_id,
+  CASE
+    WHEN b.order_id IS NOT NULL AND g.transaction_id IS NOT NULL THEN 'matched'
+    WHEN b.order_id IS NOT NULL THEN 'missing_in_ga4'
+    ELSE 'missing_in_backend'
+  END AS match_status,
+  b.order_status_group,
+  b.payment_method_group,
+  b.is_paid,
+  b.order_value AS backend_value,
+  g.revenue AS ga4_revenue,
+  b.order_value - g.revenue AS value_difference,
+  g.session_default_channel_group,
+  g.device_category,
+  g.device_browser,
+  g.hostname,
+  g.is_test_transaction,
+  g.times_sent,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM backend AS b
+FULL OUTER JOIN ga4 AS g ON g.transaction_id = b.ga4_transaction_id
+WHERE COALESCE(b.order_date, g.transaction_date) >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)

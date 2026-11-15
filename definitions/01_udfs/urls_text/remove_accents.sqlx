@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "remove_accents",
+  description: "Removes accents/diacritics: 'São Paulo, ação, pão' -> 'Sao Paulo, acao, pao'",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- NFD splits "ã" into "a" + "~", then we drop the marks (\p{M})
+CREATE OR REPLACE FUNCTION ${self()}(text STRING) RETURNS STRING AS (
+  REGEXP_REPLACE(NORMALIZE(text, NFD), r'\p{M}', '')
+)
+OPTIONS (description = "Remove accents")

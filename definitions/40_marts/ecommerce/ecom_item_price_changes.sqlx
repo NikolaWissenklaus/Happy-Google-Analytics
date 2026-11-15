@@ -1,0 +1,78 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_price_changes",
+  description: "Price change log of every item, detected from the prices users saw in GA4 (no ERP needed). Every change of 2%+ in the daily median price becomes a row, with what happened to views, carts and sales after it",
+  bigquery: {
+    partitionBy: "change_date",
+    clusterBy: ["item_id"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "pricing"],
+  columns: {
+    price_change_pct: "(new price - old price) / old price",
+    cart_rate_before: "add to carts / views in the 7 days before the change",
+    cart_rate_after: "add to carts / views in the 7 days after the change (including the day of the change)"
+  }
+}
+
+WITH
+prices AS (
+  SELECT
+    *,
+    LAG(median_price) OVER (PARTITION BY item_id, currency ORDER BY event_date) AS previous_price,
+    LAG(event_date) OVER (PARTITION BY item_id, currency ORDER BY event_date) AS previous_price_date
+  FROM ${ref("int_ga4__item_prices_daily")}
+  WHERE price_observations >= 3
+),
+
+changes AS (
+  SELECT
+    item_id,
+    item_name,
+    item_category,
+    currency,
+    event_date AS change_date,
+    previous_price_date,
+    previous_price AS old_price,
+    median_price AS new_price,
+    SAFE_DIVIDE(median_price - previous_price, previous_price) AS price_change_pct
+  FROM prices
+  WHERE previous_price IS NOT NULL
+    AND ABS(SAFE_DIVIDE(median_price - previous_price, previous_price)) >= 0.02
+),
+
+around_change AS (
+  SELECT
+    c.item_id,
+    c.change_date,
+    SUM(IF(p.event_date < c.change_date, p.views, 0)) AS views_before,
+    SUM(IF(p.event_date >= c.change_date, p.views, 0)) AS views_after,
+    SUM(IF(p.event_date < c.change_date, p.add_to_carts, 0)) AS carts_before,
+    SUM(IF(p.event_date >= c.change_date, p.add_to_carts, 0)) AS carts_after,
+    SUM(IF(p.event_date < c.change_date, p.units_sold, 0)) AS units_before,
+    SUM(IF(p.event_date >= c.change_date, p.units_sold, 0)) AS units_after
+  FROM changes AS c
+  JOIN ${ref("int_ga4__item_prices_daily")} AS p
+    ON p.item_id = c.item_id
+    AND p.event_date BETWEEN DATE_SUB(c.change_date, INTERVAL 7 DAY) AND DATE_ADD(c.change_date, INTERVAL 6 DAY)
+  GROUP BY 1, 2
+)
+
+SELECT
+  c.*,
+  IF(c.price_change_pct < 0, 'price_drop', 'price_increase') AS change_type,
+  a.views_before,
+  a.views_after,
+  a.carts_before,
+  a.carts_after,
+  a.units_before,
+  a.units_after,
+  SAFE_DIVIDE(a.carts_before, a.views_before) AS cart_rate_before,
+  SAFE_DIVIDE(a.carts_after, a.views_after) AS cart_rate_after,
+  ${helpers.pctChange("a.units_after", "a.units_before")} AS units_change_pct,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM changes AS c
+LEFT JOIN around_change AS a USING (item_id, change_date)

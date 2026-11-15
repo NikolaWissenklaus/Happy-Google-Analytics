@@ -1,0 +1,114 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.lifts,
+  name: "lift_registry",
+  description: "Every lift measured in the project in one table, from the most causal to the least: A/B tests, activation holdouts, geo experiments, interventions and promotions, with the same columns (lift, interval, p value, incremental value, verdict) and the method behind it. The 'what really works' page. Behaviour associations stay out on purpose (they are not causal, see lift_behaviors_adjusted)",
+  bigquery: {
+    labels: { layer: "marts", domain: "lifts" }
+  },
+  tags: ["marts", "lifts", "daily", "business"],
+  columns: {
+    evidence_level: "1 = randomized (A/B test, holdout) | 2 = quasi experiment (geo DiD, intervention with control) | 3 = before / after (intervention without control, promotions)",
+    incremental_value: "In the unit of the source: revenue for promotions / holdouts / additive interventions, NULL when the source does not have it"
+  }
+}
+
+WITH all_lifts AS (
+  SELECT
+    'ab_test' AS lift_type,
+    1 AS evidence_level,
+    CONCAT(experiment_id, ' / ', variant_id) AS lift_id,
+    experiment_name AS name,
+    'conversion_rate' AS metric,
+    start_date,
+    end_date,
+    conversion_uplift AS relative_lift,
+    CAST(NULL AS FLOAT64) AS lift_ci_low,
+    CAST(NULL AS FLOAT64) AS lift_ci_high,
+    p_value,
+    CAST(NULL AS FLOAT64) AS incremental_value,
+    verdict,
+    'cro_ab_test_results' AS source_table
+  FROM ${ref("cro_ab_test_results")}
+  WHERE NOT is_control
+
+  ${cfg_lifts.holdout.enabled ? `
+  UNION ALL
+  SELECT
+    'activation_holdout',
+    1,
+    CONCAT(program_type, ' / ', program),
+    program,
+    'purchase_rate',
+    first_cohort,
+    last_cohort,
+    relative_lift,
+    CAST(NULL AS FLOAT64),
+    CAST(NULL AS FLOAT64),
+    p_value,
+    incremental_revenue,
+    verdict,
+    'lift_activation_holdouts'
+  FROM ${ref("lift_activation_holdouts")}` : ``}
+
+  UNION ALL
+  SELECT
+    'geo_experiment',
+    2,
+    experiment_id,
+    experiment_name,
+    'revenue',
+    CAST(NULL AS DATE),
+    CAST(NULL AS DATE),
+    relative_lift,
+    CAST(NULL AS FLOAT64),
+    CAST(NULL AS FLOAT64),
+    CAST(NULL AS FLOAT64),
+    did_revenue_per_day,
+    IF(groups_look_comparable, 'comparable_groups', 'groups_not_comparable'),
+    'ds_geo_experiment_did'
+  FROM ${ref("ds_geo_experiment_did")}
+
+  UNION ALL
+  SELECT
+    'intervention',
+    IF(control_dimension IS NULL, 3, 2),
+    CONCAT(intervention_name, ' / ', metric),
+    COALESCE(description, intervention_name),
+    metric,
+    start_date,
+    end_date,
+    lift_pct,
+    lift_ci_low,
+    lift_ci_high,
+    p_value,
+    cumulative_effect,
+    verdict,
+    'lift_interventions'
+  FROM ${ref("lift_interventions")}
+
+  UNION ALL
+  SELECT
+    'promotion',
+    3,
+    promo_id,
+    promo_name,
+    'revenue',
+    start_date,
+    end_date,
+    revenue_lift,
+    CAST(NULL AS FLOAT64),
+    CAST(NULL AS FLOAT64),
+    CAST(NULL AS FLOAT64),
+    net_incremental_revenue,
+    status,
+    'promo_calendar_lift'
+  FROM ${ref("promo_calendar_lift")}
+)
+
+SELECT
+  *,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_lifts

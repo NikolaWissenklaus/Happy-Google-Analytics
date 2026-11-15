@@ -1,0 +1,44 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_channel_mix_weekly",
+  description: "Weekly channel mix: share of sessions, new users and revenue of each channel and the change vs the previous week. Good for the stacked area chart of the monthly meeting",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"]
+}
+
+WITH
+weekly AS (
+  SELECT
+    session_week AS week_start,
+    session_custom_channel_group AS channel,
+    COUNT(*) AS sessions,
+    COUNTIF(is_new_user) AS new_users,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart()}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+),
+
+shares AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(sessions, SUM(sessions) OVER (PARTITION BY week_start)) AS share_sessions,
+    SAFE_DIVIDE(new_users, SUM(new_users) OVER (PARTITION BY week_start)) AS share_new_users,
+    SAFE_DIVIDE(revenue, SUM(revenue) OVER (PARTITION BY week_start)) AS share_revenue
+  FROM weekly
+)
+
+SELECT
+  *,
+  share_sessions - LAG(share_sessions) OVER (PARTITION BY channel ORDER BY week_start) AS share_sessions_change_pp,
+  share_revenue - LAG(share_revenue) OVER (PARTITION BY channel ORDER BY week_start) AS share_revenue_change_pp,
+  ${helpers.pctChange("revenue", "LAG(revenue) OVER (PARTITION BY channel ORDER BY week_start)")} AS revenue_wow,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM shares

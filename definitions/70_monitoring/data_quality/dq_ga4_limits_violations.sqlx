@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_ga4_limits_violations",
+  description: "Things that break GA4 collection limits (last 7 days): event names over 40 chars, param names over 40, param values hitting 100 chars (GA4 cuts them, silently), events with more than 25 params, user properties over the limits and reserved prefixes (ga_, google_, firebase_)",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "governance"]
+}
+
+js {
+  const n = cfg_tracking_plan.naming;
+  const reserved = n.reserved_prefixes.map(p => `STARTS_WITH(x, '${p}')`).join(" OR ");
+}
+
+WITH
+params AS (
+  SELECT event_name, param_key, value_length, event_id
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY)
+),
+
+params_per_event AS (
+  SELECT event_name, event_id, COUNT(*) AS params
+  FROM params
+  WHERE param_key NOT IN ('ga_session_id', 'ga_session_number', 'engagement_time_msec', 'page_location', 'page_referrer', 'page_title',
+                          'batch_page_id', 'batch_ordering_id', 'entrances', 'session_engaged', 'engaged_session_event', 'firebase_conversion',
+                          'ignore_referrer', 'debug_mode', 'term', 'source', 'medium', 'campaign')
+  GROUP BY 1, 2
+),
+
+user_props AS (
+  SELECT DISTINCT property_key, property_value
+  FROM ${ref("stg_ga4__user_properties")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY)
+)
+
+SELECT 'event_name_too_long' AS violation, event_name AS object, CAST(NULL AS STRING) AS detail, COUNT(DISTINCT event_id) AS occurrences
+FROM params WHERE LENGTH(event_name) > ${n.max_event_name_length} GROUP BY 2
+UNION ALL
+SELECT 'param_name_too_long', event_name, param_key, COUNT(*)
+FROM params WHERE LENGTH(param_key) > ${n.max_param_name_length} GROUP BY 2, 3
+UNION ALL
+SELECT 'param_value_probably_truncated', event_name, param_key, COUNT(*)
+FROM params WHERE value_length >= ${n.max_param_value_length} GROUP BY 2, 3
+UNION ALL
+SELECT 'too_many_params_in_event', event_name, CONCAT('max ', CAST(MAX(params) AS STRING), ' custom params'), COUNT(*)
+FROM params_per_event WHERE params > ${n.max_params_per_event} GROUP BY 2
+UNION ALL
+SELECT 'reserved_prefix_param', event_name, param_key, COUNT(*)
+FROM (SELECT *, param_key AS x FROM params) WHERE (${reserved}) AND param_key NOT LIKE 'ga_session%' AND param_key NOT LIKE 'firebase_screen%' AND param_key NOT IN ('firebase_conversion', 'firebase_event_origin', 'firebase_previous_screen', 'firebase_previous_class', 'firebase_previous_id', 'firebase_screen_id') GROUP BY 2, 3
+UNION ALL
+SELECT 'user_property_name_too_long', property_key, CAST(NULL AS STRING), COUNT(*)
+FROM user_props WHERE LENGTH(property_key) > ${n.max_user_property_name_length} GROUP BY 2
+UNION ALL
+SELECT 'user_property_value_probably_truncated', property_key, CAST(NULL AS STRING), COUNT(*)
+FROM user_props WHERE LENGTH(property_value) >= ${n.max_user_property_value_length} GROUP BY 2

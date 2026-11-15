@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_daily_scorecard",
+  description: "The morning table of the board: one row per day with the main KPIs and the right comparisons. Yesterday, same weekday last week and same weekday LAST YEAR (364 days, never the same date, a monday is not a saturday), plus 7 day rolling",
+  bigquery: {
+    partitionBy: "kpi_date",
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    revenue_vs_ly: "Change vs same weekday last year (kpi_date - 364)",
+    revenue_7d_vs_ly: "7 day rolling revenue vs the same 7 days last year"
+  }
+}
+
+WITH
+kpis AS (
+  SELECT
+    k.kpi_date,
+    k.sessions,
+    k.users,
+    k.orders,
+    k.valid_revenue AS revenue,
+    k.new_customer_orders,
+    k.conversion_rate,
+    k.average_order_value,
+    c.weekday_name_pt,
+    c.holiday_name,
+    c.retail_event,
+    c.is_special_day,
+    SUM(k.valid_revenue) OVER w7 AS revenue_7d,
+    SUM(k.orders) OVER w7 AS orders_7d,
+    SUM(k.sessions) OVER w7 AS sessions_7d
+  FROM ${ref("ecom_daily_kpis")} AS k
+  LEFT JOIN ${ref("dim_calendar")} AS c ON c.date_day = k.kpi_date
+  WINDOW w7 AS (ORDER BY UNIX_DATE(k.kpi_date) RANGE BETWEEN 6 PRECEDING AND CURRENT ROW)
+)
+
+SELECT
+  t.*,
+  y.revenue AS revenue_yesterday,
+  w.revenue AS revenue_last_week,
+  ly.revenue AS revenue_last_year,
+  ${helpers.pctChange("t.revenue", "y.revenue")} AS revenue_vs_yesterday,
+  ${helpers.pctChange("t.revenue", "w.revenue")} AS revenue_vs_last_week,
+  ${helpers.pctChange("t.revenue", "ly.revenue")} AS revenue_vs_ly,
+  ${helpers.pctChange("t.sessions", "ly.sessions")} AS sessions_vs_ly,
+  ${helpers.pctChange("t.orders", "ly.orders")} AS orders_vs_ly,
+  t.conversion_rate - ly.conversion_rate AS conversion_rate_vs_ly_pp,
+  ${helpers.pctChange("t.average_order_value", "ly.average_order_value")} AS aov_vs_ly,
+  ${helpers.pctChange("t.revenue_7d", "ly.revenue_7d")} AS revenue_7d_vs_ly,
+  ${helpers.pctChange("t.revenue_7d", "w.revenue_7d")} AS revenue_7d_vs_last_week,
+  ly.holiday_name AS last_year_holiday,
+  ly.retail_event AS last_year_retail_event,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM kpis AS t
+LEFT JOIN kpis AS y ON y.kpi_date = DATE_SUB(t.kpi_date, INTERVAL 1 DAY)
+LEFT JOIN kpis AS w ON w.kpi_date = DATE_SUB(t.kpi_date, INTERVAL 7 DAY)
+LEFT JOIN kpis AS ly ON ly.kpi_date = DATE_SUB(t.kpi_date, INTERVAL 364 DAY)

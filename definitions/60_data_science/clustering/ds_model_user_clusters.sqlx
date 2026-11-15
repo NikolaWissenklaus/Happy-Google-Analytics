@@ -1,0 +1,22 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_user_clusters",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML k-means over the behaviour of the active users (standardized). Data driven segments to put next to the rule based personas",
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = 'KMEANS',
+  num_clusters = ${cfg_ds.clustering.num_clusters},
+  kmeans_init_method = 'KMEANS++',
+  standardize_features = TRUE
+) AS
+SELECT ${cfg_ds.features.cluster_columns.map(c => `COALESCE(${c}, 0) AS ${c}`).join(",\n  ")}
+FROM ${ref("ds_feature_snapshots")}
+WHERE is_current_snapshot

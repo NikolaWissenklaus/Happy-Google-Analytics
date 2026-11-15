@@ -1,0 +1,16 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "url_path",
+  description: "Path of a url, as it is (keeps case and trailing slash). See clean_page_path for the normalized one",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(url STRING) RETURNS STRING AS (
+  REGEXP_EXTRACT(url, r'^(?:[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*)?([^?#]*)')
+)
+OPTIONS (description = "Raw path of a url")

@@ -1,0 +1,47 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__item_prices_daily",
+  description: "Price of each item per day, as seen by the users (median of the price in view_item / list / cart / purchase). GA4 becomes a price history database: price drops, elasticity, stockouts",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["item_id"],
+    labels: { layer: "intermediate", domain: "ecommerce" }
+  },
+  tags: ["ga4", "intermediate", "daily", "ecommerce"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__event_items"] })}
+}
+
+SELECT
+  event_date,
+  item_id,
+  ARRAY_AGG(item_name IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_name,
+  ARRAY_AGG(item_category IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_category,
+  ARRAY_AGG(item_brand IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_brand,
+  COALESCE(currency, '${constants.CURRENCY}') AS currency,
+  APPROX_QUANTILES(price, 2)[OFFSET(1)] AS median_price,
+  MIN(price) AS min_price,
+  MAX(price) AS max_price,
+  COUNT(*) AS price_observations,
+  COUNT(DISTINCT ROUND(price, 2)) AS distinct_prices,
+  COUNTIF(event_name = 'view_item') AS views,
+  COUNTIF(event_name = 'add_to_cart') AS add_to_carts,
+  SUM(IF(event_name = 'purchase', COALESCE(quantity, 1), 0)) AS units_sold,
+  SUM(IF(event_name = 'purchase', item_revenue_fixed, 0)) AS item_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__event_items")}
+WHERE event_date >= run_from
+  AND item_id IS NOT NULL
+  AND price > 0
+  AND event_name IN ('view_item', 'view_item_list', 'select_item', 'add_to_cart', 'begin_checkout', 'purchase')
+  AND NOT is_internal_traffic
+GROUP BY event_date, item_id, currency
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

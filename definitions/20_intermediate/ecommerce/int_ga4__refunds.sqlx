@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__refunds",
+  description: "GA4 refund events (full and partial). Joined with the transactions in fct_transactions to get net revenue",
+  bigquery: {
+    partitionBy: "refund_date",
+    clusterBy: ["transaction_id"],
+    labels: { layer: "intermediate", domain: "ecommerce" }
+  },
+  tags: ["ga4", "intermediate", "daily", "ecommerce"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "refund_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+SELECT
+  event_id,
+  event_date AS refund_date,
+  event_ts AS refund_ts,
+  transaction_id,
+  COALESCE(currency, '${constants.CURRENCY}') AS currency,
+  COALESCE(
+    refund_value,
+    event_value,
+    (SELECT SUM(COALESCE(i.item_refund, i.price * COALESCE(i.quantity, 1))) FROM UNNEST(items) AS i)
+  ) AS refund_value,
+  refund_value_in_usd,
+  COALESCE(items_count, 0) > 0 AS is_partial_refund,
+  items_count AS refunded_items,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")}
+WHERE event_date >= run_from
+  AND event_name = 'refund'
+  AND transaction_id IS NOT NULL
+  ${helpers.noiseFilter()}
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_media_heatmap",
+  description: "Weekday x hour heatmap per channel (last 8 weeks): sessions, conversion and revenue index vs the channel average. Media buyers use it for dayparting (when to bid more, when to pause)",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"],
+  columns: {
+    conversion_index: "conversion rate of the slot / average conversion rate of the channel. 1.3 = 30% better than usual",
+    revenue_per_session_index: "same idea for revenue per session"
+  }
+}
+
+WITH
+slots AS (
+  SELECT
+    session_custom_channel_group AS channel,
+    session_iso_weekday,
+    session_hour,
+    COUNT(*) AS sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    COUNTIF(is_engaged) AS engaged_sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 56 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  *,
+  ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sab', 'Dom'][OFFSET(session_iso_weekday - 1)] AS weekday_label,
+  SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+  SAFE_DIVIDE(revenue, sessions) AS revenue_per_session,
+  SAFE_DIVIDE(sessions, SUM(sessions) OVER (PARTITION BY channel)) AS share_of_channel_sessions,
+  SAFE_DIVIDE(SAFE_DIVIDE(transactions, sessions), SAFE_DIVIDE(SUM(transactions) OVER (PARTITION BY channel), SUM(sessions) OVER (PARTITION BY channel))) AS conversion_index,
+  SAFE_DIVIDE(SAFE_DIVIDE(revenue, sessions), SAFE_DIVIDE(SUM(revenue) OVER (PARTITION BY channel), SUM(sessions) OVER (PARTITION BY channel))) AS revenue_per_session_index,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM slots

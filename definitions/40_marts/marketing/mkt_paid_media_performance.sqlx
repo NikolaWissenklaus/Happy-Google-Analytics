@@ -1,0 +1,131 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_paid_media_performance",
+  description: "Cost (Google Ads, Meta Ads, manual) x GA4 results per day / platform / campaign: CPC, CPA, ROAS, CAC, cost per session and click-to-session rate (tracking loss detector)",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["platform", "campaign"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "costs"],
+  columns: {
+    platform: "google_ads | meta_ads | microsoft_ads | tiktok_ads | manual",
+    roas: "GA4 revenue (last non-direct click) / cost. It is NOT the platform ROAS, it is the one finance believes",
+    click_to_session_rate: "GA4 sessions / ad clicks. Much lower than ~0.8 = tracking problem, slow landing page or bot clicks",
+    cac: "cost / new customers"
+  }
+}
+
+WITH
+-- which ad platform a GA4 session belongs to (same rule of dim_campaigns)
+ga4_side AS (
+  SELECT
+    session_date AS metric_date,
+    CASE
+      WHEN session_source = 'google' AND session_medium = 'cpc' THEN 'google_ads'
+      WHEN session_source IN ('facebook', 'instagram', 'meta', 'fb', 'ig', 'an', 'messenger', 'threads') AND REGEXP_CONTAINS(session_medium, r'${channels.PAID_MEDIUM}') THEN 'meta_ads'
+      WHEN session_source = 'bing' AND session_medium = 'cpc' THEN 'microsoft_ads'
+      WHEN session_source = 'tiktok' AND REGEXP_CONTAINS(session_medium, r'${channels.PAID_MEDIUM}') THEN 'tiktok_ads'
+      ELSE NULL
+    END AS platform,
+    COALESCE(LOWER(session_campaign), '(not set)') AS campaign,
+    session_source,
+    session_medium,
+    user_pseudo_id,
+    is_new_user,
+    is_engaged,
+    transactions,
+    revenue,
+    key_events,
+    session_key
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart()}
+    ${helpers.martSessionFilter()}
+),
+
+manual_keys AS (
+  SELECT DISTINCT source, medium, campaign FROM ${ref("int_costs__unified_daily")} WHERE platform = 'manual'
+),
+
+ga4_with_manual AS (
+  SELECT
+    g.* EXCEPT (platform),
+    COALESCE(g.platform, IF(m.source IS NOT NULL, 'manual', NULL)) AS platform
+  FROM ga4_side AS g
+  LEFT JOIN manual_keys AS m
+    ON m.source = g.session_source AND m.medium = g.session_medium AND m.campaign = g.campaign
+),
+
+new_customer_sessions AS (
+  SELECT session_key, COUNT(*) AS new_customers, SUM(revenue) AS new_customer_revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_first_purchase AND is_valid_for_revenue
+  GROUP BY session_key
+),
+
+ga4_results AS (
+  SELECT
+    g.metric_date,
+    g.platform,
+    g.campaign,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT g.user_pseudo_id) AS users,
+    COUNTIF(g.is_new_user) AS new_users,
+    COUNTIF(g.is_engaged) AS engaged_sessions,
+    SUM(g.key_events) AS key_events,
+    SUM(g.transactions) AS transactions,
+    SUM(g.revenue) AS revenue,
+    SUM(COALESCE(n.new_customers, 0)) AS new_customers,
+    SUM(COALESCE(n.new_customer_revenue, 0)) AS new_customer_revenue
+  FROM ga4_with_manual AS g
+  LEFT JOIN new_customer_sessions AS n USING (session_key)
+  WHERE g.platform IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+costs AS (
+  SELECT
+    cost_date AS metric_date,
+    platform,
+    COALESCE(campaign, '(not set)') AS campaign,
+    SUM(cost) AS cost,
+    SUM(clicks) AS clicks,
+    SUM(impressions) AS impressions
+  FROM ${ref("int_costs__unified_daily")}
+  WHERE cost_date >= ${helpers.martWindowStart()}
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  COALESCE(c.metric_date, r.metric_date) AS metric_date,
+  COALESCE(c.platform, r.platform) AS platform,
+  COALESCE(c.campaign, r.campaign) AS campaign,
+  COALESCE(c.cost, 0) AS cost,
+  c.clicks AS ad_clicks,
+  c.impressions AS ad_impressions,
+  COALESCE(r.sessions, 0) AS sessions,
+  COALESCE(r.users, 0) AS users,
+  COALESCE(r.new_users, 0) AS new_users,
+  COALESCE(r.engaged_sessions, 0) AS engaged_sessions,
+  COALESCE(r.key_events, 0) AS key_events,
+  COALESCE(r.transactions, 0) AS transactions,
+  COALESCE(r.revenue, 0) AS revenue,
+  COALESCE(r.new_customers, 0) AS new_customers,
+  COALESCE(r.new_customer_revenue, 0) AS new_customer_revenue,
+  SAFE_DIVIDE(c.cost, c.clicks) AS cpc,
+  SAFE_DIVIDE(c.cost * 1000, c.impressions) AS cpm,
+  SAFE_DIVIDE(c.clicks, c.impressions) AS ctr,
+  SAFE_DIVIDE(c.cost, r.sessions) AS cost_per_session,
+  SAFE_DIVIDE(c.cost, r.transactions) AS cpa,
+  SAFE_DIVIDE(r.revenue, c.cost) AS roas,
+  SAFE_DIVIDE(c.cost, r.new_customers) AS cac,
+  SAFE_DIVIDE(r.sessions, c.clicks) AS click_to_session_rate,
+  c.metric_date IS NULL AS has_ga4_but_no_cost,
+  r.metric_date IS NULL AS has_cost_but_no_ga4,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM costs AS c
+FULL OUTER JOIN ga4_results AS r
+  ON r.metric_date = c.metric_date AND r.platform = c.platform AND r.campaign = c.campaign

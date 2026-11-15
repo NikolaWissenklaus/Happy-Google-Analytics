@@ -1,0 +1,32 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "dim_traffic_sources",
+  description: "Every source / medium ever seen (after the fixes) with both channel groups, source category, first/last seen and lifetime numbers. Handy to review the channel mapping with marketing",
+  bigquery: {
+    labels: { layer: "core", domain: "attribution" }
+  },
+  tags: ["ga4", "core", "daily", "attribution"]
+}
+
+SELECT
+  s.session_source,
+  s.session_medium,
+  s.session_source_medium,
+  ANY_VALUE(s.session_default_channel_group) AS default_channel_group,
+  ANY_VALUE(s.session_custom_channel_group) AS custom_channel_group,
+  ANY_VALUE(c.category) AS source_category,
+  ${channels.isAiAssistant("s.session_source")} AS is_ai_assistant,
+  MIN(s.session_date) AS first_seen_date,
+  MAX(s.session_date) AS last_seen_date,
+  COUNT(*) AS lifetime_sessions,
+  COUNTIF(s.is_engaged) AS lifetime_engaged_sessions,
+  SUM(s.transactions) AS lifetime_transactions,
+  SUM(s.revenue) AS lifetime_revenue,
+  COUNTIF(s.ga4_native_default_channel_group IS NOT NULL AND s.ga4_native_default_channel_group != s.session_default_channel_group) AS sessions_where_ga4_disagrees,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_sessions")} AS s
+LEFT JOIN ${ref("seed_source_categories")} AS c ON c.source = s.session_source
+GROUP BY 1, 2, 3

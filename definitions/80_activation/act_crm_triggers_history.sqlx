@@ -1,0 +1,29 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.activation,
+  name: "act_crm_triggers_history",
+  description: "Daily snapshot of the CRM triggers (holdout included, flagged): who got which trigger on which day. Base of the holdout lift (lift_activation_holdouts) and of 'how many abandoned carts per day do we have'",
+  bigquery: {
+    partitionBy: "trigger_date",
+    clusterBy: ["trigger_name"],
+    labels: { layer: "activation", destination: "crm" }
+  },
+  tags: ["activation", "daily", "crm"]
+}
+
+pre_operations {
+  ${incremental() ? `DELETE FROM ${self()} WHERE trigger_date = ${helpers.today()}` : ``}
+}
+
+SELECT
+  trigger_date,
+  trigger_name,
+  user_key,
+  user_id,
+  trigger_ts,
+  value_at_stake,
+  is_holdout,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("act_crm_triggers_all")}

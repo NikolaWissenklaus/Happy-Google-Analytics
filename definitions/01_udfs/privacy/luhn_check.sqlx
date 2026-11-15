@@ -1,0 +1,30 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "luhn_check",
+  description: "Luhn check for credit card like numbers (13 to 19 digits). A card number in GA4 is a PCI incident, not only LGPD",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(value STRING) RETURNS BOOL LANGUAGE js AS r"""
+  if (value === null || value === undefined) return null;
+  var d = String(value).replace(/\D/g, '');
+  if (d.length < 13 || d.length > 19) return false;
+  if (/^(\d)\1+$/.test(d)) return false;
+  var sum = 0, doubleIt = false;
+  for (var i = d.length - 1; i >= 0; i--) {
+    var n = Number(d.charAt(i));
+    if (doubleIt) {
+      n = n * 2;
+      if (n > 9) n -= 9;
+    }
+    sum += n;
+    doubleIt = !doubleIt;
+  }
+  return sum % 10 === 0;
+"""
+OPTIONS (description = "Luhn algorithm")

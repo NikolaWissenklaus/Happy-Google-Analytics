@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_mmm",
+  disabled: !constants.ENABLE.bqml,
+  description: "Lightweight MMM: BQML linear regression of daily revenue on the saturated adstock of each platform + calendar controls. Not a Robyn / Meridian, but it answers 'what happens to revenue if we cut 20% of Meta' with data from the own warehouse",
+  tags: ["data_science", "bqml", "weekly", "optional", "mmm"]
+}
+
+js {
+  const platforms = ["manual"].concat(constants.ENABLE.google_ads ? ["google_ads"] : []).concat(constants.ENABLE.meta_ads ? ["meta_ads"] : []);
+}
+
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = 'LINEAR_REG',
+  input_label_cols = ['revenue'],
+  l2_reg = 1.0,
+  data_split_method = 'SEQ',
+  data_split_col = 'metric_date',
+  data_split_eval_fraction = 0.15,
+  enable_global_explain = TRUE
+) AS
+SELECT
+  metric_date,
+  revenue,
+  weekday,
+  is_holiday,
+  is_retail_event,
+  is_salary_window,
+  is_13th_salary_window,
+  ${platforms.map(p => `sat_${p}`).join(",\n  ")}
+FROM ${ref("ds_mmm_dataset")}
+WHERE revenue > 0

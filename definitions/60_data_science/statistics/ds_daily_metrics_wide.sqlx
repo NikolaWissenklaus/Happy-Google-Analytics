@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_daily_metrics_wide",
+  description: "One row per day (last 400 days) with the main KPIs AND the sessions of every channel as columns. Base of the correlation tables and great to download to a notebook / spreadsheet",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily"]
+}
+
+js {
+  const channelList = ["Direct", "Organic Search", "Paid Search", "Paid Social", "Organic Social", "Email", "Referral", "Display", "Paid Shopping", "Cross-network", "Organic Shopping", "Organic Video", "Affiliates", "SMS", "Mobile Push Notifications", "Unassigned"];
+  const col = c => "sessions_" + c.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+}
+
+SELECT
+  session_date AS metric_date,
+  COUNT(*) AS sessions,
+  COUNT(DISTINCT user_key) AS users,
+  COUNTIF(is_new_user) AS new_users,
+  SAFE_DIVIDE(COUNTIF(is_engaged), COUNT(*)) AS engagement_rate,
+  SUM(transactions) AS transactions,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(transactions), COUNT(*)) AS conversion_rate,
+  SAFE_DIVIDE(SUM(revenue), SUM(transactions)) AS average_order_value,
+  SAFE_DIVIDE(COUNTIF(has_add_to_cart), COUNT(*)) AS add_to_cart_rate,
+  SAFE_DIVIDE(COUNTIF(device_category = 'mobile'), COUNT(*)) AS mobile_share,
+  SAFE_DIVIDE(COUNTIF(consent_ads_storage = 'denied'), COUNT(*)) AS ads_consent_denied_share,
+  ${channelList.map(c => `COUNTIF(session_default_channel_group = '${c}') AS ${col(c)}`).join(",\n  ")},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_sessions")}
+WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 400 DAY)
+  AND session_date < CURRENT_DATE('${constants.TIMEZONE}')
+  ${helpers.martSessionFilter()}
+GROUP BY session_date

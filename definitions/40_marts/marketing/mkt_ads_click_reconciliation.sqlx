@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_ads_click_reconciliation",
+  disabled: !constants.ENABLE.google_ads,
+  description: "Google Ads clicks (gclid by gclid) x GA4 sessions with that gclid. Clicks without session = page did not load, consent denied, tag broken, or click fraud. By campaign and device",
+  bigquery: {
+    partitionBy: "click_date",
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "google_ads", "optional", "data_quality"]
+}
+
+WITH
+ga4_gclids AS (
+  SELECT DISTINCT gclid
+  FROM ${ref("fct_sessions")}
+  WHERE gclid IS NOT NULL
+    AND session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 95 DAY)
+)
+
+SELECT
+  c.click_date,
+  c.campaign_id,
+  ANY_VALUE(cd.campaign_name) AS campaign_name,
+  c.device,
+  COUNT(*) AS ad_clicks_with_gclid,
+  COUNTIF(g.gclid IS NOT NULL) AS clicks_with_ga4_session,
+  SAFE_DIVIDE(COUNTIF(g.gclid IS NOT NULL), COUNT(*)) AS gclid_match_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_google_ads__clicks")} AS c
+LEFT JOIN ga4_gclids AS g USING (gclid)
+LEFT JOIN (SELECT DISTINCT campaign_id, campaign_name FROM ${ref("stg_google_ads__campaign_daily")}) AS cd USING (campaign_id)
+WHERE c.click_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+GROUP BY 1, 2, 4

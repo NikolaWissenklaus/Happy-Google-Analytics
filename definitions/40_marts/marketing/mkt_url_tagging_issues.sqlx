@@ -1,0 +1,59 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_url_tagging_issues",
+  description: "Media quality, the url side (last 30 days): every way a campaign url can lose the attribution, with the utms it had, sessions and revenue affected, an example url, severity and how to fix. Missing '?', params glued without '&', '&amp;', utm after '#', typos in the param names, empty values, auto tagging ids without utms, internal utms, utms that arrived late and the sessions where GA4 never processed the utms (no source / medium event param). Values of the utms (case, typos in the source) are in mkt_utm_linter",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "media_quality"],
+  columns: {
+    issue: "See tagging.ISSUE_FIX (includes/tagging.js) for each one",
+    revenue_affected: "Revenue of the affected sessions: it was credited to the wrong channel, or to (direct)",
+    example_url: "One url with the problem (PII already masked by staging)"
+  }
+}
+
+WITH
+checks AS (
+  SELECT
+    c.*,
+    s.revenue,
+    s.transactions,
+    s.session_default_channel_group
+  FROM ${ref("int_ga4__session_tagging_checks")} AS c
+  JOIN ${ref("fct_sessions")} AS s USING (session_key)
+  WHERE c.session_date >= ${helpers.daysAgo(30)}
+),
+
+all_issues AS (
+  SELECT issue, c.* EXCEPT (url_issues) FROM checks AS c, UNNEST(c.url_issues) AS issue
+  UNION ALL
+  SELECT 'internal_utm', c.* EXCEPT (url_issues) FROM checks AS c WHERE c.has_internal_utm
+  UNION ALL
+  SELECT 'utm_not_on_first_page', c.* EXCEPT (url_issues) FROM checks AS c WHERE c.has_utm_not_on_first_page
+  UNION ALL
+  SELECT 'utm_without_source_medium_event_param', c.* EXCEPT (url_issues) FROM checks AS c WHERE c.is_utm_without_source_medium_param
+  UNION ALL
+  SELECT 'utm_ignored_by_ga4', c.* EXCEPT (url_issues) FROM checks AS c WHERE c.is_utm_ignored_by_ga4
+)
+
+SELECT
+  issue,
+  ${tagging.severityCase("issue")} AS severity,
+  COALESCE(utm_source, '(none)') AS utm_source,
+  COALESCE(utm_medium, '(none)') AS utm_medium,
+  COALESCE(utm_campaign, '(none)') AS utm_campaign,
+  COUNT(*) AS sessions_affected,
+  SUM(transactions) AS transactions_affected,
+  SUM(revenue) AS revenue_affected,
+  ARRAY_AGG(session_default_channel_group IGNORE NULLS ORDER BY session_date DESC LIMIT 1)[SAFE_OFFSET(0)] AS channel_it_went_to,
+  MIN(session_date) AS first_seen,
+  MAX(session_date) AS last_seen,
+  ARRAY_AGG(landing_url IGNORE NULLS ORDER BY session_date DESC LIMIT 1)[SAFE_OFFSET(0)] AS example_url,
+  ${tagging.fixCase("issue")} AS how_to_fix,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_issues
+GROUP BY issue, utm_source, utm_medium, utm_campaign

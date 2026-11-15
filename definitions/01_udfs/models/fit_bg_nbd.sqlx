@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "fit_bg_nbd",
+  description: "Fits a BG/NBD model (Fader, Hardie & Lee 2005) by maximum likelihood, Nelder-Mead in log space. Input is the RFM summary grouped",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "data_science"]
+}
+
+-- "buy till you die" without python. the input is the classic summary:
+--   x      repeat purchases (frequency)
+--   t_x    time of the last purchase since the first one (recency)
+--   t_cal  customer age, time since the first purchase (T)
+--   n      how many customers have exactly this (x, t_x, t_cal), so we can group and send less rows
+-- time unit is up to you (weeks is the classic). same as the python lib "lifetimes", fit() result
+-- should be very close to it.
+CREATE OR REPLACE FUNCTION ${self()}(
+  data ARRAY<STRUCT<x FLOAT64, t_x FLOAT64, t_cal FLOAT64, n FLOAT64>>,
+  penalizer FLOAT64
+)
+RETURNS STRUCT<r FLOAT64, alpha FLOAT64, a FLOAT64, b FLOAT64, log_likelihood FLOAT64, iterations FLOAT64, converged BOOL>
+LANGUAGE js AS r"""
+  var LANCZOS = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+    -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  function lgamma(x) {
+    if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+    x -= 1;
+    var a = LANCZOS[0];
+    var t = x + 7.5;
+    for (var i = 1; i < 9; i++) a += LANCZOS[i] / (x + i);
+    return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+  }
+
+  var rows = [];
+  var totalN = 0, sumT = 0, sumX = 0;
+  for (var k = 0; k < (data || []).length; k++) {
+    var d = data[k];
+    if (!d || d.x === null || d.t_cal === null || d.t_cal <= 0) continue;
+    var w = (d.n === null || d.n === undefined) ? 1 : d.n;
+    if (w <= 0) continue;
+    var tx = (d.t_x === null || d.t_x === undefined) ? 0 : d.t_x;
+    rows.push([d.x, tx, d.t_cal, w]);
+    totalN += w;
+    sumT += w * d.t_cal;
+    sumX += w * d.x;
+  }
+  if (rows.length < 3) return null;
+  var pen = (penalizer === null || penalizer === undefined) ? 0 : penalizer;
+
+  function negLogLik(p) {
+    var r = Math.exp(p[0]), alpha = Math.exp(p[1]), a = Math.exp(p[2]), b = Math.exp(p[3]);
+    var lgR = lgamma(r), lgAB = lgamma(a + b), lgB = lgamma(b), logAlpha = Math.log(alpha);
+    var ll = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var x = rows[i][0], t = rows[i][1], T = rows[i][2], w = rows[i][3];
+      var A1 = lgamma(r + x) - lgR + r * logAlpha;
+      var A2 = lgAB + lgamma(b + x) - lgB - lgamma(a + b + x);
+      var A3 = -(r + x) * Math.log(alpha + T);
+      var term = A3;
+      if (x > 0) {
+        var A4 = Math.log(a) - Math.log(b + x - 1) - (r + x) * Math.log(alpha + t);
+        var m = Math.max(A3, A4);
+        term = m + Math.log(Math.exp(A3 - m) + Math.exp(A4 - m));
+      }
+      ll += w * (A1 + A2 + term);
+    }
+    var value = -ll / totalN + pen * (p[0] * p[0] + p[1] * p[1] + p[2] * p[2] + p[3] * p[3]);
+    return isFinite(value) ? value : 1e10;
+  }
+
+  function nelderMead(f, start, maxIter, tol) {
+    var n = start.length;
+    var simplex = [start.slice()];
+    for (var i = 0; i < n; i++) {
+      var v = start.slice();
+      v[i] = v[i] + 0.5;
+      simplex.push(v);
+    }
+    var values = simplex.map(f);
+    var iter = 0;
+    function sortSimplex() {
+      var idx = values.map(function (v, i) { return i; });
+      idx.sort(function (i, j) { return values[i] - values[j]; });
+      simplex = idx.map(function (i) { return simplex[i]; });
+      values = idx.map(function (i) { return values[i]; });
+    }
+    for (; iter < maxIter; iter++) {
+      sortSimplex();
+      if (Math.abs(values[n] - values[0]) < tol) break;
+      var c = [];
+      for (var j = 0; j < n; j++) {
+        var s = 0;
+        for (var i2 = 0; i2 < n; i2++) s += simplex[i2][j];
+        c.push(s / n);
+      }
+      var worst = simplex[n];
+      var xr = c.map(function (cj, j) { return cj + (cj - worst[j]); });
+      var fr = f(xr);
+      if (fr < values[0]) {
+        var xe = c.map(function (cj, j) { return cj + 2 * (cj - worst[j]); });
+        var fe = f(xe);
+        if (fe < fr) { simplex[n] = xe; values[n] = fe; } else { simplex[n] = xr; values[n] = fr; }
+      } else if (fr < values[n - 1]) {
+        simplex[n] = xr; values[n] = fr;
+      } else {
+        var outside = fr < values[n];
+        var xc = outside
+          ? c.map(function (cj, j) { return cj + 0.5 * (xr[j] - cj); })
+          : c.map(function (cj, j) { return cj + 0.5 * (worst[j] - cj); });
+        var fc = f(xc);
+        if (fc < (outside ? fr : values[n])) {
+          simplex[n] = xc; values[n] = fc;
+        } else {
+          for (var i3 = 1; i3 <= n; i3++) {
+            simplex[i3] = simplex[i3].map(function (v, j) { return simplex[0][j] + 0.5 * (v - simplex[0][j]); });
+            values[i3] = f(simplex[i3]);
+          }
+        }
+      }
+    }
+    sortSimplex();
+    return { x: simplex[0], fx: values[0], iterations: iter, converged: iter < maxIter };
+  }
+
+  // start: r = 1, alpha so that E[lambda] = r / alpha matches the average rate, a = b = 1
+  var meanRate = Math.max(sumX / Math.max(sumT, 1e-9), 1e-6);
+  var start = [0, Math.log(1 / meanRate), 0, 0];
+  var first = nelderMead(negLogLik, start, 3000, 1e-10);
+  // a restart from the best point helps nelder-mead when it got stuck in a flat region
+  var best = nelderMead(negLogLik, first.x, 3000, 1e-12);
+  return {
+    r: Math.exp(best.x[0]),
+    alpha: Math.exp(best.x[1]),
+    a: Math.exp(best.x[2]),
+    b: Math.exp(best.x[3]),
+    log_likelihood: -best.fx * totalN,
+    iterations: first.iterations + best.iterations,
+    converged: first.converged && best.converged
+  };
+"""
+OPTIONS (description = "BG/NBD maximum likelihood fit")

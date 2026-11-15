@@ -1,0 +1,163 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "dim_users",
+  description: "One row per stitched user (user_key): acquisition (GA4 first user + our first session), lifetime engagement, purchases, LTV, recency, consent and latest user properties",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "core", domain: "users" }
+  },
+  tags: ["ga4", "core", "daily", "users"],
+  columns: Object.assign(docs.pick("user_key", "user_id"), {
+    first_channel: "Default channel group of the first session we saw (works with user_id across devices, GA4 first user does not)",
+    ga4_first_user_source: "GA4 first user source (traffic_source in the export, device scoped)",
+    lifetime_revenue: "Sum of valid transactions revenue (tests and outliers out)",
+    is_customer: "At least one valid purchase",
+    days_since_last_purchase: "NULL for non customers",
+    latest_consent_ads: "Last ads_storage consent we saw (granted / denied / unknown). Activation tables need 'granted'",
+    user_properties: "Latest value of each GA4 user property"
+  })
+}
+
+WITH
+sessions AS (
+  SELECT * FROM ${ref("fct_sessions")}
+  WHERE TRUE ${helpers.martSessionFilter()}
+),
+
+per_user AS (
+  SELECT
+    user_key,
+    ANY_VALUE(is_identified_user) AS is_identified,
+    ARRAY_AGG(user_id IGNORE NULLS ORDER BY session_start_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS user_id,
+    ARRAY_AGG(user_pseudo_id ORDER BY session_start_ts DESC LIMIT 1)[OFFSET(0)] AS last_user_pseudo_id,
+    COUNT(DISTINCT user_pseudo_id) AS devices,
+    COUNT(DISTINCT device_category) AS device_categories,
+    MIN(session_start_ts) AS first_seen_ts,
+    MAX(session_start_ts) AS last_seen_ts,
+    MIN(session_date) AS first_seen_date,
+    MAX(session_date) AS last_seen_date,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(page_views + screen_views) AS views,
+    SUM(engagement_time_sec) AS engagement_time_sec,
+    SUM(key_events) AS key_events,
+    COUNTIF(has_add_to_cart) AS sessions_with_cart,
+    COUNTIF(has_begin_checkout) AS sessions_with_checkout,
+    COUNTIF(has_site_search) AS sessions_with_search,
+    COUNT(DISTINCT session_default_channel_group) AS distinct_channels,
+    ARRAY_AGG(STRUCT(
+      session_source AS source, session_medium AS medium, session_campaign AS campaign,
+      session_default_channel_group AS channel, session_custom_channel_group AS custom_channel,
+      landing_page_path, landing_page_type, device_category, geo_country, geo_region, geo_uf, geo_city,
+      ga4_first_user_source, ga4_first_user_medium, ga4_first_user_campaign
+    ) ORDER BY session_start_ts LIMIT 1)[OFFSET(0)] AS first_session,
+    ARRAY_AGG(STRUCT(
+      session_default_channel_group AS channel, device_category, geo_uf, geo_city, landing_page_path
+    ) ORDER BY session_start_ts DESC LIMIT 1)[OFFSET(0)] AS last_session,
+    ARRAY_AGG(consent_ads_storage ORDER BY session_start_ts DESC LIMIT 1)[OFFSET(0)] AS latest_consent_ads,
+    ARRAY_AGG(consent_analytics_storage ORDER BY session_start_ts DESC LIMIT 1)[OFFSET(0)] AS latest_consent_analytics,
+    APPROX_TOP_COUNT(session_default_channel_group, 1)[SAFE_OFFSET(0)].value AS main_channel,
+    APPROX_TOP_COUNT(device_category, 1)[SAFE_OFFSET(0)].value AS main_device
+  FROM sessions
+  GROUP BY user_key
+),
+
+purchases AS (
+  SELECT
+    user_key,
+    COUNT(*) AS transactions,
+    SUM(revenue) AS lifetime_revenue,
+    SUM(net_revenue) AS lifetime_net_revenue,
+    MIN(transaction_date) AS first_purchase_date,
+    MAX(transaction_date) AS last_purchase_date,
+    AVG(revenue) AS avg_order_value,
+    COUNTIF(coupon IS NOT NULL) AS coupon_orders,
+    AVG(days_since_previous_order) AS avg_days_between_orders
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+  GROUP BY user_key
+),
+
+-- one value per property per user (the most recent among all devices of the user)
+latest_prop_per_user AS (
+  SELECT
+    id.user_key,
+    up.property_key,
+    up.property_value,
+    up.last_seen_date
+  FROM ${ref("int_ga4__user_properties_latest")} AS up
+  JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY id.user_key, up.property_key ORDER BY up.last_seen_date DESC) = 1
+),
+
+user_props AS (
+  SELECT
+    user_key,
+    ARRAY_AGG(STRUCT(property_key AS key, property_value AS value, last_seen_date) ORDER BY property_key) AS user_properties
+  FROM latest_prop_per_user
+  GROUP BY user_key
+)
+
+SELECT
+  u.user_key,
+  u.user_id,
+  u.is_identified,
+  u.last_user_pseudo_id,
+  u.devices,
+  u.device_categories,
+  u.first_seen_ts,
+  u.last_seen_ts,
+  u.first_seen_date,
+  u.last_seen_date,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), u.last_seen_date, DAY) AS days_since_last_seen,
+  DATE_DIFF(u.last_seen_date, u.first_seen_date, DAY) AS active_span_days,
+  u.sessions,
+  u.engaged_sessions,
+  u.views,
+  u.engagement_time_sec,
+  u.key_events,
+  u.sessions_with_cart,
+  u.sessions_with_checkout,
+  u.sessions_with_search,
+  u.distinct_channels,
+  u.first_session.channel AS first_channel,
+  u.first_session.custom_channel AS first_custom_channel,
+  u.first_session.source AS first_source,
+  u.first_session.medium AS first_medium,
+  u.first_session.campaign AS first_campaign,
+  u.first_session.landing_page_path AS first_landing_page,
+  u.first_session.landing_page_type AS first_landing_page_type,
+  u.first_session.device_category AS first_device_category,
+  u.first_session.geo_country AS first_country,
+  u.first_session.geo_uf AS first_uf,
+  u.first_session.ga4_first_user_source,
+  u.first_session.ga4_first_user_medium,
+  u.first_session.ga4_first_user_campaign,
+  u.last_session.channel AS last_channel,
+  u.last_session.device_category AS last_device_category,
+  u.last_session.geo_uf AS last_uf,
+  u.last_session.geo_city AS last_city,
+  u.main_channel,
+  u.main_device,
+  COALESCE(p.transactions, 0) AS transactions,
+  COALESCE(p.lifetime_revenue, 0) AS lifetime_revenue,
+  COALESCE(p.lifetime_net_revenue, 0) AS lifetime_net_revenue,
+  p.first_purchase_date,
+  p.last_purchase_date,
+  p.avg_order_value,
+  COALESCE(p.coupon_orders, 0) AS coupon_orders,
+  p.avg_days_between_orders,
+  COALESCE(p.transactions, 0) > 0 AS is_customer,
+  COALESCE(p.transactions, 0) > 1 AS is_repeat_customer,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), p.last_purchase_date, DAY) AS days_since_last_purchase,
+  DATE_DIFF(p.first_purchase_date, u.first_seen_date, DAY) AS days_to_first_purchase,
+  u.latest_consent_ads,
+  u.latest_consent_analytics,
+  COALESCE(up.user_properties, []) AS user_properties,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_user AS u
+LEFT JOIN purchases AS p USING (user_key)
+LEFT JOIN user_props AS up USING (user_key)

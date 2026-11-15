@@ -1,0 +1,31 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_scores_purchase_propensity",
+  disabled: !constants.ENABLE.bqml,
+  description: "Purchase propensity (next 7 days) of every active user today, from the BQML model, with decile (10 = most likely). Audiences use it when enable_bqml is on",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "scores" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional"]
+}
+
+WITH predictions AS (
+  SELECT
+    user_key,
+    is_customer,
+    (SELECT p.prob FROM UNNEST(predicted_will_purchase_7d_probs) AS p WHERE p.label = 1) AS purchase_propensity
+  FROM ML.PREDICT(
+    MODEL ${ref("ds_model_purchase_propensity")},
+    (SELECT * FROM ${ref("ds_feature_snapshots")} WHERE is_current_snapshot)
+  )
+)
+
+SELECT
+  *,
+  NTILE(10) OVER (ORDER BY purchase_propensity) AS propensity_decile,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM predictions

@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_all_pages_daily",
+  description: "UA Behavior > Site Content > All Pages per day: pageviews, unique pageviews, avg time on page (UA formula: time on page / (pageviews - exits)), entrances, bounce rate of the entrances and % exit. Sums are kept so any date range is right",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["page_path"],
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"],
+  columns: {
+    unique_pageviews: "Sessions that viewed the page at least once (UA definition)",
+    avg_time_on_page_sec: "time_on_page_sum / (pageviews - exits). Exits have no time on page in UA, so they are out of the denominator"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["int_ga4__page_views", "int_ga4__sessions_base"] })}
+}
+
+WITH
+views AS (
+  SELECT
+    pv.event_date,
+    pv.page_path,
+    pv.page_title,
+    pv.event_ts,
+    pv.session_key,
+    pv.is_entrance,
+    pv.is_exit,
+    pv.time_on_page_sec,
+    b.is_bounce_ua
+  FROM ${ref("int_ga4__page_views")} AS pv
+  LEFT JOIN ${ref("int_ga4__sessions_base")} AS b
+    ON b.session_key = pv.session_key
+    AND b.session_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+  WHERE pv.event_date >= run_from
+),
+
+agg AS (
+  SELECT
+    event_date,
+    page_path,
+    ARRAY_AGG(page_title IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS page_title,
+    COUNT(*) AS pageviews,
+    COUNT(DISTINCT session_key) AS unique_pageviews,
+    SUM(IF(NOT is_exit, time_on_page_sec, 0)) AS time_on_page_sum_sec,
+    COUNTIF(is_entrance) AS entrances,
+    COUNTIF(is_entrance AND is_bounce_ua) AS bounces,
+    COUNTIF(is_exit) AS exits
+  FROM views
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(time_on_page_sum_sec, pageviews - exits) AS avg_time_on_page_sec,
+  SAFE_DIVIDE(bounces, entrances) AS bounce_rate,
+  SAFE_DIVIDE(exits, pageviews) AS pct_exit,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_crm_triggers_all",
+  description: "Every CRM trigger of today (identified customers that can_send_to_crm), INCLUDING the holdout group (cfg_lifts.holdout): abandoned checkout, abandoned cart (with the items), price drop on a product they viewed, high propensity without purchase and churn risk. The CRM reads act_crm_triggers (holdout already out), this one feeds act_crm_triggers_history and the lift measurement",
+  bigquery: {
+    clusterBy: ["trigger_name"],
+    labels: { layer: "activation", destination: "crm" }
+  },
+  tags: ["activation", "daily", "crm"],
+  columns: {
+    trigger_name: "abandoned_checkout | abandoned_cart | price_drop | high_propensity_no_purchase | churn_risk",
+    items: "Up to 5 products related to the trigger (last ones added to the cart / viewed with lower price now)",
+    priority: "1 = do it today. Higher value at stake comes first inside the same trigger",
+    is_holdout: "In the holdout of this trigger (deterministic by user, cfg_lifts.holdout.crm_triggers_pct). Never sent, used to measure the real lift"
+  }
+}
+
+js {
+  // the price drop trigger uses the audience of kind price_drop (cfg_audiences), if there is one
+  const priceDropAudience = cfg_audiences.audiences.find(a => a.kind === "price_drop");
+  const itemsType = "ARRAY<STRUCT<item_id STRING, item_name STRING, price FLOAT64>>";
+}
+
+WITH
+eligible AS (
+  SELECT user_key, user_id
+  FROM ${ref("act_consent_eligible_users")}
+  WHERE can_send_to_crm
+    AND user_id IS NOT NULL
+),
+
+features AS (
+  SELECT f.*
+  FROM ${ref("aud_user_features")} AS f
+  JOIN eligible USING (user_key)
+),
+
+-- the products still in the cart: added in the last 7 days, not bought after
+cart_items AS (
+  SELECT
+    s.user_key,
+    ARRAY_AGG(STRUCT(i.item_id, i.item_name, i.price) ORDER BY i.event_ts DESC LIMIT 5) AS items
+  FROM ${ref("stg_ga4__event_items")} AS i
+  JOIN ${ref("int_ga4__user_stitching")} AS s USING (user_pseudo_id)
+  JOIN eligible AS e ON e.user_key = s.user_key
+  WHERE i.event_date >= ${helpers.daysAgo(7)}
+    AND i.event_name = 'add_to_cart'
+    AND i.item_id IS NOT NULL
+  GROUP BY s.user_key
+),
+
+${priceDropAudience ? `price_drops AS (
+  SELECT
+    p.user_key,
+    ARRAY(SELECT AS STRUCT d.item_id, CAST(NULL AS STRING) AS item_name, d.new_price AS price FROM UNNEST(p.dropped_items) AS d) AS items
+  FROM ${ref(`aud_${priceDropAudience.name}`)} AS p
+  JOIN eligible USING (user_key)
+),` : ``}
+
+all_triggers AS (
+  SELECT f.user_key, 'abandoned_checkout' AS trigger_name, f.last_begin_checkout_ts AS trigger_ts, f.open_checkout_value AS value_at_stake, c.items
+  FROM features AS f
+  LEFT JOIN cart_items AS c USING (user_key)
+  WHERE f.has_open_checkout
+
+  UNION ALL
+  SELECT f.user_key, 'abandoned_cart', f.last_add_to_cart_ts, f.open_cart_value, c.items
+  FROM features AS f
+  LEFT JOIN cart_items AS c USING (user_key)
+  WHERE f.has_open_cart
+    AND NOT f.has_open_checkout
+
+  ${priceDropAudience ? `UNION ALL
+  SELECT user_key, 'price_drop', CURRENT_TIMESTAMP(), CAST(NULL AS FLOAT64), items
+  FROM price_drops` : ``}
+
+  UNION ALL
+  SELECT user_key, 'high_propensity_no_purchase', CURRENT_TIMESTAMP(), CAST(NULL AS FLOAT64), CAST(NULL AS ${itemsType})
+  FROM features
+  WHERE purchase_propensity >= 0.7
+    AND purchases_30d = 0
+
+  UNION ALL
+  SELECT user_key, 'churn_risk', CURRENT_TIMESTAMP(), lifetime_revenue, CAST(NULL AS ${itemsType})
+  FROM features
+  WHERE churn_risk >= 0.7
+    AND purchases_total > 0
+)
+
+SELECT
+  e.user_id,
+  t.user_key,
+  t.trigger_name,
+  t.trigger_ts,
+  ROUND(t.value_at_stake, 2) AS value_at_stake,
+  t.items,
+  ROW_NUMBER() OVER (PARTITION BY t.trigger_name ORDER BY t.value_at_stake DESC NULLS LAST) AS priority,
+  ${helpers.today()} AS trigger_date,
+  ${cfg_lifts.holdout.enabled ? helpers.isHoldout("t.trigger_name", "t.user_key", cfg_lifts.holdout.crm_triggers_pct) : "FALSE"} AS is_holdout,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_triggers AS t
+JOIN eligible AS e USING (user_key)

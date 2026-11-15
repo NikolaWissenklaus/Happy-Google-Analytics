@@ -1,0 +1,66 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_media_and_links",
+  description: "Enhanced measurement in one place (last 90 days): videos (starts, progress, completion), file downloads (by file and extension) and outbound clicks (by domain). One row per object, column kind says what it is",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "content"],
+  columns: {
+    kind: "video | file_download | outbound_link"
+  }
+}
+
+WITH
+events AS (
+  SELECT *
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name IN ('video_start', 'video_progress', 'video_complete', 'file_download', 'click')
+    ${helpers.noiseFilter()}
+)
+
+SELECT
+  'video' AS kind,
+  COALESCE(video_title, '(no title)') AS object_name,
+  ANY_VALUE(video_provider) AS detail,
+  COUNTIF(event_name = 'video_start') AS starts,
+  COUNTIF(event_name = 'video_progress' AND video_percent >= 25) AS reached_25,
+  COUNTIF(event_name = 'video_progress' AND video_percent >= 50) AS reached_50,
+  COUNTIF(event_name = 'video_progress' AND video_percent >= 75) AS reached_75,
+  COUNTIF(event_name = 'video_complete') AS completes,
+  SAFE_DIVIDE(COUNTIF(event_name = 'video_complete'), COUNTIF(event_name = 'video_start')) AS completion_rate,
+  COUNT(DISTINCT user_pseudo_id) AS users,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM events
+WHERE event_name LIKE 'video_%'
+GROUP BY 2
+
+UNION ALL
+
+SELECT
+  'file_download',
+  COALESCE(file_name, '(no name)'),
+  ANY_VALUE(file_extension),
+  COUNT(*), NULL, NULL, NULL, NULL, NULL,
+  COUNT(DISTINCT user_pseudo_id),
+  CURRENT_TIMESTAMP()
+FROM events
+WHERE event_name = 'file_download'
+GROUP BY 2
+
+UNION ALL
+
+SELECT
+  'outbound_link',
+  COALESCE(link_domain, '(no domain)'),
+  ANY_VALUE(link_url),
+  COUNT(*), NULL, NULL, NULL, NULL, NULL,
+  COUNT(DISTINCT user_pseudo_id),
+  CURRENT_TIMESTAMP()
+FROM events
+WHERE event_name = 'click' AND is_outbound
+GROUP BY 2

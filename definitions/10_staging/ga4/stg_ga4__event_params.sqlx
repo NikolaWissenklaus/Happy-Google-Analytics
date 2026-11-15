@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_ga4__event_params",
+  description: "Long format of every event param (one row per event x param). Base for the tracking plan checks, param registry, cardinality and type drift monitoring",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name", "param_key"],
+    partitionExpirationDays: 120,
+    labels: { layer: "staging", source: "ga4" }
+  },
+  tags: ["ga4", "staging", "daily", "governance"],
+  columns: Object.assign(docs.pick("event_id", "event_date", "event_name", "loaded_at"), {
+    param_key: "Param name",
+    value_type: "string | int | double | float | null (which field of the value struct was filled)",
+    value_as_string: "Value converted to string, whatever the type",
+    value_length: "Length of the string value (GA4 truncates at 100 chars on standard properties)"
+  })
+}
+
+-- 120 days of partition expiration on purpose: this table is big and only the
+-- monitoring models read it (they look at recent days). change if you need more.
+pre_operations {
+  ${helpers.incrementalDeclares({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+  SET run_from = GREATEST(run_from, DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 120 DAY));
+  ${helpers.incrementalApply({ self: self(), incremental: incremental(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+SELECT
+  e.event_date,
+  e.event_id,
+  e.event_name,
+  e.stream_id,
+  e.platform,
+  e.is_internal_traffic,
+  e.is_debug,
+  p.key AS param_key,
+  p.value.string_value,
+  p.value.int_value,
+  p.value.float_value,
+  p.value.double_value,
+  CASE
+    WHEN p.value.string_value IS NOT NULL THEN 'string'
+    WHEN p.value.int_value IS NOT NULL THEN 'int'
+    WHEN p.value.double_value IS NOT NULL THEN 'double'
+    WHEN p.value.float_value IS NOT NULL THEN 'float'
+    ELSE 'null'
+  END AS value_type,
+  COALESCE(p.value.string_value, CAST(p.value.int_value AS STRING), CAST(p.value.double_value AS STRING), CAST(p.value.float_value AS STRING)) AS value_as_string,
+  LENGTH(p.value.string_value) AS value_length,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")} AS e,
+  UNNEST(e.event_params) AS p
+WHERE e.event_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

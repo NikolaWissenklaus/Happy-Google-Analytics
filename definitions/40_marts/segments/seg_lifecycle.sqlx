@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_lifecycle",
+  description: "Current lifecycle stage of every user (prospects and customers): new_visitor, engaged_prospect, dormant_prospect, first_time_customer, repeat_customer, loyal_customer, at_risk_customer, lapsed_customer, churned_customer. The language of the CRM 'regua' (journey) in one column",
+  bigquery: {
+    clusterBy: ["lifecycle_stage"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"]
+}
+
+WITH
+recent_engagement AS (
+  SELECT user_key, SUM(engaged_sessions) AS engaged_sessions_30d
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  GROUP BY user_key
+)
+
+SELECT
+  u.user_key,
+  u.first_seen_date,
+  u.last_seen_date,
+  u.transactions,
+  u.last_purchase_date,
+  u.days_since_last_seen,
+  u.days_since_last_purchase,
+  COALESCE(e.engaged_sessions_30d, 0) AS engaged_sessions_30d,
+  CASE
+    WHEN u.transactions = 0 AND u.days_since_last_seen <= 30 AND DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), u.first_seen_date, DAY) <= 30 AND COALESCE(e.engaged_sessions_30d, 0) < 2 THEN 'new_visitor'
+    WHEN u.transactions = 0 AND COALESCE(e.engaged_sessions_30d, 0) >= 2 THEN 'engaged_prospect'
+    WHEN u.transactions = 0 THEN 'dormant_prospect'
+    WHEN u.days_since_last_purchase > 365 THEN 'churned_customer'
+    WHEN u.days_since_last_purchase > 180 THEN 'lapsed_customer'
+    WHEN u.days_since_last_purchase > 90 THEN 'at_risk_customer'
+    WHEN u.transactions >= 4 THEN 'loyal_customer'
+    WHEN u.transactions >= 2 THEN 'repeat_customer'
+    ELSE 'first_time_customer'
+  END AS lifecycle_stage,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dim_users")} AS u
+LEFT JOIN recent_engagement AS e USING (user_key)

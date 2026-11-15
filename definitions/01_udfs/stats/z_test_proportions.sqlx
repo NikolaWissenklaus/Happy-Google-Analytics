@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "z_test_proportions",
+  description: "Two proportions z test (pooled). Returns rates, absolute diff, relative uplift, z and two sided p value",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- z_test_proportions(conv_control, sessions_control, conv_variant, sessions_variant)
+CREATE OR REPLACE FUNCTION ${self()}(conv_a FLOAT64, n_a FLOAT64, conv_b FLOAT64, n_b FLOAT64)
+RETURNS STRUCT<rate_a FLOAT64, rate_b FLOAT64, abs_diff FLOAT64, rel_uplift FLOAT64, z FLOAT64, p_value FLOAT64> AS ((
+  SELECT
+    STRUCT(
+      pa AS rate_a,
+      pb AS rate_b,
+      pb - pa AS abs_diff,
+      SAFE_DIVIDE(pb - pa, pa) AS rel_uplift,
+      z AS z,
+      IF(z IS NULL, NULL, 2 * (1 - ${ref("normal_cdf")}(ABS(z)))) AS p_value
+    )
+  FROM (
+    SELECT
+      pa,
+      pb,
+      SAFE_DIVIDE(pb - pa, SQRT(pooled * (1 - pooled) * (SAFE_DIVIDE(1, n_a) + SAFE_DIVIDE(1, n_b)))) AS z
+    FROM (
+      SELECT
+        SAFE_DIVIDE(conv_a, n_a) AS pa,
+        SAFE_DIVIDE(conv_b, n_b) AS pb,
+        SAFE_DIVIDE(conv_a + conv_b, n_a + n_b) AS pooled
+    )
+  )
+))
+OPTIONS (description = "Two proportions z test")

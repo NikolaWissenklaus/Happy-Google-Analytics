@@ -1,0 +1,54 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_top_session_paths",
+  description: "Most common session journeys (first 5 page types, consecutive repeats collapsed), last 30 days, with sessions, conversion and revenue per session. The GA4 path exploration, but for everybody at once",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"]
+}
+
+WITH
+sequences AS (
+  SELECT
+    session_key,
+    ANY_VALUE(session_has_purchase) AS has_purchase,
+    ANY_VALUE(session_revenue) AS revenue,
+    ARRAY_AGG(page_type ORDER BY page_number) AS page_types
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+  GROUP BY session_key
+),
+
+collapsed AS (
+  SELECT
+    session_key,
+    has_purchase,
+    revenue,
+    ARRAY(
+      SELECT pt FROM (
+        SELECT pt, pos, LAG(pt) OVER (ORDER BY pos) AS previous_pt
+        FROM UNNEST(page_types) AS pt WITH OFFSET AS pos
+      )
+      WHERE previous_pt IS NULL OR previous_pt != pt
+      ORDER BY pos
+      LIMIT 5
+    ) AS journey
+  FROM sequences
+)
+
+SELECT
+  ARRAY_TO_STRING(journey, ' > ') AS journey,
+  ARRAY_LENGTH(journey) AS steps,
+  COUNT(*) AS sessions,
+  SAFE_DIVIDE(COUNTIF(has_purchase), COUNT(*)) AS conversion_rate,
+  SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS revenue_per_session,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()) AS share_of_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM collapsed
+GROUP BY 1, 2
+HAVING COUNT(*) >= 20

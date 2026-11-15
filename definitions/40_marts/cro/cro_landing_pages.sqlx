@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_landing_pages",
+  description: "Landing pages (last 30 days) by device with engagement, GA4 and UA bounce, conversion with Wilson interval, revenue per session, and the revenue opportunity if the page converted like the median of its page type. Ranked by opportunity, not by traffic",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily"],
+  columns: {
+    conversion_wilson_low: "Pessimistic conversion (Wilson lower bound). Use it to compare pages with very different traffic",
+    revenue_opportunity_30d: "(median conversion of the page type for the device - page conversion) x sessions x AOV of the page type"
+  }
+}
+
+WITH
+pages AS (
+  SELECT
+    landing_page_path,
+    landing_page_type,
+    device_category,
+    COUNT(*) AS sessions,
+    COUNTIF(is_new_user) AS new_users,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    COUNTIF(is_bounce_ga4) AS bounces_ga4,
+    COUNTIF(is_bounce_ua) AS bounces_ua,
+    SUM(engagement_time_sec) AS engagement_time_sec,
+    COUNTIF(has_purchase) AS converting_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    COUNTIF(has_key_event) AS sessions_with_key_event
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3
+),
+
+with_rates AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(converting_sessions, sessions) AS conversion_rate,
+    PERCENTILE_CONT(SAFE_DIVIDE(converting_sessions, sessions), 0.5) OVER (PARTITION BY landing_page_type, device_category) AS page_type_median_conversion,
+    SAFE_DIVIDE(SUM(revenue) OVER (PARTITION BY landing_page_type, device_category), SUM(transactions) OVER (PARTITION BY landing_page_type, device_category)) AS page_type_aov
+  FROM pages
+  WHERE sessions >= 30
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+  SAFE_DIVIDE(bounces_ga4, sessions) AS bounce_rate_ga4,
+  SAFE_DIVIDE(bounces_ua, sessions) AS bounce_rate_ua,
+  SAFE_DIVIDE(engagement_time_sec, sessions) AS avg_engagement_time_sec,
+  SAFE_DIVIDE(revenue, sessions) AS revenue_per_session,
+  ${helpers.wilsonLower("converting_sessions", "sessions")} AS conversion_wilson_low,
+  ${helpers.wilsonUpper("converting_sessions", "sessions")} AS conversion_wilson_high,
+  GREATEST(page_type_median_conversion - conversion_rate, 0) * sessions * COALESCE(page_type_aov, 0) AS revenue_opportunity_30d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_rates

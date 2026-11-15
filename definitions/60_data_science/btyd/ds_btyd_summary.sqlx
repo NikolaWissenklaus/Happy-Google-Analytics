@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_btyd_summary",
+  description: "RFM summary in the 'buy till you die' format (lifetimes style): x = repeat purchase days, t_x = time between first and last purchase, T = customer age, in weeks (cfg_ds.btyd.time_unit_days). Same day orders count as one purchase, like the original papers",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "btyd" }
+  },
+  tags: ["data_science", "btyd", "daily"]
+}
+
+js {
+  const unit = cfg_ds.btyd.time_unit_days;
+}
+
+WITH
+purchase_days AS (
+  SELECT user_key, transaction_date, SUM(revenue) AS revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date < CURRENT_DATE('${constants.TIMEZONE}')
+  GROUP BY 1, 2
+),
+
+per_customer AS (
+  SELECT
+    user_key,
+    MIN(transaction_date) AS first_purchase_date,
+    MAX(transaction_date) AS last_purchase_date,
+    COUNT(*) AS purchase_days,
+    SUM(revenue) AS total_revenue,
+    ARRAY_AGG(revenue ORDER BY transaction_date LIMIT 1)[OFFSET(0)] AS first_day_revenue
+  FROM purchase_days
+  GROUP BY user_key
+)
+
+SELECT
+  user_key,
+  first_purchase_date,
+  last_purchase_date,
+  LEAST(purchase_days - 1, ${cfg_ds.btyd.max_frequency}) AS frequency,
+  DATE_DIFF(last_purchase_date, first_purchase_date, DAY) / ${unit} AS recency,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), first_purchase_date, DAY) / ${unit} AS customer_age,
+  -- Gamma-Gamma uses the average of the REPEAT purchases only
+  IF(purchase_days > 1, (total_revenue - first_day_revenue) / (purchase_days - 1), NULL) AS monetary_value,
+  total_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_customer
+WHERE first_purchase_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL ${cfg_ds.btyd.calibration_days} DAY)
+  AND DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), first_purchase_date, DAY) >= ${unit}

@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.crm,
+  name: "crm_tracking_loss",
+  disabled: !constants.ENABLE.crm,
+  description: "How much of the real business GA4 does not see, by week, payment method and order value bucket (backend side), plus the GA4 orders that do not exist in the backend by browser / hostname. The correction factor to apply on GA4 revenue reports",
+  bigquery: {
+    labels: { layer: "marts", domain: "crm" }
+  },
+  tags: ["marts", "crm", "daily", "optional", "data_quality"],
+  columns: {
+    tracking_coverage: "Paid backend orders found in GA4 / paid backend orders. 0.85 = GA4 sees 85%, multiply GA4 revenue by ~1.18"
+  }
+}
+
+WITH r AS (
+  SELECT * FROM ${ref("crm_order_reconciliation")}
+)
+
+SELECT
+  'backend_payment_method' AS cut,
+  DATE_TRUNC(order_date, WEEK(MONDAY)) AS week_start,
+  COALESCE(payment_method_group, '(not set)') AS cut_value,
+  COUNTIF(is_paid) AS paid_backend_orders,
+  COUNTIF(is_paid AND match_status = 'matched') AS found_in_ga4,
+  SAFE_DIVIDE(COUNTIF(is_paid AND match_status = 'matched'), COUNTIF(is_paid)) AS tracking_coverage,
+  SUM(IF(is_paid AND match_status = 'missing_in_ga4', backend_value, 0)) AS revenue_not_seen_by_ga4,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM r
+WHERE match_status != 'missing_in_backend'
+GROUP BY 2, 3
+
+UNION ALL
+
+SELECT
+  'backend_order_value',
+  DATE_TRUNC(order_date, WEEK(MONDAY)),
+  CASE WHEN backend_value < 100 THEN '< 100' WHEN backend_value < 300 THEN '100-300' WHEN backend_value < 1000 THEN '300-1000' ELSE '1000+' END,
+  COUNTIF(is_paid),
+  COUNTIF(is_paid AND match_status = 'matched'),
+  SAFE_DIVIDE(COUNTIF(is_paid AND match_status = 'matched'), COUNTIF(is_paid)),
+  SUM(IF(is_paid AND match_status = 'missing_in_ga4', backend_value, 0)),
+  CURRENT_TIMESTAMP()
+FROM r
+WHERE match_status != 'missing_in_backend'
+GROUP BY 2, 3
+
+UNION ALL
+
+SELECT
+  'ga4_orders_not_in_backend_by_browser',
+  DATE_TRUNC(order_date, WEEK(MONDAY)),
+  COALESCE(device_browser, '(not set)'),
+  COUNT(*),
+  NULL,
+  NULL,
+  SUM(ga4_revenue),
+  CURRENT_TIMESTAMP()
+FROM r
+WHERE match_status = 'missing_in_backend'
+GROUP BY 2, 3

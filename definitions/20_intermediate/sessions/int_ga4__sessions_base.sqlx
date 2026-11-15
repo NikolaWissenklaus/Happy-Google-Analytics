@@ -1,0 +1,167 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__sessions_base",
+  description: "One row per session (session_key) with counts, engagement, landing/exit page, device, geo and consent. Traffic source is in int_ga4__session_traffic",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["user_pseudo_id", "session_key"],
+    labels: { layer: "intermediate", domain: "sessions" }
+  },
+  tags: ["ga4", "intermediate", "daily", "sessions"],
+  columns: Object.assign(docs.pick("session_key", "user_pseudo_id", "user_id", "ga_session_id", "session_date", "session_start_ts",
+    "is_new_user", "is_engaged", "is_bounce_ga4", "is_bounce_ua", "landing_page_path", "device_category", "geo_country", "geo_region",
+    "consent_analytics_storage", "consent_ads_storage", "loaded_at"), {
+    landing_page_path_ga4: "Landing page exactly like GA4 (first page_view). NULL = '(not set)' in the GA4 UI",
+    is_landing_page_fixed: "TRUE when the session had no page_view and we used the first event with page_location",
+    raw_key_events: "Events with a key event name (simple count, the precise one is in int_ga4__key_events)",
+    max_clock_offset_sec: "Biggest difference between device clock and server clock in the session"
+  })
+}
+
+js {
+  const simpleKeyEvents = Array.from(new Set(cfg_key_events.key_events.filter(k => !k.condition).map(k => k.event_name)));
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+-- one extra day before run_from: sessions that start 23:58 continue after midnight in another shard
+session_events AS (
+  SELECT *
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+roll_up_sessions AS (
+  SELECT
+    session_key,
+    ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
+    ANY_VALUE(ga_session_id) AS ga_session_id,
+    MAX(ga_session_number) AS ga_session_number,
+    ARRAY_AGG(user_id IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS user_id,
+    MIN(event_date) AS session_date,
+    MIN(event_ts) AS session_start_ts,
+    MAX(event_ts) AS session_end_ts,
+    ANY_VALUE(stream_id) AS stream_id,
+    ANY_VALUE(platform) AS platform,
+
+    COUNT(*) AS event_count,
+    COUNT(DISTINCT event_name) AS distinct_event_names,
+    COUNTIF(event_name = 'page_view') AS page_views,
+    COUNTIF(event_name = 'screen_view') AS screen_views,
+    COUNT(DISTINCT IF(event_name IN ('page_view', 'screen_view'), COALESCE(page_path, screen_name), NULL)) AS unique_pages,
+    COUNTIF(event_name NOT IN ('page_view', 'screen_view', 'session_start', 'first_visit', 'first_open', 'user_engagement')) AS interaction_events,
+    COUNTIF(${helpers.inList("event_name", simpleKeyEvents)}) AS raw_key_events,
+    COUNTIF(event_name = 'purchase') AS purchase_events,
+
+    LOGICAL_OR(event_name = 'session_start') AS has_session_start,
+    LOGICAL_OR(event_name IN ('first_visit', 'first_open')) AS has_first_visit,
+    LOGICAL_OR(is_session_engaged) AS is_engaged_ga4,
+    SUM(COALESCE(engagement_time_msec, 0)) AS engagement_time_msec,
+
+    -- landing page: GA4 uses the first page_view. if there is none, GA4 shows (not set)
+    -- and we fall back to the first event that has a page_location
+    ARRAY_AGG(
+      IF(event_name IN ('page_view', 'screen_view'), STRUCT(page_location, COALESCE(page_path, screen_name) AS page_path, page_title, page_hostname), NULL)
+      IGNORE NULLS ORDER BY event_ts, batch_ordering_id LIMIT 1
+    )[SAFE_OFFSET(0)] AS first_view,
+    ARRAY_AGG(
+      IF(page_path IS NOT NULL, STRUCT(page_location, page_path, page_title, page_hostname), NULL)
+      IGNORE NULLS ORDER BY event_ts LIMIT 1
+    )[SAFE_OFFSET(0)] AS first_page_any_event,
+    ARRAY_AGG(
+      IF(event_name IN ('page_view', 'screen_view'), STRUCT(COALESCE(page_path, screen_name) AS page_path, page_title), NULL)
+      IGNORE NULLS ORDER BY event_ts DESC LIMIT 1
+    )[SAFE_OFFSET(0)] AS last_view,
+
+    ARRAY_AGG(STRUCT(
+      device_category, device_os, device_os_version, device_browser, device_browser_version,
+      device_language, device_brand, device_model, geo_continent, geo_sub_continent,
+      geo_country, geo_region, geo_city, geo_metro, app_version, hostname
+    ) ORDER BY event_ts LIMIT 1)[OFFSET(0)] AS first_context,
+
+    -- GA4 "first user" acquisition (user scoped, same value in every event of the device)
+    ARRAY_AGG(first_user_source IGNORE NULLS LIMIT 1)[SAFE_OFFSET(0)] AS ga4_first_user_source,
+    ARRAY_AGG(first_user_medium IGNORE NULLS LIMIT 1)[SAFE_OFFSET(0)] AS ga4_first_user_medium,
+    ARRAY_AGG(first_user_campaign IGNORE NULLS LIMIT 1)[SAFE_OFFSET(0)] AS ga4_first_user_campaign,
+
+    ARRAY_AGG(consent_analytics_storage ORDER BY event_ts DESC LIMIT 1)[OFFSET(0)] AS consent_analytics_storage,
+    ARRAY_AGG(consent_ads_storage ORDER BY event_ts DESC LIMIT 1)[OFFSET(0)] AS consent_ads_storage,
+    COUNT(DISTINCT consent_ads_storage) > 1 OR COUNT(DISTINCT consent_analytics_storage) > 1 AS consent_changed_in_session,
+
+    -- quality signals, used by fct_sessions.data_quality_score
+    MAX(duplicate_count) > 1 AS had_duplicate_events,
+    LOGICAL_OR(source_table_type = 'intraday') AS has_intraday_events,
+    LOGICAL_OR(is_non_production_host) AS is_non_production_host,
+    MAX(ABS(event_server_timestamp_offset)) / 1e6 AS max_clock_offset_sec,
+    COUNTIF(event_name = 'page_view' AND page_location IS NULL) AS page_views_without_location,
+    COUNTIF(platform = 'WEB' AND page_location IS NULL AND event_name NOT IN ('session_start', 'first_visit', 'user_engagement')) AS web_events_without_page
+  FROM session_events
+  GROUP BY session_key
+)
+
+SELECT
+  session_key,
+  user_pseudo_id,
+  user_id,
+  ga_session_id,
+  ga_session_number,
+  session_date,
+  session_start_ts,
+  session_end_ts,
+  DATETIME(session_start_ts, '${constants.TIMEZONE}') AS session_start_local,
+  TIMESTAMP_DIFF(session_end_ts, session_start_ts, SECOND) AS session_duration_sec,
+  stream_id,
+  platform,
+  event_count,
+  distinct_event_names,
+  page_views,
+  screen_views,
+  unique_pages,
+  interaction_events,
+  raw_key_events,
+  purchase_events,
+  has_session_start,
+  has_first_visit,
+  is_engaged_ga4,
+  engagement_time_msec,
+  (COALESCE(ga_session_number, 0) = 1 OR has_first_visit) AS is_new_user,
+  -- GA4 flag can be missing (consent, MP, old tags). the rule is public, so we apply it too
+  (is_engaged_ga4 OR engagement_time_msec >= ${constants.ENGAGED_SESSION_MSEC} OR page_views + screen_views >= 2 OR raw_key_events > 0) AS is_engaged,
+  NOT is_engaged_ga4 AS is_bounce_ga4,
+  (page_views + screen_views <= 1 AND interaction_events = 0) AS is_bounce_ua,
+  first_view.page_path AS landing_page_path_ga4,
+  COALESCE(first_view.page_path, first_page_any_event.page_path) AS landing_page_path,
+  COALESCE(first_view.page_location, first_page_any_event.page_location) AS landing_page_location,
+  COALESCE(first_view.page_title, first_page_any_event.page_title) AS landing_page_title,
+  COALESCE(first_view.page_hostname, first_page_any_event.page_hostname) AS landing_hostname,
+  first_view IS NULL AND first_page_any_event IS NOT NULL AS is_landing_page_fixed,
+  last_view.page_path AS exit_page_path,
+  last_view.page_title AS exit_page_title,
+  first_context.*,
+  ga4_first_user_source,
+  ga4_first_user_medium,
+  ga4_first_user_campaign,
+  consent_analytics_storage,
+  consent_ads_storage,
+  consent_changed_in_session,
+  had_duplicate_events,
+  has_intraday_events,
+  is_non_production_host,
+  max_clock_offset_sec,
+  page_views_without_location,
+  web_events_without_page,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM roll_up_sessions
+WHERE session_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

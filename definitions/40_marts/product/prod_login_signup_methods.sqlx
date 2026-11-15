@@ -1,0 +1,27 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_login_signup_methods",
+  description: "Login and sign up by method (email, google, facebook, apple, whatsapp, gov.br...) last 90 days: events, users, share, and how many of those users bought in the same session. Social login adoption in one query",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"]
+}
+
+SELECT
+  e.event_name,
+  COALESCE(e.method, '(not set)') AS method,
+  COUNT(*) AS events,
+  COUNT(DISTINCT e.user_pseudo_id) AS users,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY e.event_name)) AS share_of_event,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(s.has_purchase, e.session_key, NULL)), COUNT(DISTINCT e.session_key)) AS session_conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")} AS e
+LEFT JOIN ${ref("fct_sessions")} AS s ON s.session_key = e.session_key
+WHERE e.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  AND e.event_name IN ('login', 'sign_up')
+  ${helpers.noiseFilter("e")}
+GROUP BY 1, 2

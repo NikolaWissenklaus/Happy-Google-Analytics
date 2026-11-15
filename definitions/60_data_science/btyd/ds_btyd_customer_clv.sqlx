@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_btyd_customer_clv",
+  description: "Per customer: probability of still being 'alive', expected purchases in the next 13 weeks, expected order value (Gamma-Gamma) and the CLV of the period (revenue and gross margin). The 'who is worth calling' list, with the math of Fader & Hardie, no python notebook",
+  bigquery: {
+    clusterBy: ["alive_band"],
+    labels: { layer: "data_science", domain: "btyd" }
+  },
+  tags: ["data_science", "btyd", "daily", "crm"],
+  columns: {
+    p_alive: "Probability that the customer did not churn silently (BG/NBD)",
+    expected_purchases: "Expected purchase days in the next prediction_horizon_units weeks",
+    clv_revenue: "expected purchases x expected order value",
+    clv_margin: "clv_revenue x assumed gross margin"
+  }
+}
+
+WITH params AS (
+  SELECT * FROM ${ref("ds_btyd_model_params")}
+),
+
+predicted AS (
+  SELECT
+    s.*,
+    ${ref("bg_nbd_predict")}(
+      CAST(s.frequency AS FLOAT64), s.recency, s.customer_age, ${cfg_ds.btyd.prediction_horizon_units},
+      p.bg_r, p.bg_alpha, p.bg_a, p.bg_b
+    ) AS bg,
+    ${ref("gamma_gamma_expected_value")}(CAST(s.frequency AS FLOAT64), s.monetary_value, p.gg_p, p.gg_q, p.gg_v) AS expected_order_value
+  FROM ${ref("ds_btyd_summary")} AS s
+  CROSS JOIN params AS p
+)
+
+SELECT
+  user_key,
+  first_purchase_date,
+  last_purchase_date,
+  frequency,
+  recency,
+  customer_age,
+  monetary_value,
+  bg.p_alive,
+  bg.expected_purchases,
+  expected_order_value,
+  bg.expected_purchases * expected_order_value AS clv_revenue,
+  bg.expected_purchases * expected_order_value * ${cfg_project.assumed_gross_margin} AS clv_margin,
+  CASE
+    WHEN bg.p_alive >= 0.8 THEN 'alive'
+    WHEN bg.p_alive >= 0.5 THEN 'cooling'
+    WHEN bg.p_alive >= 0.2 THEN 'at_risk'
+    ELSE 'probably_gone'
+  END AS alive_band,
+  NTILE(10) OVER (ORDER BY bg.expected_purchases * expected_order_value) AS clv_decile,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM predicted

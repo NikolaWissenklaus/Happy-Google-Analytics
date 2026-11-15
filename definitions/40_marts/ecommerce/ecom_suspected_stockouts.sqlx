@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_suspected_stockouts",
+  description: "Items that people keep viewing but suddenly nobody adds to cart: probably out of stock (or the buy button / size selector broke). Compares the last 3 days with the previous 28 and estimates the revenue being lost per day",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "alerts"],
+  columns: {
+    estimated_lost_revenue_per_day: "views per day x baseline cart rate x baseline cart-to-purchase revenue. Rough, but enough to prioritize",
+    suspicion: "high = views normal and carts ~0, medium = carts fell 70%+"
+  }
+}
+
+WITH
+recent AS (
+  SELECT
+    item_id,
+    SUM(IF(event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), views, 0)) AS views_3d,
+    SUM(IF(event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), add_to_carts, 0)) AS carts_3d,
+    SUM(IF(event_date < DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), views, 0)) AS views_28d,
+    SUM(IF(event_date < DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), add_to_carts, 0)) AS carts_28d,
+    SUM(IF(event_date < DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), item_revenue, 0)) AS revenue_28d
+  FROM ${ref("int_ga4__item_prices_daily")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY)
+    AND event_date < CURRENT_DATE('${constants.TIMEZONE}')
+  GROUP BY item_id
+)
+
+SELECT
+  r.item_id,
+  d.item_name,
+  d.item_category,
+  d.item_brand,
+  d.current_price,
+  r.views_3d,
+  r.carts_3d,
+  r.views_28d,
+  r.carts_28d,
+  SAFE_DIVIDE(r.carts_28d, r.views_28d) AS baseline_cart_rate,
+  SAFE_DIVIDE(r.carts_3d, r.views_3d) AS recent_cart_rate,
+  SAFE_DIVIDE(r.views_3d / 3, r.views_28d / 28) AS views_index,
+  SAFE_DIVIDE(r.revenue_28d, r.carts_28d) AS revenue_per_cart_28d,
+  (r.views_3d / 3) * SAFE_DIVIDE(r.carts_28d, r.views_28d) * SAFE_DIVIDE(r.revenue_28d, r.carts_28d) AS estimated_lost_revenue_per_day,
+  CASE
+    WHEN r.carts_3d = 0 AND r.views_3d >= 30 THEN 'high'
+    ELSE 'medium'
+  END AS suspicion,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM recent AS r
+LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+WHERE r.carts_28d >= 20
+  AND r.views_3d >= 20
+  AND SAFE_DIVIDE(r.views_3d / 3, r.views_28d / 28) >= 0.5
+  AND SAFE_DIVIDE(r.carts_3d, r.views_3d) < 0.3 * SAFE_DIVIDE(r.carts_28d, r.views_28d)

@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_google_ads__clicks",
+  disabled: !constants.ENABLE.google_ads,
+  description: "One row per Google Ads click (gclid) with campaign, ad group and keyword. Used to rescue the campaign of GA4 sessions with gclid and '(not set)' campaign",
+  bigquery: {
+    partitionBy: "click_date",
+    clusterBy: ["gclid"],
+    labels: { layer: "staging", source: "google_ads" }
+  },
+  tags: ["staging", "daily", "google_ads", "optional"],
+  columns: {
+    gclid: "Google click id, same value that lands in the url of the session",
+    keyword_text: "Keyword that triggered the click (search campaigns only)"
+  }
+}
+
+SELECT
+  click_view_gclid AS gclid,
+  segments_date AS click_date,
+  CAST(customer_id AS STRING) AS customer_id,
+  CAST(campaign_id AS STRING) AS campaign_id,
+  CAST(ad_group_id AS STRING) AS ad_group_id,
+  click_view_keyword_info_text AS keyword_text,
+  click_view_keyword_info_match_type AS keyword_match_type,
+  segments_device AS device,
+  segments_ad_network_type AS network,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref(`ads_ClickStats_${constants.GOOGLE_ADS.customer_id}`)}
+WHERE segments_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
+  AND click_view_gclid IS NOT NULL
+QUALIFY ROW_NUMBER() OVER (PARTITION BY click_view_gclid ORDER BY segments_date) = 1

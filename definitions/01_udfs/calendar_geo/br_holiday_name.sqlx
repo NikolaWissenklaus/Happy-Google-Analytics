@@ -1,0 +1,39 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "br_holiday_name",
+  description: "Brazilian national holiday (feriado nacional) or national 'ponto facultativo' name of a date, NULL otherwise",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "calendar"]
+}
+
+-- Consciencia Negra became a national holiday in 2024 (Lei 14.759/2023).
+-- Carnaval, Quarta de Cinzas and Corpus Christi are "ponto facultativo" nationally, but
+-- for ecommerce they behave like holidays, so they are here (dim_calendar has the type).
+-- state and city holidays are not here, put them in the calendar if you need.
+CREATE OR REPLACE FUNCTION ${self()}(d DATE) RETURNS STRING AS ((
+  SELECT
+    CASE
+      WHEN md = '01-01' THEN 'Confraternização Universal'
+      WHEN d = DATE_SUB(easter, INTERVAL 48 DAY) THEN 'Carnaval (segunda)'
+      WHEN d = DATE_SUB(easter, INTERVAL 47 DAY) THEN 'Carnaval (terça)'
+      WHEN d = DATE_SUB(easter, INTERVAL 46 DAY) THEN 'Quarta-feira de Cinzas'
+      WHEN d = DATE_SUB(easter, INTERVAL 2 DAY) THEN 'Sexta-feira Santa'
+      WHEN d = easter THEN 'Páscoa'
+      WHEN md = '04-21' THEN 'Tiradentes'
+      WHEN md = '05-01' THEN 'Dia do Trabalho'
+      WHEN d = DATE_ADD(easter, INTERVAL 60 DAY) THEN 'Corpus Christi'
+      WHEN md = '09-07' THEN 'Independência do Brasil'
+      WHEN md = '10-12' THEN 'Nossa Senhora Aparecida'
+      WHEN md = '11-02' THEN 'Finados'
+      WHEN md = '11-15' THEN 'Proclamação da República'
+      WHEN md = '11-20' AND EXTRACT(YEAR FROM d) >= 2024 THEN 'Consciência Negra'
+      WHEN md = '12-25' THEN 'Natal'
+      ELSE NULL
+    END
+  FROM (SELECT ${ref("easter_date")}(EXTRACT(YEAR FROM d)) AS easter, FORMAT_DATE('%m-%d', d) AS md)
+))
+OPTIONS (description = "Brazilian national holiday name")

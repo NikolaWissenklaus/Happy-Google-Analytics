@@ -1,0 +1,21 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "gamma_gamma_expected_value",
+  description: "Expected average order value of a customer given x repeat purchases with mean m (Gamma-Gamma). x = 0 gives the population mean",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "data_science"]
+}
+
+-- E(M | p, q, v, m_x, x) = p * (v + m_x * x) / (p * x + q - 1)
+CREATE OR REPLACE FUNCTION ${self()}(x FLOAT64, m FLOAT64, p FLOAT64, q FLOAT64, v FLOAT64) RETURNS FLOAT64 AS (
+  CASE
+    WHEN p IS NULL OR q IS NULL OR v IS NULL THEN NULL
+    WHEN x IS NULL OR x <= 0 OR m IS NULL THEN SAFE_DIVIDE(p * v, q - 1)
+    ELSE SAFE_DIVIDE(p * (v + m * x), p * x + q - 1)
+  END
+)
+OPTIONS (description = "Gamma-Gamma conditional expected spend")

@@ -1,0 +1,54 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "dim_pages",
+  description: "One row per page path: latest title, page type, content group, UA style path levels, 404 flag, first/last seen and lifetime views",
+  bigquery: {
+    clusterBy: ["page_type", "page_path"],
+    labels: { layer: "core", domain: "pages" }
+  },
+  tags: ["ga4", "core", "daily", "pages"],
+  columns: {
+    page_type: "home / product / category / cart / checkout / thank_you / search / account / blog / institutional / landing_page / other",
+    path_level_1: "UA content drilldown level 1 (/blog/)",
+    is_not_found: "Title says 404 / not found / pagina nao encontrada"
+  }
+}
+
+WITH per_page AS (
+  SELECT
+    page_path,
+    ARRAY_AGG(STRUCT(page_title, page_hostname, content_group) ORDER BY event_ts DESC LIMIT 1)[OFFSET(0)] AS latest,
+    COUNT(DISTINCT page_title) AS title_variants,
+    MIN(event_date) AS first_seen_date,
+    MAX(event_date) AS last_seen_date,
+    COUNT(*) AS lifetime_views,
+    COUNTIF(is_entrance) AS lifetime_entrances,
+    COUNTIF(is_exit) AS lifetime_exits
+  FROM ${ref("int_ga4__page_views")}
+  WHERE page_path IS NOT NULL
+  GROUP BY page_path
+)
+
+SELECT
+  page_path,
+  latest.page_title,
+  latest.page_hostname,
+  latest.content_group,
+  ${content.pageTypeCase("page_path")} AS page_type,
+  ${content.isNotFoundTitle("latest.page_title")} AS is_not_found,
+  ${ref("path_level")}(page_path, 1) AS path_level_1,
+  ${ref("path_level")}(page_path, 2) AS path_level_2,
+  ${ref("path_level")}(page_path, 3) AS path_level_3,
+  ${ref("path_level")}(page_path, 4) AS path_level_4,
+  ARRAY_LENGTH(SPLIT(TRIM(page_path, '/'), '/')) AS path_depth,
+  title_variants,
+  first_seen_date,
+  last_seen_date,
+  lifetime_views,
+  lifetime_entrances,
+  lifetime_exits,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_page

@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_geo_market_penetration",
+  description: "Market penetration per brazilian state (last 365 days): customers and revenue per 100 thousand inhabitants (IBGE Censo 2022) and the index vs Brazil. States with traffic but low penetration = logistics / shipping problem or a regional media opportunity",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "geo"],
+  columns: {
+    penetration_index: "customers per 100k of the state / customers per 100k of Brazil. 0.5 = half of the national penetration"
+  }
+}
+
+WITH
+by_state AS (
+  SELECT
+    geo_uf,
+    COUNT(DISTINCT user_key) AS customers,
+    SUM(revenue) AS revenue,
+    COUNT(*) AS orders
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND geo_uf IS NOT NULL
+    AND transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+  GROUP BY geo_uf
+),
+
+sessions_by_state AS (
+  SELECT geo_uf, COUNT(*) AS sessions, SAFE_DIVIDE(SUM(transactions), COUNT(*)) AS conversion_rate
+  FROM ${ref("fct_sessions")}
+  WHERE geo_uf IS NOT NULL
+    AND session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY geo_uf
+)
+
+SELECT
+  st.uf,
+  st.state_name,
+  st.macro_region,
+  st.population_2022,
+  COALESCE(s.sessions, 0) AS sessions,
+  s.conversion_rate,
+  COALESCE(b.customers, 0) AS customers,
+  COALESCE(b.orders, 0) AS orders,
+  COALESCE(b.revenue, 0) AS revenue,
+  SAFE_DIVIDE(b.customers * 100000, st.population_2022) AS customers_per_100k,
+  SAFE_DIVIDE(b.revenue, st.population_2022) AS revenue_per_capita,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(b.customers, st.population_2022),
+    SAFE_DIVIDE(SUM(b.customers) OVER (), SUM(st.population_2022) OVER ())
+  ) AS penetration_index,
+  SAFE_DIVIDE(b.revenue, SUM(b.revenue) OVER ()) AS revenue_share,
+  SAFE_DIVIDE(st.population_2022, SUM(st.population_2022) OVER ()) AS population_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("seed_br_states")} AS st
+LEFT JOIN by_state AS b ON b.geo_uf = st.uf
+LEFT JOIN sessions_by_state AS s ON s.geo_uf = st.uf

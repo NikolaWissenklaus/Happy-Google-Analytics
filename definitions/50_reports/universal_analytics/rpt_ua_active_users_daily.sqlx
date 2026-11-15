@@ -1,0 +1,32 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_active_users_daily",
+  description: "UA Audience > Active Users: 1-day, 7-day, 14-day and 28-day active users for every day (rolling, HLL merged)",
+  bigquery: {
+    partitionBy: "activity_date",
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"]
+}
+
+WITH sketches AS (
+  SELECT activity_date, HLL_COUNT.INIT(user_key) AS sketch, COUNT(DISTINCT user_key) AS users
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= DATE_SUB(${helpers.martWindowStart()}, INTERVAL 28 DAY)
+  GROUP BY activity_date
+)
+
+SELECT
+  d.activity_date,
+  ANY_VALUE(d.users) AS active_users_1_day,
+  HLL_COUNT.MERGE(IF(w.activity_date > DATE_SUB(d.activity_date, INTERVAL 7 DAY), w.sketch, NULL)) AS active_users_7_day,
+  HLL_COUNT.MERGE(IF(w.activity_date > DATE_SUB(d.activity_date, INTERVAL 14 DAY), w.sketch, NULL)) AS active_users_14_day,
+  HLL_COUNT.MERGE(w.sketch) AS active_users_28_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sketches AS d
+JOIN sketches AS w ON w.activity_date BETWEEN DATE_SUB(d.activity_date, INTERVAL 27 DAY) AND d.activity_date
+WHERE d.activity_date >= ${helpers.martWindowStart()}
+GROUP BY d.activity_date

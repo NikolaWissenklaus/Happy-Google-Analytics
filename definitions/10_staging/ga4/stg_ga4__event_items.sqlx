@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_ga4__event_items",
+  description: "One row per item per ecommerce event (view_item_list, select_item, view_item, add_to_cart, purchase, refund, promotions...). Cleaned, with item revenue fixed when GA4 leaves it NULL",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name", "item_id"],
+    labels: { layer: "staging", source: "ga4" }
+  },
+  tags: ["ga4", "staging", "daily", "ecommerce"],
+  columns: Object.assign(docs.pick("event_id", "event_date", "event_ts", "event_name", "session_key", "user_pseudo_id", "transaction_id", "loaded_at"), {
+    item_index: "Position of the item inside the items array (0 based)",
+    item_revenue_fixed: "item_revenue, or price * quantity when GA4 did not fill it. Only for purchase",
+    item_value: "price * quantity, the value of the line (works for cart/checkout events too)",
+    item_discount: "discount item param (number), if the site sends it"
+  })
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+SELECT
+  e.event_date,
+  e.event_id,
+  e.event_ts,
+  e.event_name,
+  e.session_key,
+  e.user_pseudo_id,
+  e.user_id,
+  e.stream_id,
+  e.platform,
+  e.transaction_id,
+  e.currency,
+  e.coupon AS order_coupon,
+  e.is_internal_traffic,
+  e.is_debug,
+  item_index,
+  ${ga4.cleanId("i.item_id")} AS item_id,
+  ${ga4.cleanString("i.item_name")} AS item_name,
+  ${ga4.cleanString("i.item_brand")} AS item_brand,
+  ${ga4.cleanString("i.item_variant")} AS item_variant,
+  ${ga4.cleanString("i.item_category")} AS item_category,
+  ${ga4.cleanString("i.item_category2")} AS item_category2,
+  ${ga4.cleanString("i.item_category3")} AS item_category3,
+  ${ga4.cleanString("i.item_category4")} AS item_category4,
+  ${ga4.cleanString("i.item_category5")} AS item_category5,
+  i.price,
+  i.price_in_usd,
+  i.quantity,
+  i.item_revenue,
+  i.item_revenue_in_usd,
+  i.item_refund,
+  i.item_refund_in_usd,
+  IF(e.event_name = 'purchase', COALESCE(i.item_revenue, i.price * COALESCE(i.quantity, 1)), NULL) AS item_revenue_fixed,
+  COALESCE(i.price, 0) * COALESCE(i.quantity, 1) AS item_value,
+  NULLIF(UPPER(TRIM(${ga4.cleanString("i.coupon")})), '') AS item_coupon,
+  ${ga4.cleanString("i.affiliation")} AS affiliation,
+  i.location_id,
+  ${ga4.cleanString("i.item_list_id")} AS item_list_id,
+  ${ga4.cleanString("i.item_list_name")} AS item_list_name,
+  SAFE_CAST(i.item_list_index AS INT64) AS item_list_index,
+  ${ga4.cleanString("i.promotion_id")} AS promotion_id,
+  ${ga4.cleanString("i.promotion_name")} AS promotion_name,
+  ${ga4.cleanString("i.creative_name")} AS creative_name,
+  ${ga4.cleanString("i.creative_slot")} AS creative_slot,
+  ${ga4.itemParam("discount", "number")} AS item_discount,
+  i.item_params,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")} AS e,
+  UNNEST(e.items) AS i WITH OFFSET AS item_index
+WHERE e.event_date >= run_from
+  AND e.items_count > 0
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

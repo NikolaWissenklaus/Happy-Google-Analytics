@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_lagged_correlations",
+  description: "Cross correlation between the sessions of each channel and the revenue N days LATER (lag 0..14, last 365 days, both detrended with 7 day differences). The lag with the highest correlation says how long each channel takes to turn into money: TV / social usually lag, search is instant",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily", "attribution"],
+  columns: {
+    best_lag_for_channel: "TRUE on the lag with the highest correlation of the channel"
+  }
+}
+
+js {
+  const channelList = ["Direct", "Organic Search", "Paid Search", "Paid Social", "Organic Social", "Email", "Referral", "Display", "Paid Shopping", "Cross-network"];
+  const col = c => "sessions_" + c.toLowerCase().replace(/[^a-z0-9]+/g, "_");
+}
+
+WITH
+-- week over week differences remove trend and the weekday pattern (spurious correlations die here)
+diffs AS (
+  SELECT
+    metric_date,
+    revenue - LAG(revenue, 7) OVER (ORDER BY metric_date) AS d_revenue,
+    ${channelList.map(c => `${col(c)} - LAG(${col(c)}, 7) OVER (ORDER BY metric_date) AS d_${col(c)}`).join(",\n    ")}
+  FROM ${ref("ds_daily_metrics_wide")}
+  WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 380 DAY)
+),
+
+channels_long AS (
+  SELECT metric_date, c.channel, c.d_sessions
+  FROM diffs,
+    UNNEST([${channelList.map(c => `STRUCT('${c}' AS channel, CAST(d_${col(c)} AS FLOAT64) AS d_sessions)`).join(", ")}]) AS c
+),
+
+lags AS (
+  SELECT lag_days FROM UNNEST(GENERATE_ARRAY(0, 14)) AS lag_days
+),
+
+correlations AS (
+  SELECT
+    c.channel,
+    l.lag_days,
+    CORR(c.d_sessions, r.d_revenue) AS correlation,
+    COUNT(*) AS days
+  FROM channels_long AS c
+  CROSS JOIN lags AS l
+  JOIN diffs AS r ON r.metric_date = DATE_ADD(c.metric_date, INTERVAL l.lag_days DAY)
+  WHERE c.d_sessions IS NOT NULL AND r.d_revenue IS NOT NULL
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  correlation = MAX(correlation) OVER (PARTITION BY channel) AS best_lag_for_channel,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM correlations

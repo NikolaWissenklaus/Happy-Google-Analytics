@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ops,
+  name: "ops_incremental_watermarks",
+  description: "Log of every incremental run (model, run_from, mode). Downstream models read it to follow upstream backfills automatically",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["ops", "daily", "bootstrap"]
+}
+
+-- created once, appended by the post_operations of each incremental model
+-- (helpers.incrementalPostOps). never drop this table without a full refresh after.
+CREATE TABLE IF NOT EXISTS ${self()} (
+  model STRING OPTIONS (description = "Dataform action name"),
+  run_from DATE OPTIONS (description = "First date (re)processed in this run"),
+  run_mode STRING OPTIONS (description = "incremental | full_refresh"),
+  loaded_at TIMESTAMP OPTIONS (description = "When the run finished")
+)
+PARTITION BY DATE(loaded_at)
+OPTIONS (
+  description = "Incremental runs log (watermarks)",
+  partition_expiration_days = 400
+)

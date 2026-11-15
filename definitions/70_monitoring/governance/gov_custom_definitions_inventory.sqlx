@@ -1,0 +1,117 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.governance,
+  name: "gov_custom_definitions_inventory",
+  description: "Which params and user properties deserve to be GA4 custom dimensions / metrics, and if they fit the quota (standard property: 50 event scoped dimensions, 25 user scoped, 10 item scoped, 50 metrics). Ranked by volume, with type, cardinality (high cardinality = '(other)' row in the reports) and a suggestion. Built in GA4 params are out, they need no registration",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "governance" }
+  },
+  tags: ["monitoring", "governance", "daily"],
+  columns: {
+    suggestion: "custom_metric (numeric, not an id) | custom_dimension | do_not_register (id / timestamp / free text with huge cardinality, use BigQuery instead)",
+    fits_in_quota: "Rank inside the scope quota of a standard property",
+    distinct_values_7d: "Approximate distinct values in the last 7 days"
+  }
+}
+
+js {
+  // params GA4 collects / understands by itself, they never need a custom definition
+  const builtIn = [
+    "page_location", "page_referrer", "page_title", "page_path", "ga_session_id", "ga_session_number", "engagement_time_msec",
+    "session_engaged", "engaged_session_event", "entrances", "ignore_referrer", "debug_mode", "debug_event", "traffic_type",
+    "batch_page_id", "batch_ordering_id", "synthetic_bundle", "term", "source", "medium", "campaign", "campaign_id", "content",
+    "gclid", "dclid", "srsltid", "gad_source", "firebase_screen", "firebase_screen_class", "firebase_screen_id",
+    "firebase_event_origin", "firebase_previous_screen", "firebase_previous_class", "firebase_previous_id", "firebase_conversion",
+    "currency", "value", "transaction_id", "tax", "shipping", "coupon", "payment_type", "shipping_tier", "items",
+    "item_list_id", "item_list_name", "promotion_id", "promotion_name", "creative_name", "creative_slot", "method",
+    "search_term", "link_url", "link_domain", "link_classes", "link_id", "link_text", "outbound", "file_name", "file_extension",
+    "video_title", "video_url", "video_provider", "video_percent", "video_current_time", "video_duration", "visible",
+    "percent_scrolled", "form_id", "form_name", "form_destination", "form_length", "form_submit_text", "content_group",
+    "content_type", "content_id", "language", "screen_resolution", "unique_search_term", "client_id"
+  ];
+  const quota = { event: 50, user: 25, item: 10, metric: 50 };
+}
+
+WITH
+event_params AS (
+  SELECT
+    'event' AS scope,
+    param_key AS name,
+    COUNT(*) AS rows_7d,
+    COUNT(DISTINCT event_name) AS events_using_it,
+    ARRAY_AGG(DISTINCT value_type) AS value_types,
+    APPROX_COUNT_DISTINCT(value_as_string) AS distinct_values_7d,
+    LOGICAL_AND(value_type IN ('int', 'double', 'float', 'null')) AS is_numeric
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+    AND param_key NOT IN (${helpers.sqlList(builtIn)})
+  GROUP BY param_key
+),
+
+user_props AS (
+  SELECT
+    'user' AS scope,
+    property_key AS name,
+    COUNT(*) AS rows_7d,
+    0 AS events_using_it,
+    ARRAY_AGG(DISTINCT value_type) AS value_types,
+    APPROX_COUNT_DISTINCT(property_value) AS distinct_values_7d,
+    LOGICAL_AND(value_type IN ('int', 'double', 'float', 'null')) AS is_numeric
+  FROM ${ref("stg_ga4__user_properties")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+  GROUP BY property_key
+),
+
+item_params AS (
+  SELECT
+    'item' AS scope,
+    param_key AS name,
+    item_rows AS rows_7d,
+    0 AS events_using_it,
+    value_types,
+    distinct_values AS distinct_values_7d,
+    NOT EXISTS (SELECT 1 FROM UNNEST(value_types) AS t WHERE t NOT IN ('int', 'double', 'float', 'null')) AS is_numeric
+  FROM ${ref("watch_item_param_registry")}
+  WHERE last_seen_date >= ${helpers.daysAgo(7)}
+),
+
+candidates AS (
+  SELECT * FROM event_params
+  UNION ALL SELECT * FROM user_props
+  UNION ALL SELECT * FROM item_params
+),
+
+with_suggestion AS (
+  SELECT
+    *,
+    CASE
+      WHEN REGEXP_CONTAINS(LOWER(name), r'(^|_)(id|uuid|guid|token|timestamp|ts|time|hash)$') AND distinct_values_7d > 1000 THEN 'do_not_register'
+      WHEN NOT is_numeric AND distinct_values_7d > 50000 THEN 'do_not_register'
+      WHEN is_numeric AND scope != 'user' AND NOT REGEXP_CONTAINS(LOWER(name), r'(^|_)(id|number|code|cep|zip)$') THEN 'custom_metric'
+      ELSE 'custom_dimension'
+    END AS suggestion
+  FROM candidates
+),
+
+ranked AS (
+  SELECT
+    *,
+    -- metrics share one quota, dimensions have one quota per scope
+    ROW_NUMBER() OVER (PARTITION BY IF(suggestion = 'custom_metric', 'metric', scope), suggestion ORDER BY rows_7d DESC) AS rank_in_scope
+  FROM with_suggestion
+)
+
+SELECT
+  *,
+  CASE
+    WHEN suggestion = 'do_not_register' THEN NULL
+    WHEN suggestion = 'custom_metric' THEN rank_in_scope <= ${quota.metric}
+    WHEN scope = 'event' THEN rank_in_scope <= ${quota.event}
+    WHEN scope = 'user' THEN rank_in_scope <= ${quota.user}
+    ELSE rank_in_scope <= ${quota.item}
+  END AS fits_in_quota,
+  distinct_values_7d > 500 AND suggestion = 'custom_dimension' AS risk_of_other_row,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ranked

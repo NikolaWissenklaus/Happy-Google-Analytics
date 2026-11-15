@@ -1,0 +1,56 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_param_cardinality",
+  description: "Cardinality of every event param (last 7 days): distinct values per day, top value share and type mix. High cardinality params registered as custom dimensions fill GA4 reports with '(other)'. Also catches ids and timestamps sent as dimensions by mistake",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "governance"],
+  columns: {
+    avg_distinct_values_per_day: "Distinct values per day (GA4 starts grouping into '(other)' above ~500 per day per dimension in standard reports)",
+    cardinality_flag: "ok | high (500+/day) | id_like (almost one value per event)"
+  }
+}
+
+WITH per_day AS (
+  SELECT
+    event_date,
+    event_name,
+    param_key,
+    COUNT(*) AS occurrences,
+    COUNT(DISTINCT value_as_string) AS distinct_values,
+    COUNT(DISTINCT value_type) AS value_types
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY)
+    AND param_key NOT IN ('ga_session_id', 'ga_session_number', 'engagement_time_msec', 'page_location', 'page_referrer', 'page_title',
+                          'batch_page_id', 'batch_ordering_id', 'entrances', 'session_engaged', 'engaged_session_event')
+  GROUP BY 1, 2, 3
+),
+
+top_values AS (
+  SELECT event_name, param_key, APPROX_TOP_COUNT(value_as_string, 3) AS top_3_values
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY)
+  GROUP BY 1, 2
+)
+
+SELECT
+  p.event_name,
+  p.param_key,
+  SUM(p.occurrences) AS occurrences_7d,
+  AVG(p.distinct_values) AS avg_distinct_values_per_day,
+  MAX(p.value_types) AS value_types_used,
+  SAFE_DIVIDE(AVG(p.distinct_values), AVG(p.occurrences)) AS distinct_per_occurrence,
+  ANY_VALUE(t.top_3_values) AS top_3_values,
+  CASE
+    WHEN SAFE_DIVIDE(AVG(p.distinct_values), AVG(p.occurrences)) > 0.9 AND AVG(p.occurrences) > 100 THEN 'id_like'
+    WHEN AVG(p.distinct_values) > 500 THEN 'high'
+    ELSE 'ok'
+  END AS cardinality_flag,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_day AS p
+LEFT JOIN top_values AS t USING (event_name, param_key)
+GROUP BY 1, 2

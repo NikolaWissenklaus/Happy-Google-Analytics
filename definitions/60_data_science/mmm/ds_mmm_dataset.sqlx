@@ -1,0 +1,90 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_mmm_dataset",
+  description: "Daily dataset for a lightweight Marketing Mix Model: revenue, spend per platform with geometric adstock (carry over of the ads effect, decay in cfg_ds.mmm) and log saturation (diminishing returns), plus calendar controls (weekday, holidays, retail events, salary window). The model is ds_model_mmm (BQML)",
+  bigquery: {
+    labels: { layer: "data_science", domain: "mmm" }
+  },
+  tags: ["data_science", "mmm", "daily"]
+}
+
+js {
+  const decay = cfg_ds.mmm.adstock_decay;
+  // platforms known at compile time: manual costs always, the connectors when enabled
+  const platforms = ["manual"].concat(constants.ENABLE.google_ads ? ["google_ads"] : []).concat(constants.ENABLE.meta_ads ? ["meta_ads"] : []);
+}
+
+WITH
+days AS (
+  SELECT d AS metric_date
+  FROM UNNEST(GENERATE_DATE_ARRAY(${helpers.martWindowStart(730)}, DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 DAY))) AS d
+),
+
+spend AS (
+  SELECT cost_date AS metric_date, platform, SUM(cost) AS cost
+  FROM ${ref("int_costs__unified_daily")}
+  GROUP BY 1, 2
+),
+
+grid AS (
+  SELECT d.metric_date, p AS platform, COALESCE(s.cost, 0) AS cost
+  FROM days AS d
+  CROSS JOIN UNNEST([${helpers.sqlList(platforms)}]) AS p
+  LEFT JOIN spend AS s ON s.metric_date = d.metric_date AND s.platform = p
+),
+
+-- adstock_t = sum of spend_(t-k) * decay^k over the last 30 days
+adstocked AS (
+  SELECT
+    metric_date,
+    platform,
+    cost,
+    (SELECT SUM(h.c * POW(${decay}, DATE_DIFF(metric_date, h.d, DAY))) FROM UNNEST(history) AS h) AS adstock
+  FROM (
+    SELECT
+      *,
+      ARRAY_AGG(STRUCT(metric_date AS d, cost AS c)) OVER (
+        PARTITION BY platform ORDER BY UNIX_DATE(metric_date) RANGE BETWEEN 29 PRECEDING AND CURRENT ROW
+      ) AS history
+    FROM grid
+  )
+),
+
+typical_spend AS (
+  SELECT platform, APPROX_QUANTILES(cost, 2)[OFFSET(1)] AS median_spend
+  FROM grid
+  WHERE cost > 0
+  GROUP BY platform
+),
+
+media_wide AS (
+  SELECT
+    a.metric_date,
+    ${platforms.map(p => `SUM(IF(a.platform = '${p}', a.cost, 0)) AS cost_${p},
+    SUM(IF(a.platform = '${p}', a.adstock, 0)) AS adstock_${p},
+    SUM(IF(a.platform = '${p}', LN(1 + COALESCE(SAFE_DIVIDE(a.adstock, t.median_spend), 0)), 0)) AS sat_${p}`).join(",\n    ")}
+  FROM adstocked AS a
+  LEFT JOIN typical_spend AS t USING (platform)
+  GROUP BY a.metric_date
+)
+
+SELECT
+  d.metric_date,
+  COALESCE(k.valid_revenue, 0) AS revenue,
+  COALESCE(k.orders, 0) AS orders,
+  COALESCE(k.sessions, 0) AS sessions,
+  c.weekday_name AS weekday,
+  c.is_holiday,
+  c.retail_event IS NOT NULL AS is_retail_event,
+  c.is_salary_window,
+  c.is_13th_salary_window,
+  m.* EXCEPT (metric_date),
+  ${platforms.map(p => `m.cost_${p}`).join(" + ")} AS total_cost,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM days AS d
+LEFT JOIN ${ref("ecom_daily_kpis")} AS k ON k.kpi_date = d.metric_date
+LEFT JOIN ${ref("dim_calendar")} AS c ON c.date_day = d.metric_date
+LEFT JOIN media_wide AS m ON m.metric_date = d.metric_date

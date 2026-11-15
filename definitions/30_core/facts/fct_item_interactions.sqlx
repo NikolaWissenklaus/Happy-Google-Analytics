@@ -1,0 +1,27 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.core,
+  name: "fct_item_interactions",
+  description: "Every item level ecommerce event (impressions, clicks, views, carts, checkout, purchase, refund, promotions) with session context. Filter event_date!",
+  tags: ["ga4", "core", "daily", "ecommerce"]
+}
+
+SELECT
+  i.*,
+  s.user_key,
+  s.is_new_user,
+  s.session_source,
+  s.session_medium,
+  s.session_campaign,
+  s.session_default_channel_group,
+  s.session_custom_channel_group,
+  s.landing_page_type,
+  s.device_category,
+  s.geo_uf,
+  s.has_purchase AS session_has_purchase,
+  s.is_bot_suspect
+FROM ${ref("stg_ga4__event_items")} AS i
+LEFT JOIN ${ref("fct_sessions")} AS s ON s.session_key = i.session_key
+WHERE NOT i.is_internal_traffic

@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_activation_consent_audit",
+  description: "Proof that the activation layer only sends consented people: for every act_ table, rows, distinct users and the rows of users that are NOT allowed for that destination today (must be zero). assert_activation_only_consented_users fails the run if not",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily", "activation"],
+  columns: {
+    rows_not_allowed: "Rows of users without the needed permission (can_send_to_ads / can_write_back_ga4 / can_send_to_crm) or blocked by a data subject request"
+  }
+}
+
+js {
+  const audits = [
+    { table: "act_google_ads_offline_conversions", flag: "can_send_to_ads" },
+    { table: "act_meta_capi_events", flag: "can_send_to_ads" },
+    { table: "act_ga4_mp_user_properties", flag: "can_write_back_ga4" },
+    { table: "act_crm_user_traits", flag: "can_send_to_crm" },
+    { table: "act_crm_triggers", flag: "can_send_to_crm" }
+  ];
+}
+
+WITH all_checks AS (
+  ${audits.map(a => `
+  SELECT
+    '${a.table}' AS activation_table,
+    '${a.flag}' AS permission_needed,
+    COUNT(*) AS total_rows,
+    COUNT(DISTINCT t.user_key) AS users,
+    COUNTIF(NOT COALESCE(e.${a.flag}, FALSE)) AS rows_not_allowed
+  FROM ${ref(a.table)} AS t
+  LEFT JOIN ${ref("act_consent_eligible_users")} AS e USING (user_key)`).join("\n  UNION ALL")}
+
+  UNION ALL
+  SELECT
+    'act_audience_exports',
+    'can_send_to_ads / can_send_to_crm',
+    COUNT(*),
+    COUNT(DISTINCT t.user_key),
+    COUNTIF(NOT COALESCE(IF(t.destination = 'crm', e.can_send_to_crm, e.can_send_to_ads), FALSE))
+  FROM ${ref("act_audience_exports")} AS t
+  LEFT JOIN ${ref("act_consent_eligible_users")} AS e USING (user_key)
+)
+
+SELECT
+  *,
+  rows_not_allowed = 0 AS is_ok,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_checks

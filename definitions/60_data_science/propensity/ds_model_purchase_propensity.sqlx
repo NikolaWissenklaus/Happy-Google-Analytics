@@ -1,0 +1,29 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_purchase_propensity",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML classifier: probability of purchase in the next 7 days. Trained on the weekly snapshots, the newest training snapshot is kept OUT (out of time holdout, used by ds_propensity_gains)",
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+-- weekly tag on purpose: training every day costs money and the model does not change that fast
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = '${cfg_ds.propensity.model_type}',
+  input_label_cols = ['will_purchase_7d'],
+  auto_class_weights = TRUE,
+  data_split_method = 'RANDOM',
+  data_split_eval_fraction = 0.2,
+  enable_global_explain = TRUE
+) AS
+SELECT
+  ${cfg_ds.features.model_columns.join(",\n  ")},
+  will_purchase_7d
+FROM ${ref("ds_feature_snapshots")}
+WHERE NOT is_current_snapshot
+  AND will_purchase_7d IS NOT NULL
+  AND snapshot_date < (SELECT MAX(snapshot_date) FROM ${ref("ds_feature_snapshots")} WHERE NOT is_current_snapshot)

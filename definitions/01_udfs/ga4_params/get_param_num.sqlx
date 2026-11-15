@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_param_num",
+  description: "FLOAT64 value of a GA4 param no matter how it was sent (value, price, shipping...)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- "value" can arrive as int (199), double (199.9) or string ("199.9") depending on
+-- who implemented the tag. "199,90" with comma becomes NULL, on purpose.
+CREATE OR REPLACE FUNCTION ${self()}(params ANY TYPE, param_key STRING) AS ((
+  SELECT COALESCE(
+    p.value.double_value,
+    p.value.float_value,
+    CAST(p.value.int_value AS FLOAT64),
+    SAFE_CAST(p.value.string_value AS FLOAT64)
+  )
+  FROM UNNEST(params) AS p
+  WHERE p.key = param_key
+  LIMIT 1
+))
+OPTIONS (description = "FLOAT64 value of a GA4 param, whatever type it was sent with")

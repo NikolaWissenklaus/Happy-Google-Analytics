@@ -1,0 +1,20 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_deletion_log",
+  description: "Audit log of the LGPD deletions: which table, how many rows, for which requests and when. Proof for the DPO / ANPD that the deletion happened",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["monitoring", "lgpd", "daily", "bootstrap"]
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  run_id STRING OPTIONS (description = "One id per execution of priv_dsr_deletion"),
+  target_table STRING OPTIONS (description = "dataset.table cleaned"),
+  rows_deleted INT64 OPTIONS (description = "Rows deleted in this table in this run"),
+  request_ids ARRAY<STRING> OPTIONS (description = "Requests processed in this run"),
+  deleted_at TIMESTAMP OPTIONS (description = "When")
+)
+OPTIONS (description = "LGPD deletion audit log")

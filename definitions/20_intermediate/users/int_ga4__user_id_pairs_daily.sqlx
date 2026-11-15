@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__user_id_pairs_daily",
+  description: "Device (user_pseudo_id) x user_id pairs seen per day. Small table that feeds the identity stitching without scanning all events every day",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["user_pseudo_id", "user_id"],
+    labels: { layer: "intermediate", domain: "identity" }
+  },
+  tags: ["ga4", "intermediate", "daily", "identity"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+SELECT
+  event_date,
+  user_pseudo_id,
+  user_id,
+  MIN(event_ts) AS first_seen_ts,
+  MAX(event_ts) AS last_seen_ts,
+  COUNT(*) AS events,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")}
+WHERE event_date >= run_from
+  AND user_id IS NOT NULL
+  AND user_pseudo_id IS NOT NULL
+  ${helpers.noiseFilter()}
+GROUP BY 1, 2, 3
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_heuristic_scores",
+  description: "Purchase propensity and churn risk WITHOUT machine learning: every user of today gets the historical rate of 'users like him' (same profile of cart / checkout / recency / customer history) in the past snapshots, with bayesian smoothing. Explainable, cheap, always on, and surprisingly hard to beat",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "scores" }
+  },
+  tags: ["data_science", "scores", "daily"],
+  columns: {
+    purchase_propensity: "P(purchase in the next 7 days) of the profile, smoothed: (buyers + 20 * global rate) / (users + 20)",
+    churn_risk: "Customers only: P(no session in the next 30 days) of the profile",
+    propensity_profile: "Profile key used (readable, so marketing can understand where the number comes from)"
+  }
+}
+
+WITH
+profiled AS (
+  SELECT
+    *,
+    CONCAT(
+      'checkout:', IF(checkout_sessions_30d > 0, 'yes', 'no'),
+      '|cart7d:', IF(cart_sessions_7d > 0, 'yes', 'no'),
+      '|recency:', CASE WHEN days_since_last_session <= 1 THEN '0-1' WHEN days_since_last_session <= 7 THEN '2-7' WHEN days_since_last_session <= 30 THEN '8-30' ELSE '31+' END,
+      '|orders:', CASE WHEN purchases_before = 0 THEN '0' WHEN purchases_before = 1 THEN '1' ELSE '2+' END,
+      '|engaged30d:', CASE WHEN engaged_sessions_30d = 0 THEN '0' WHEN engaged_sessions_30d <= 2 THEN '1-2' ELSE '3+' END
+    ) AS propensity_profile,
+    CONCAT(
+      'recency:', CASE WHEN days_since_last_session <= 7 THEN '0-7' WHEN days_since_last_session <= 30 THEN '8-30' WHEN days_since_last_session <= 60 THEN '31-60' ELSE '61+' END,
+      '|orders:', CASE WHEN purchases_before = 1 THEN '1' WHEN purchases_before <= 3 THEN '2-3' ELSE '4+' END,
+      '|active30d:', CASE WHEN active_days_30d = 0 THEN '0' WHEN active_days_30d <= 2 THEN '1-2' ELSE '3+' END
+    ) AS churn_profile
+  FROM ${ref("ds_feature_snapshots")}
+),
+
+global_rates AS (
+  SELECT
+    AVG(will_purchase_7d) AS global_purchase_rate,
+    AVG(churned_30d) AS global_churn_rate
+  FROM profiled
+  WHERE NOT is_current_snapshot
+),
+
+purchase_lookup AS (
+  SELECT
+    propensity_profile,
+    COUNT(*) AS users,
+    SUM(will_purchase_7d) AS buyers
+  FROM profiled
+  WHERE NOT is_current_snapshot
+  GROUP BY 1
+),
+
+churn_lookup AS (
+  SELECT
+    churn_profile,
+    COUNT(churned_30d) AS customers,
+    SUM(churned_30d) AS churned
+  FROM profiled
+  WHERE NOT is_current_snapshot AND churned_30d IS NOT NULL
+  GROUP BY 1
+)
+
+SELECT
+  c.user_key,
+  c.propensity_profile,
+  SAFE_DIVIDE(COALESCE(p.buyers, 0) + 20 * g.global_purchase_rate, COALESCE(p.users, 0) + 20) AS purchase_propensity,
+  IF(c.is_customer, c.churn_profile, NULL) AS churn_profile,
+  IF(c.is_customer, SAFE_DIVIDE(COALESCE(ch.churned, 0) + 20 * g.global_churn_rate, COALESCE(ch.customers, 0) + 20), NULL) AS churn_risk,
+  COALESCE(p.users, 0) AS profile_history_users,
+  'heuristic_lookup' AS score_method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM profiled AS c
+CROSS JOIN global_rates AS g
+LEFT JOIN purchase_lookup AS p USING (propensity_profile)
+LEFT JOIN churn_lookup AS ch USING (churn_profile)
+WHERE c.is_current_snapshot

@@ -1,0 +1,18 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "normalize_source",
+  description: "Canonical source name: l.facebook.com / m.facebook.com / fb -> facebook, google.com.br -> google... (cfg_channels.js)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- generated from includes/cfg_channels.js (source_aliases). edit there, not here.
+CREATE OR REPLACE FUNCTION ${self()}(source STRING) RETURNS STRING AS ((
+  SELECT ${channels.normalizeSource("s")}
+  FROM (SELECT LOWER(TRIM(source)) AS s)
+))
+OPTIONS (description = "Source normalization")

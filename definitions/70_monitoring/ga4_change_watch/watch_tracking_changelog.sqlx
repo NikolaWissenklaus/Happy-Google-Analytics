@@ -1,0 +1,139 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_tracking_changelog",
+  description: "One feed with everything that changed in the GA4 data (last 90 days): export schema, events, params, user properties, item params, new hostnames / streams / app versions / currencies, streams that stopped and channel rules drift. Read it every monday, or send the critical ones to Slack with tools/alerts",
+  bigquery: {
+    partitionBy: "change_date",
+    clusterBy: ["severity", "change_type"],
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    severity: "critical (key event gone, stream stopped, staging column removed) | warning | info",
+    source_table: "Where to look for the details"
+  }
+}
+
+WITH
+all_changes AS (
+  SELECT
+    change_date,
+    CONCAT('export_schema_', change_type) AS change_type,
+    field_path AS subject,
+    CONCAT(COALESCE(previous_data_type, '-'), ' -> ', COALESCE(data_type, '-')) AS details,
+    CASE
+      WHEN is_used_by_staging AND change_type IN ('removed', 'type_changed') THEN 'critical'
+      WHEN change_type = 'added' THEN 'info'
+      ELSE 'warning'
+    END AS severity,
+    'watch_export_schema_changes' AS source_table
+  FROM ${ref("watch_export_schema_changes")}
+
+  UNION ALL
+  SELECT
+    first_seen_date,
+    'event_new',
+    event_name,
+    CONCAT(CAST(events_last_7d AS STRING), ' events in 7 days', IF(in_tracking_plan, '', ', NOT in the tracking plan')),
+    IF(in_tracking_plan OR is_automatic, 'info', 'warning'),
+    'watch_event_registry'
+  FROM ${ref("watch_event_registry")}
+  WHERE status = 'new'
+
+  UNION ALL
+  SELECT
+    DATE_ADD(last_seen_date, INTERVAL 1 DAY),
+    'event_gone',
+    event_name,
+    CONCAT('was ', CAST(ROUND(avg_week_before) AS STRING), ' events / week'),
+    IF(is_key_event, 'critical', 'warning'),
+    'watch_event_registry'
+  FROM ${ref("watch_event_registry")}
+  WHERE status = 'gone'
+
+  UNION ALL
+  SELECT
+    ${helpers.today()},
+    CONCAT('event_', status),
+    event_name,
+    CONCAT(CAST(events_last_7d AS STRING), ' events in 7 days vs ', CAST(ROUND(avg_week_before) AS STRING), ' usual'),
+    IF(is_key_event AND status = 'dropping', 'critical', 'warning'),
+    'watch_event_registry'
+  FROM ${ref("watch_event_registry")}
+  WHERE status IN ('dropping', 'spiking')
+
+  UNION ALL
+  SELECT
+    IF(status = 'gone', DATE_ADD(last_seen_date, INTERVAL 1 DAY), IF(status = 'new', first_seen_date, ${helpers.today()})),
+    CONCAT('param_', status),
+    CONCAT(event_name, '.', param_key),
+    CONCAT('fill rate 7d: ', COALESCE(FORMAT('%.1f%%', 100 * fill_rate_7d), '-')),
+    IF(status = 'type_drift', 'warning', 'info'),
+    'watch_param_registry'
+  FROM ${ref("watch_param_registry")}
+  WHERE status != 'ok'
+
+  UNION ALL
+  SELECT
+    IF(status = 'gone', DATE_ADD(last_seen_date, INTERVAL 1 DAY), IF(status = 'new', first_seen_date, ${helpers.today()})),
+    CONCAT('user_property_', status),
+    property_key,
+    CONCAT(CAST(devices_last_7d AS STRING), ' devices in 7 days'),
+    IF(status = 'new', 'info', 'warning'),
+    'watch_user_property_registry'
+  FROM ${ref("watch_user_property_registry")}
+  WHERE status != 'ok'
+
+  UNION ALL
+  SELECT
+    IF(status = 'gone', DATE_ADD(last_seen_date, INTERVAL 1 DAY), IF(status = 'new', first_seen_date, ${helpers.today()})),
+    CONCAT('item_param_', status),
+    CONCAT(event_name, '.', param_key),
+    CONCAT(CAST(distinct_values AS STRING), ' distinct values'),
+    IF(status = 'new', 'info', 'warning'),
+    'watch_item_param_registry'
+  FROM ${ref("watch_item_param_registry")}
+  WHERE status != 'ok'
+
+  UNION ALL
+  SELECT
+    first_seen_date,
+    CONCAT('new_', dimension),
+    value,
+    CONCAT(CAST(recent_events AS STRING), ' events'),
+    severity,
+    'watch_new_values'
+  FROM ${ref("watch_new_values")}
+  WHERE dimension IN ('hostname', 'stream_id', 'app_version', 'currency', 'payment_type', 'shipping_tier', 'traffic_type')
+
+  UNION ALL
+  SELECT
+    IF(status = 'stopped', DATE_ADD(last_seen_date, INTERVAL 1 DAY), ${helpers.today()}),
+    CONCAT('stream_', status),
+    CONCAT(stream_id, ' (', COALESCE(platform, '?'), ')'),
+    CONCAT(CAST(events_last_7d AS STRING), ' events in 7 days vs ', CAST(events_previous_7d AS STRING), ' the week before'),
+    IF(status IN ('stopped', 'dropping'), 'critical', 'warning'),
+    'watch_export_streams'
+  FROM ${ref("watch_export_streams")}
+  WHERE status != 'ok'
+
+  UNION ALL
+  SELECT
+    session_date,
+    'channel_rules_drift',
+    'default channel group',
+    CONCAT('agreement with GA4: ', FORMAT('%.1f%%', 100 * agreement_rate), ' (28d before: ', FORMAT('%.1f%%', 100 * agreement_rate_28d_before), ')'),
+    'warning',
+    'watch_attribution_drift'
+  FROM ${ref("watch_attribution_drift")}
+  WHERE is_drift
+)
+
+SELECT
+  *,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_changes
+WHERE change_date >= ${helpers.daysAgo(90)}

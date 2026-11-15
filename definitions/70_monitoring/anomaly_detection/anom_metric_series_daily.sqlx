@@ -1,0 +1,100 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_metric_series_daily",
+  description: "Daily time series monitored by the anomaly detection (cfg_anomaly.js): metric x breakdown (all, device, channel, platform), long format. Bots are NOT removed here on purpose: a bot attack must show up as an anomaly",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"],
+  columns: {
+    breakdown: "all | device_category | session_default_channel_group | platform",
+    breakdown_value: "Value of the breakdown ('all' for the property total)"
+  }
+}
+
+js {
+  const metrics = cfg_anomaly.metrics;
+  const breakdowns = cfg_anomaly.breakdowns.filter(b => b !== "all");
+}
+
+WITH
+base AS (
+  SELECT
+    session_date, device_category, session_default_channel_group, platform, user_pseudo_id,
+    is_new_user, is_engaged, page_views, screen_views, event_count, key_events, transactions, revenue,
+    has_add_to_cart, has_begin_checkout, consent_ads_storage, is_bot_suspect
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL ${cfg_anomaly.history_days} DAY)
+    AND session_date < CURRENT_DATE('${constants.TIMEZONE}')
+),
+
+with_breakdowns AS (
+  SELECT 'all' AS breakdown, 'all' AS breakdown_value, b.* FROM base AS b
+  ${breakdowns.map(d => `UNION ALL
+  SELECT '${d}', COALESCE(CAST(b.${d} AS STRING), '(not set)'), b.* FROM base AS b`).join("\n  ")}
+),
+
+aggregated AS (
+  SELECT
+    session_date AS metric_date,
+    breakdown,
+    breakdown_value,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT user_pseudo_id) AS users,
+    COUNTIF(is_new_user) AS new_users,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(page_views + screen_views) AS page_views,
+    SUM(event_count) AS events,
+    SUM(key_events) AS key_events,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    COUNTIF(has_add_to_cart) AS cart_sessions,
+    COUNTIF(has_begin_checkout) AS checkout_sessions,
+    COUNTIF(consent_ads_storage = 'denied') AS ads_denied_sessions,
+    COUNTIF(session_default_channel_group = 'Unassigned') AS unassigned_sessions,
+    COUNTIF(is_bot_suspect) AS bot_sessions
+  FROM with_breakdowns
+  GROUP BY 1, 2, 3
+),
+
+-- tiny segments are pure noise, keep only breakdown values with 50+ sessions/day on average
+big_enough AS (
+  SELECT *
+  FROM aggregated
+  QUALIFY breakdown = 'all' OR AVG(sessions) OVER (PARTITION BY breakdown, breakdown_value) >= 50
+)
+
+SELECT
+  metric_date,
+  breakdown,
+  breakdown_value,
+  m.metric,
+  m.value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM big_enough,
+  UNNEST([
+    STRUCT('sessions' AS metric, CAST(sessions AS FLOAT64) AS value),
+    STRUCT('users', CAST(users AS FLOAT64)),
+    STRUCT('new_users', CAST(new_users AS FLOAT64)),
+    STRUCT('engaged_sessions', CAST(engaged_sessions AS FLOAT64)),
+    STRUCT('engagement_rate', SAFE_DIVIDE(engaged_sessions, sessions)),
+    STRUCT('page_views', CAST(page_views AS FLOAT64)),
+    STRUCT('events', CAST(events AS FLOAT64)),
+    STRUCT('key_events', CAST(key_events AS FLOAT64)),
+    STRUCT('transactions', CAST(transactions AS FLOAT64)),
+    STRUCT('revenue', CAST(revenue AS FLOAT64)),
+    STRUCT('conversion_rate', SAFE_DIVIDE(transactions, sessions)),
+    STRUCT('average_order_value', SAFE_DIVIDE(revenue, transactions)),
+    STRUCT('add_to_cart_rate', SAFE_DIVIDE(cart_sessions, sessions)),
+    STRUCT('checkout_rate', SAFE_DIVIDE(checkout_sessions, cart_sessions)),
+    STRUCT('consent_denied_rate', SAFE_DIVIDE(ads_denied_sessions, sessions)),
+    STRUCT('unassigned_share', SAFE_DIVIDE(unassigned_sessions, sessions)),
+    STRUCT('bot_share', SAFE_DIVIDE(bot_sessions, sessions))
+  ]) AS m
+WHERE m.metric IN (${helpers.sqlList(metrics)})
+  AND m.value IS NOT NULL

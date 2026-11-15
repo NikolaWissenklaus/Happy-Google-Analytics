@@ -1,0 +1,39 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_kpi_forecast",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML ARIMA_PLUS, one series per KPI (sessions, orders, revenue), with brazilian holidays (holiday_region = BR) and automatic seasonality. Used for the forecast, the pacing and as the 9th vote of the anomaly ensemble",
+  tags: ["data_science", "bqml", "weekly", "optional", "forecast"]
+}
+
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = 'ARIMA_PLUS',
+  time_series_timestamp_col = 'metric_ts',
+  time_series_data_col = 'value',
+  time_series_id_col = 'metric',
+  horizon = ${cfg_ds.forecast.horizon_days},
+  auto_arima = TRUE,
+  data_frequency = 'DAILY',
+  holiday_region = '${cfg_ds.forecast.holiday_region}',
+  decompose_time_series = TRUE,
+  clean_spikes_and_dips = TRUE
+) AS
+SELECT
+  TIMESTAMP(kpi_date) AS metric_ts,
+  m.metric,
+  m.value
+FROM ${ref("ecom_daily_kpis")},
+  UNNEST([
+    STRUCT('sessions' AS metric, CAST(sessions AS FLOAT64) AS value),
+    STRUCT('transactions', CAST(orders AS FLOAT64)),
+    STRUCT('revenue', valid_revenue)
+  ]) AS m
+WHERE kpi_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 730 DAY)
+  AND kpi_date < CURRENT_DATE('${constants.TIMEZONE}')
+  AND m.metric IN (${helpers.sqlList(cfg_ds.forecast.metrics)})
+  AND m.value IS NOT NULL

@@ -1,0 +1,24 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.core,
+  name: "fct_events",
+  description: "Every event (cleaned, from staging) + the session traffic + user_key. The 'I want everything' table for ad hoc analysis. ALWAYS filter event_date, it is a view over a big partitioned table",
+  tags: ["ga4", "core", "daily", "events"]
+}
+
+-- view on purpose: no extra storage and always in sync with staging.
+-- pruning works on event_date (stg partition), so: WHERE event_date BETWEEN ... (please)
+SELECT
+  e.*,
+  COALESCE(id.user_key, CONCAT('dev:', e.user_pseudo_id)) AS user_key,
+  t.session_source,
+  t.session_medium,
+  t.session_campaign,
+  t.session_source_medium,
+  t.session_default_channel_group,
+  t.session_custom_channel_group
+FROM ${ref("stg_ga4__events")} AS e
+LEFT JOIN ${ref("int_ga4__session_traffic")} AS t ON t.session_key = e.session_key
+LEFT JOIN ${ref("int_ga4__user_stitching")} AS id ON id.user_pseudo_id = e.user_pseudo_id

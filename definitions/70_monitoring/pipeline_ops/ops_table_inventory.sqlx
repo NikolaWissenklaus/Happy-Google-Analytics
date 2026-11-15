@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ops,
+  name: "ops_table_inventory",
+  description: "Every table and view the project created, with rows, logical / physical size, time travel bytes, partitions, last change and hours since it. The 'what is eating our storage' table",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ops" }
+  },
+  tags: ["ops", "daily"],
+  columns: {
+    hours_since_change: "Hours since the last write. A daily table above ~30 here did not run",
+    time_travel_gb: "Physical bytes kept by time travel. Big here = lots of DELETE / MERGE, see max_time_travel_hours"
+  }
+}
+
+WITH
+objects AS (
+  SELECT table_schema, table_name, table_type, creation_time
+  FROM ${constants.regionTable("TABLES")}
+  WHERE STARTS_WITH(table_schema, '${constants.SCHEMA_PREFIX}_')
+),
+
+storage AS (
+  SELECT
+    table_schema,
+    table_name,
+    total_rows,
+    total_partitions,
+    total_logical_bytes,
+    total_physical_bytes,
+    time_travel_physical_bytes,
+    storage_last_modified_time
+  FROM ${constants.regionTable("TABLE_STORAGE")}
+  WHERE STARTS_WITH(table_schema, '${constants.SCHEMA_PREFIX}_')
+    AND NOT deleted
+)
+
+SELECT
+  o.table_schema AS dataset,
+  o.table_name,
+  o.table_type,
+  REGEXP_EXTRACT(o.table_name, r'^([a-z0-9]+)_') AS name_prefix,
+  o.creation_time,
+  s.total_rows,
+  s.total_partitions,
+  ROUND(s.total_logical_bytes / POW(1024, 3), 3) AS logical_gb,
+  ROUND(s.total_physical_bytes / POW(1024, 3), 3) AS physical_gb,
+  ROUND(s.time_travel_physical_bytes / POW(1024, 3), 3) AS time_travel_gb,
+  s.storage_last_modified_time AS last_modified_at,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), s.storage_last_modified_time, HOUR) AS hours_since_change,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM objects AS o
+LEFT JOIN storage AS s USING (table_schema, table_name)

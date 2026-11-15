@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_level_shift",
+  description: "Method 8 - level shift / change point: Welch t statistic between the last 7 days (ending on the day) and the 28 days before them. When the series moved to a new level (new campaign, broken tag, price change) this one stays on until the new level becomes the normal",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"]
+}
+
+WITH windows AS (
+  SELECT
+    *,
+    AVG(value) OVER recent AS recent_mean,
+    VARIANCE(value) OVER recent AS recent_var,
+    COUNT(value) OVER recent AS recent_n,
+    AVG(value) OVER before AS before_mean,
+    VARIANCE(value) OVER before AS before_var,
+    COUNT(value) OVER before AS before_n
+  FROM ${ref("anom_metric_series_daily")}
+  WINDOW
+    recent AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date) RANGE BETWEEN 6 PRECEDING AND CURRENT ROW),
+    before AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date) RANGE BETWEEN 34 PRECEDING AND 7 PRECEDING)
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  before_mean AS expected,
+  CAST(NULL AS FLOAT64) AS lower_bound,
+  CAST(NULL AS FLOAT64) AS upper_bound,
+  SAFE_DIVIDE(recent_mean - before_mean, SQRT(SAFE_DIVIDE(recent_var, recent_n) + SAFE_DIVIDE(before_var, before_n))) AS score,
+  recent_n >= 5 AND before_n >= 20
+    AND ABS(SAFE_DIVIDE(recent_mean - before_mean, SQRT(SAFE_DIVIDE(recent_var, recent_n) + SAFE_DIVIDE(before_var, before_n)))) > ${cfg_anomaly.change_point.t_threshold} AS is_anomaly,
+  'level_shift' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM windows
+WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)

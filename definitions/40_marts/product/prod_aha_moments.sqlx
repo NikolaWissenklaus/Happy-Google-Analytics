@@ -1,0 +1,81 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_aha_moments",
+  description: "Aha moment finder: which actions in the FIRST 7 DAYS of a user are most associated with coming back in the following 30 days (and with buying). Ranks every event name by retention lift, coverage and phi correlation",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "data_science"],
+  columns: {
+    retention_lift: "retention of users that did the action / retention of users that did not",
+    phi: "correlation between 'did the action' and 'retained' (-1..1). Combines lift and coverage",
+    coverage: "share of new users that did the action in the first week"
+  }
+}
+
+WITH
+new_users AS (
+  SELECT user_key, first_seen_date
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 120 DAY)
+                            AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 38 DAY)
+),
+
+retention AS (
+  SELECT
+    n.user_key,
+    LOGICAL_OR(d.days_since_first_seen BETWEEN 8 AND 37) AS retained,
+    LOGICAL_OR(d.days_since_first_seen BETWEEN 8 AND 37 AND d.transactions > 0) AS bought_later
+  FROM new_users AS n
+  LEFT JOIN ${ref("fct_user_daily")} AS d USING (user_key)
+  GROUP BY n.user_key
+),
+
+first_week_actions AS (
+  SELECT DISTINCT id.user_key, e.event_name
+  FROM ${ref("stg_ga4__events")} AS e
+  JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  JOIN new_users AS n ON n.user_key = id.user_key
+  WHERE e.event_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 120 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY)
+    AND e.event_date BETWEEN n.first_seen_date AND DATE_ADD(n.first_seen_date, INTERVAL 6 DAY)
+    AND e.event_name NOT IN ('session_start', 'first_visit', 'first_open', 'user_engagement', 'page_view', 'screen_view')
+    ${helpers.noiseFilter("e")}
+),
+
+totals AS (
+  SELECT COUNT(*) AS n, COUNTIF(retained) AS retained FROM retention
+),
+
+per_action AS (
+  SELECT
+    a.event_name,
+    COUNT(*) AS users_did,
+    COUNTIF(r.retained) AS did_and_retained,
+    COUNTIF(r.bought_later) AS did_and_bought
+  FROM first_week_actions AS a
+  JOIN retention AS r USING (user_key)
+  GROUP BY a.event_name
+)
+
+SELECT
+  p.event_name,
+  p.users_did,
+  SAFE_DIVIDE(p.users_did, t.n) AS coverage,
+  SAFE_DIVIDE(p.did_and_retained, p.users_did) AS retention_if_did,
+  SAFE_DIVIDE(t.retained - p.did_and_retained, t.n - p.users_did) AS retention_if_not,
+  SAFE_DIVIDE(SAFE_DIVIDE(p.did_and_retained, p.users_did), SAFE_DIVIDE(t.retained - p.did_and_retained, t.n - p.users_did)) AS retention_lift,
+  SAFE_DIVIDE(p.did_and_bought, p.users_did) AS later_purchase_rate_if_did,
+  -- phi coefficient of the 2x2 table did/didnt x retained/not
+  -- FLOAT64 on purpose: the product of 4 counts overflows INT64 in big sites
+  SAFE_DIVIDE(
+    CAST(p.did_and_retained AS FLOAT64) * ((t.n - p.users_did) - (t.retained - p.did_and_retained))
+      - CAST(p.users_did - p.did_and_retained AS FLOAT64) * (t.retained - p.did_and_retained),
+    SQRT(CAST(p.users_did AS FLOAT64) * (t.n - p.users_did) * t.retained * (t.n - t.retained))
+  ) AS phi,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_action AS p
+CROSS JOIN totals AS t
+WHERE p.users_did >= 30

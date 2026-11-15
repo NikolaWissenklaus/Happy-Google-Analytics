@@ -1,0 +1,76 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_audience_exports",
+  description: "Audience lists ready per destination (only the destinations allowed in cfg_audiences): google_ads (Customer Match, hashed e-mail / phone, needs enable_crm), meta (Custom Audiences: external_id + hashed e-mail / phone), ga4 (user_id / client_id for the GA4 audience import) and crm (user_id). Only users that can_send_to_ads (crm: can_send_to_crm). With cfg_lifts.holdout on, the holdout part of each audience is left out (measured in lift_activation_holdouts). One row per destination x audience x user",
+  bigquery: {
+    clusterBy: ["destination", "audience_name"],
+    labels: { layer: "activation", domain: "audiences" }
+  },
+  tags: ["activation", "daily", "audiences"],
+  columns: {
+    destination: "google_ads | meta | ga4 | crm",
+    has_match_key: "The row has at least one identifier the destination can use. Rows without it are kept so the match rate can be measured"
+  }
+}
+
+WITH
+members AS (
+  SELECT m.audience_name, m.user_key, m.user_id, m.user_pseudo_id, d AS destination
+  FROM ${ref("aud_memberships_today")} AS m,
+    UNNEST(m.destinations) AS d
+),
+
+${constants.ENABLE.crm ? `
+crm_contacts AS (
+  SELECT
+    CONCAT('uid:', user_id) AS user_key,
+    ANY_VALUE(email_sha256_google) AS email_sha256_google,
+    ANY_VALUE(phone_sha256_google) AS phone_sha256_google,
+    ANY_VALUE(email_sha256_meta) AS email_sha256_meta,
+    ANY_VALUE(phone_sha256_meta) AS phone_sha256_meta
+  FROM ${ref("stg_crm__customers")}
+  WHERE user_id IS NOT NULL
+  GROUP BY 1
+),` : ``}
+
+with_ids AS (
+  SELECT
+    m.destination,
+    m.audience_name,
+    m.user_key,
+    m.user_id,
+    m.user_pseudo_id,
+    IF(m.user_id IS NULL, NULL, TO_HEX(SHA256(m.user_id))) AS external_id_sha256,
+    ${constants.ENABLE.crm
+      ? `c.email_sha256_google, c.phone_sha256_google, c.email_sha256_meta, c.phone_sha256_meta`
+      : `CAST(NULL AS STRING) AS email_sha256_google, CAST(NULL AS STRING) AS phone_sha256_google, CAST(NULL AS STRING) AS email_sha256_meta, CAST(NULL AS STRING) AS phone_sha256_meta`}
+  FROM members AS m
+  JOIN ${ref("act_consent_eligible_users")} AS e
+    ON e.user_key = m.user_key
+    AND IF(m.destination = 'crm', e.can_send_to_crm, e.can_send_to_ads)
+  ${constants.ENABLE.crm ? `LEFT JOIN crm_contacts AS c ON c.user_key = m.user_key` : ``}
+  -- the holdout of the audience is never sent (cfg_lifts.holdout), lift_activation_holdouts compares
+  WHERE NOT ${lifts.audienceHoldout("m.audience_name", "m.user_key")}
+)
+
+SELECT
+  destination,
+  audience_name,
+  user_key,
+  CASE destination WHEN 'ga4' THEN user_id WHEN 'crm' THEN user_id END AS user_id,
+  IF(destination = 'ga4', user_pseudo_id, NULL) AS client_id,
+  IF(destination = 'meta', external_id_sha256, NULL) AS external_id_sha256,
+  CASE destination WHEN 'google_ads' THEN email_sha256_google WHEN 'meta' THEN email_sha256_meta END AS email_sha256,
+  CASE destination WHEN 'google_ads' THEN phone_sha256_google WHEN 'meta' THEN phone_sha256_meta END AS phone_sha256,
+  CASE destination
+    WHEN 'google_ads' THEN COALESCE(email_sha256_google, phone_sha256_google) IS NOT NULL
+    WHEN 'meta' THEN COALESCE(external_id_sha256, email_sha256_meta, phone_sha256_meta) IS NOT NULL
+    WHEN 'ga4' THEN COALESCE(user_id, user_pseudo_id) IS NOT NULL
+    WHEN 'crm' THEN user_id IS NOT NULL
+    ELSE FALSE
+  END AS has_match_key,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_ids

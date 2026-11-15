@@ -1,0 +1,47 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_kpi_forecast",
+  disabled: !constants.ENABLE.bqml,
+  description: "Forecast of the next 90 days for sessions, orders and revenue (ARIMA_PLUS) with prediction intervals, plus the actuals of the last 90 days in the same shape (row_type actual / forecast) so the chart is one query",
+  bigquery: {
+    labels: { layer: "data_science", domain: "forecast" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional", "forecast"]
+}
+
+SELECT
+  'forecast' AS row_type,
+  metric,
+  DATE(forecast_timestamp) AS metric_date,
+  forecast_value AS value,
+  prediction_interval_lower_bound AS lower_bound,
+  prediction_interval_upper_bound AS upper_bound,
+  confidence_level,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ML.FORECAST(
+  MODEL ${ref("ds_model_kpi_forecast")},
+  STRUCT(${cfg_ds.forecast.horizon_days} AS horizon, ${cfg_ds.forecast.confidence_level} AS confidence_level)
+)
+
+UNION ALL
+
+SELECT
+  'actual',
+  m.metric,
+  kpi_date,
+  m.value,
+  CAST(NULL AS FLOAT64),
+  CAST(NULL AS FLOAT64),
+  CAST(NULL AS FLOAT64),
+  CURRENT_TIMESTAMP()
+FROM ${ref("ecom_daily_kpis")},
+  UNNEST([
+    STRUCT('sessions' AS metric, CAST(sessions AS FLOAT64) AS value),
+    STRUCT('transactions', CAST(orders AS FLOAT64)),
+    STRUCT('revenue', valid_revenue)
+  ]) AS m
+WHERE kpi_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  AND m.metric IN (${helpers.sqlList(cfg_ds.forecast.metrics)})

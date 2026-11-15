@@ -1,0 +1,67 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_content_engagement",
+  description: "Content performance per page (last 90 days): views, engagement time per view, 90% scroll rate, interactions and the conversion of the sessions that saw the page (plus 7 day assisted purchases for blog / content pages). Good content is not the one with more views",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "content"],
+  columns: {
+    assisted_purchase_rate_7d: "Users that saw the page and bought in the next 7 days (any channel)"
+  }
+}
+
+WITH
+views AS (
+  SELECT *
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+),
+
+purchases AS (
+  SELECT user_key, transaction_ts
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+),
+
+user_page_first_view AS (
+  SELECT page_path, user_key, MIN(event_ts) AS first_view_ts
+  FROM views
+  GROUP BY 1, 2
+),
+
+assisted AS (
+  SELECT
+    v.page_path,
+    COUNT(DISTINCT v.user_key) AS users,
+    COUNT(DISTINCT IF(p.transaction_ts IS NOT NULL, v.user_key, NULL)) AS users_bought_7d
+  FROM user_page_first_view AS v
+  LEFT JOIN purchases AS p
+    ON p.user_key = v.user_key
+    AND p.transaction_ts BETWEEN v.first_view_ts AND TIMESTAMP_ADD(v.first_view_ts, INTERVAL 7 DAY)
+  GROUP BY v.page_path
+)
+
+SELECT
+  v.page_path,
+  ANY_VALUE(v.page_title) AS page_title,
+  ANY_VALUE(v.page_type) AS page_type,
+  ANY_VALUE(v.content_group) AS content_group,
+  COUNT(*) AS views,
+  COUNT(DISTINCT v.user_key) AS users,
+  SAFE_DIVIDE(SUM(v.page_engagement_msec) / 1000, COUNT(*)) AS engagement_sec_per_view,
+  SAFE_DIVIDE(COUNTIF(v.reached_90_percent), COUNT(*)) AS scroll_90_rate,
+  SAFE_DIVIDE(SUM(v.interactions_on_page), COUNT(*)) AS interactions_per_view,
+  SAFE_DIVIDE(COUNTIF(v.is_exit), COUNT(*)) AS exit_rate,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(v.session_has_purchase, v.session_key, NULL)), COUNT(DISTINCT v.session_key)) AS session_conversion_rate,
+  ANY_VALUE(SAFE_DIVIDE(a.users_bought_7d, a.users)) AS assisted_purchase_rate_7d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM views AS v
+LEFT JOIN assisted AS a USING (page_path)
+GROUP BY v.page_path
+HAVING COUNT(*) >= 50

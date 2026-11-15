@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_top_movers_weekly",
+  description: "Automatic 'what changed this week': last complete week vs the previous one, for every value of channel, campaign, device, UF, landing page type and browser. Revenue delta and its contribution to the total delta, top 5 up and down per dimension. Answers the monday question before somebody asks",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    contribution_to_total_change: "revenue delta of the value / total revenue delta of the property. Can be > 1 or negative (that is the point)"
+  }
+}
+
+WITH
+weeks AS (
+  SELECT
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), WEEK(MONDAY)), INTERVAL 7 DAY) AS this_week,
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), WEEK(MONDAY)), INTERVAL 14 DAY) AS previous_week
+),
+
+sessions AS (
+  SELECT s.*, IF(s.session_week = w.this_week, 'this', 'previous') AS period
+  FROM ${ref("fct_sessions")} AS s
+  CROSS JOIN weeks AS w
+  WHERE s.session_date >= w.previous_week
+    AND s.session_date < DATE_ADD(w.this_week, INTERVAL 7 DAY)
+    ${helpers.martSessionFilter("s")}
+),
+
+long_format AS (
+  SELECT period, d.dimension, d.value, revenue, transactions
+  FROM sessions,
+    UNNEST([
+      STRUCT('channel' AS dimension, session_default_channel_group AS value),
+      STRUCT('custom_channel', session_custom_channel_group),
+      STRUCT('campaign', COALESCE(LOWER(session_campaign), '(not set)')),
+      STRUCT('device', device_category),
+      STRUCT('uf', COALESCE(geo_uf, '(n/a)')),
+      STRUCT('landing_page_type', landing_page_type),
+      STRUCT('browser', device_browser)
+    ]) AS d
+),
+
+per_value AS (
+  SELECT
+    dimension,
+    value,
+    SUM(IF(period = 'this', revenue, 0)) AS revenue_this_week,
+    SUM(IF(period = 'previous', revenue, 0)) AS revenue_previous_week,
+    SUM(IF(period = 'this', transactions, 0)) AS orders_this_week,
+    SUM(IF(period = 'previous', transactions, 0)) AS orders_previous_week
+  FROM long_format
+  GROUP BY 1, 2
+),
+
+total_change AS (
+  SELECT SUM(IF(period = 'this', revenue, -revenue)) AS total_delta FROM sessions
+)
+
+SELECT
+  p.*,
+  p.revenue_this_week - p.revenue_previous_week AS revenue_delta,
+  ${helpers.pctChange("p.revenue_this_week", "p.revenue_previous_week")} AS revenue_change_pct,
+  SAFE_DIVIDE(p.revenue_this_week - p.revenue_previous_week, NULLIF(t.total_delta, 0)) AS contribution_to_total_change,
+  t.total_delta AS property_revenue_delta,
+  IF(p.revenue_this_week >= p.revenue_previous_week, 'up', 'down') AS direction,
+  ROW_NUMBER() OVER (PARTITION BY p.dimension, p.revenue_this_week >= p.revenue_previous_week ORDER BY ABS(p.revenue_this_week - p.revenue_previous_week) DESC) AS rank_in_direction,
+  (SELECT this_week FROM weeks) AS week_start,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_value AS p
+CROSS JOIN total_change AS t
+QUALIFY rank_in_direction <= 5

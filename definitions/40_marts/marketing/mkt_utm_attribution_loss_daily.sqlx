@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_utm_attribution_loss_daily",
+  description: "How much of the tagged traffic GA4 did not attribute, per day and utm source / medium / campaign (last 90 days): tagged sessions, sessions where no event got the source / medium params, sessions GA4 called (direct) / (not set), with the revenue of those sessions. A campaign losing 30% here is reporting 30% less than it delivers",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["utm_medium", "utm_source"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "media_quality"],
+  columns: {
+    loss_share: "lost sessions / tagged sessions",
+    revenue_lost: "Revenue of the lost sessions: GA4 gave it to another channel or to (direct)"
+  }
+}
+
+SELECT
+  c.session_date,
+  COALESCE(c.utm_source, '(none)') AS utm_source,
+  COALESCE(c.utm_medium, '(none)') AS utm_medium,
+  COALESCE(c.utm_campaign, '(none)') AS utm_campaign,
+  COUNT(*) AS tagged_sessions,
+  COUNTIF(c.is_utm_without_source_medium_param) AS sessions_without_source_medium_param,
+  COUNTIF(c.is_utm_ignored_by_ga4) AS sessions_ignored_by_ga4,
+  COUNTIF(c.is_attribution_lost) AS lost_sessions,
+  COUNTIF(ARRAY_LENGTH(c.url_issues) > 0) AS sessions_with_url_issues,
+  SAFE_DIVIDE(COUNTIF(c.is_attribution_lost), COUNT(*)) AS loss_share,
+  SUM(s.revenue) AS revenue,
+  SUM(IF(c.is_attribution_lost, s.revenue, 0)) AS revenue_lost,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("int_ga4__session_tagging_checks")} AS c
+JOIN ${ref("fct_sessions")} AS s USING (session_key)
+WHERE c.session_date >= ${helpers.daysAgo(90)}
+  AND c.is_tagged
+GROUP BY 1, 2, 3, 4

@@ -1,0 +1,32 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_user_lifetime",
+  description: "GA4 Explorations > User lifetime: users grouped by first user source / medium / campaign (stitched users) with average lifetime revenue, sessions, engaged sessions, engagement time, transactions and recency. Which acquisition sources bring users that last",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "ltv"]
+}
+
+SELECT
+  COALESCE(first_channel, '(not set)') AS first_user_default_channel_group,
+  COALESCE(ga4_first_user_source, first_source, '(not set)') AS first_user_source,
+  COALESCE(ga4_first_user_medium, first_medium, '(not set)') AS first_user_medium,
+  COALESCE(ga4_first_user_campaign, first_campaign, '(not set)') AS first_user_campaign,
+  COUNT(*) AS users,
+  COUNTIF(is_customer) AS customers,
+  AVG(lifetime_revenue) AS lifetime_value_revenue_avg,
+  AVG(sessions) AS lifetime_sessions_avg,
+  AVG(engaged_sessions) AS lifetime_engaged_sessions_avg,
+  AVG(engagement_time_sec) AS lifetime_engagement_sec_avg,
+  AVG(transactions) AS lifetime_transactions_avg,
+  AVG(days_since_last_seen) AS days_since_last_seen_avg,
+  MIN(first_seen_date) AS first_activity,
+  MAX(last_seen_date) AS last_activity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dim_users")}
+GROUP BY 1, 2, 3, 4
+HAVING COUNT(*) >= 10

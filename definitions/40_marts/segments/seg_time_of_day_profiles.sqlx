@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_time_of_day_profiles",
+  description: "When each user is usually online (last 90 days, 2+ sessions): madrugada / manha / tarde / noite and weekday x weekend. CRM sends the email at the hour the person actually opens the site, not at 9am for everybody",
+  bigquery: {
+    clusterBy: ["preferred_daypart"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"],
+  columns: {
+    preferred_daypart: "madrugada (0-5h) | manha (6-11h) | tarde (12-17h) | noite (18-23h)",
+    preferred_hour: "Most frequent session start hour (local time)"
+  }
+}
+
+WITH sessions AS (
+  SELECT
+    user_key,
+    session_hour,
+    session_iso_weekday,
+    CASE
+      WHEN session_hour < 6 THEN 'madrugada'
+      WHEN session_hour < 12 THEN 'manha'
+      WHEN session_hour < 18 THEN 'tarde'
+      ELSE 'noite'
+    END AS daypart
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    ${helpers.martSessionFilter()}
+)
+
+SELECT
+  user_key,
+  COUNT(*) AS sessions,
+  APPROX_TOP_COUNT(daypart, 1)[OFFSET(0)].value AS preferred_daypart,
+  APPROX_TOP_COUNT(session_hour, 1)[OFFSET(0)].value AS preferred_hour,
+  SAFE_DIVIDE(COUNTIF(session_iso_weekday >= 6), COUNT(*)) AS weekend_share,
+  IF(SAFE_DIVIDE(COUNTIF(session_iso_weekday >= 6), COUNT(*)) >= 0.5, 'weekend', 'weekday') AS preferred_week_part,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions
+GROUP BY user_key
+HAVING COUNT(*) >= 2

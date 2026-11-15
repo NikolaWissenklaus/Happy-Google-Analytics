@@ -1,0 +1,95 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_monthly_scorecard",
+  description: "Monthly KPIs with MoM and YoY, targets (cfg_targets.js), and for the current month: MTD vs the same days of last month / last year and a weekday weighted projection (a month with 5 saturdays is not a month with 4)",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    revenue_projection: "Current month only: MTD revenue + remaining days x average revenue of the same weekday in the last 4 weeks",
+    revenue_vs_target: "revenue (or projection for the running month) / target - 1"
+  }
+}
+
+WITH
+daily AS (
+  SELECT
+    k.kpi_date,
+    DATE_TRUNC(k.kpi_date, MONTH) AS month_start,
+    EXTRACT(DAYOFWEEK FROM k.kpi_date) AS weekday,
+    k.sessions,
+    k.orders,
+    k.valid_revenue AS revenue,
+    k.new_customer_orders
+  FROM ${ref("ecom_daily_kpis")} AS k
+  WHERE k.kpi_date < CURRENT_DATE('${constants.TIMEZONE}')
+),
+
+months AS (
+  SELECT
+    month_start,
+    SUM(sessions) AS sessions,
+    SUM(orders) AS orders,
+    SUM(revenue) AS revenue,
+    SUM(new_customer_orders) AS new_customers,
+    MAX(kpi_date) AS last_day_with_data,
+    COUNT(*) AS days_with_data
+  FROM daily
+  GROUP BY month_start
+),
+
+-- average revenue per weekday in the last 28 days, to project the rest of the month
+weekday_profile AS (
+  SELECT weekday, AVG(revenue) AS avg_revenue, AVG(orders) AS avg_orders
+  FROM daily
+  WHERE kpi_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+  GROUP BY weekday
+),
+
+remaining_days AS (
+  SELECT
+    SUM(p.avg_revenue) AS projected_remaining_revenue,
+    SUM(p.avg_orders) AS projected_remaining_orders
+  FROM UNNEST(GENERATE_DATE_ARRAY(CURRENT_DATE('${constants.TIMEZONE}'), LAST_DAY(CURRENT_DATE('${constants.TIMEZONE}')))) AS d
+  JOIN weekday_profile AS p ON p.weekday = EXTRACT(DAYOFWEEK FROM d)
+),
+
+mtd_comparison AS (
+  SELECT
+    SUM(IF(kpi_date BETWEEN DATE_TRUNC(DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 MONTH), MONTH)
+                        AND DATE_SUB(DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 MONTH), INTERVAL 1 DAY), revenue, 0)) AS revenue_mtd_last_month,
+    SUM(IF(kpi_date BETWEEN DATE_TRUNC(DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 YEAR), MONTH)
+                        AND DATE_SUB(DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 YEAR), INTERVAL 1 DAY), revenue, 0)) AS revenue_mtd_last_year
+  FROM daily
+)
+
+SELECT
+  m.month_start,
+  m.sessions,
+  m.orders,
+  m.revenue,
+  m.new_customers,
+  SAFE_DIVIDE(m.orders, m.sessions) AS conversion_rate,
+  SAFE_DIVIDE(m.revenue, m.orders) AS average_order_value,
+  m.days_with_data,
+  m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH) AS is_current_month,
+  ${helpers.pctChange("m.revenue", "LAG(m.revenue) OVER (ORDER BY m.month_start)")} AS revenue_mom,
+  ${helpers.pctChange("m.revenue", "ly.revenue")} AS revenue_yoy,
+  IF(m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), c.revenue_mtd_last_month, NULL) AS revenue_mtd_last_month,
+  IF(m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), c.revenue_mtd_last_year, NULL) AS revenue_mtd_last_year,
+  IF(m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), m.revenue + COALESCE(r.projected_remaining_revenue, 0), m.revenue) AS revenue_projection,
+  IF(m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), m.orders + COALESCE(r.projected_remaining_orders, 0), m.orders) AS orders_projection,
+  t.revenue AS revenue_target,
+  t.transactions AS orders_target,
+  t.new_customers AS new_customers_target,
+  SAFE_DIVIDE(IF(m.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), m.revenue + COALESCE(r.projected_remaining_revenue, 0), m.revenue), t.revenue) - 1 AS revenue_vs_target,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM months AS m
+LEFT JOIN months AS ly ON ly.month_start = DATE_SUB(m.month_start, INTERVAL 1 YEAR)
+LEFT JOIN ${ref("seed_monthly_targets")} AS t ON t.target_month = m.month_start
+CROSS JOIN remaining_days AS r
+CROSS JOIN mtd_comparison AS c

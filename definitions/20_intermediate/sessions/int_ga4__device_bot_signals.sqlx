@@ -1,0 +1,198 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__device_bot_signals",
+  description: "Bot score per DEVICE (user_pseudo_id) from its whole behaviour in the last days, not one session alone: impossible travel (another country minutes after the previous session), country hopping, robotic regularity (a session every X minutes, like a cron), identical session lengths, sessions that never engage, blink sessions of 0-2 seconds, many user_ids on the same device (credential stuffing), night shift robots, headless / outdated browsers, 404 scanning and devices that always come back to ONE page and never engage or convert. fct_sessions joins it with the session level score (int_ga4__session_bot_signals)",
+  bigquery: {
+    clusterBy: ["is_bot_device", "user_pseudo_id"],
+    labels: { layer: "intermediate", domain: "data_quality" }
+  },
+  tags: ["ga4", "intermediate", "daily", "data_quality"],
+  columns: {
+    impossible_travel_jumps: "Sessions that started in another country less than cfg_project.bot.device.impossible_travel_hours after the previous one ended",
+    gap_cv: "Coefficient of variation of the minutes between sessions (std / mean). Humans are irregular, crons are not",
+    device_bot_score: "0-100, sum of the weights of the signals that fired, capped",
+    device_bot_signals: "Which signals fired",
+    is_bot_device: "device_bot_score >= cfg_project.bot.min_score_to_flag"
+  }
+}
+
+js {
+  const b = cfg_project.bot;
+  const d = b.device;
+  const modernBrowsers = helpers.sqlList(["Chrome", "Edge", "Firefox"]);
+}
+
+WITH
+sessions AS (
+  SELECT
+    user_pseudo_id,
+    session_key,
+    session_date,
+    session_start_ts,
+    session_end_ts,
+    session_duration_sec,
+    engagement_time_msec,
+    page_views,
+    unique_pages,
+    is_engaged,
+    raw_key_events,
+    purchase_events,
+    user_id,
+    NULLIF(geo_country, '(not set)') AS geo_country,
+    NULLIF(geo_region, '(not set)') AS geo_region,
+    device_browser,
+    SAFE_CAST(SPLIT(device_browser_version, '.')[SAFE_OFFSET(0)] AS INT64) AS browser_major,
+    EXTRACT(HOUR FROM session_start_local) AS local_hour
+  FROM ${ref("int_ga4__sessions_base")}
+  WHERE session_date >= ${helpers.daysAgo(d.window_days)}
+    AND user_pseudo_id IS NOT NULL
+),
+
+with_previous AS (
+  SELECT
+    *,
+    TIMESTAMP_DIFF(session_start_ts, LAG(session_start_ts) OVER w, SECOND) / 60 AS minutes_since_previous_start,
+    TIMESTAMP_DIFF(session_start_ts, LAG(session_end_ts) OVER w, MINUTE) AS minutes_since_previous_end,
+    LAG(geo_country) OVER w AS previous_country
+  FROM sessions
+  WINDOW w AS (PARTITION BY user_pseudo_id ORDER BY session_start_ts)
+),
+
+-- "current" major version of each auto updating browser: p95 of the last 7 days
+-- (the max would be fooled by a bot saying it is Chrome 999)
+current_browsers AS (
+  SELECT device_browser, APPROX_QUANTILES(browser_major, 100)[OFFSET(95)] AS current_major
+  FROM sessions
+  WHERE session_date >= ${helpers.daysAgo(7)}
+    AND device_browser IN (${modernBrowsers})
+    AND browser_major IS NOT NULL
+  GROUP BY device_browser
+),
+
+weekly_countries AS (
+  SELECT user_pseudo_id, MAX(countries) AS max_countries_in_a_week
+  FROM (
+    SELECT user_pseudo_id, DATE_TRUNC(session_date, WEEK(MONDAY)) AS week, COUNT(DISTINCT geo_country) AS countries
+    FROM sessions
+    GROUP BY 1, 2
+  )
+  GROUP BY user_pseudo_id
+),
+
+not_found_views AS (
+  SELECT
+    user_pseudo_id,
+    COUNT(*) AS page_views,
+    COUNTIF(${content.isNotFoundTitle("page_title")}) AS not_found_views
+  FROM ${ref("int_ga4__page_views")}
+  WHERE event_date >= ${helpers.daysAgo(d.window_days)}
+  GROUP BY user_pseudo_id
+),
+
+per_device AS (
+  SELECT
+    s.user_pseudo_id,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT s.session_date) AS active_days,
+    COUNTIF(
+      s.previous_country IS NOT NULL AND s.geo_country IS NOT NULL
+      AND s.geo_country != s.previous_country
+      AND s.minutes_since_previous_end < ${d.impossible_travel_hours * 60}
+    ) AS impossible_travel_jumps,
+    COUNT(DISTINCT s.geo_country) AS countries,
+    SAFE_DIVIDE(STDDEV(s.minutes_since_previous_start), AVG(s.minutes_since_previous_start)) AS gap_cv,
+    AVG(s.session_duration_sec) AS avg_session_sec,
+    STDDEV(s.session_duration_sec) AS std_session_sec,
+    APPROX_QUANTILES(s.session_duration_sec, 2)[OFFSET(1)] AS median_session_sec,
+    SAFE_DIVIDE(COUNTIF(COALESCE(s.engagement_time_msec, 0) = 0), COUNT(*)) AS zero_engagement_share,
+    SUM(s.page_views) AS page_views,
+    COUNT(DISTINCT s.user_id) AS user_ids,
+    -- one page (path without params, or one app screen), not engaged, no key event, no purchase
+    COUNTIF(s.unique_pages <= 1 AND NOT s.is_engaged AND s.raw_key_events = 0 AND s.purchase_events = 0) AS one_page_idle_sessions,
+    SAFE_DIVIDE(COUNTIF(s.local_hour BETWEEN 1 AND 4), COUNT(*)) AS night_share,
+    LOGICAL_OR(REGEXP_CONTAINS(LOWER(COALESCE(s.device_browser, '')), r'${d.headless_browser_pattern}')) AS headless_browser,
+    LOGICAL_OR(s.browser_major < c.current_major - ${d.outdated_browser_major_gap}) AS outdated_browser
+  FROM with_previous AS s
+  LEFT JOIN current_browsers AS c USING (device_browser)
+  GROUP BY s.user_pseudo_id
+),
+
+check_signals AS (
+  SELECT
+    p.*,
+    w.max_countries_in_a_week,
+    SAFE_DIVIDE(n.not_found_views, n.page_views) AS not_found_share,
+    p.impossible_travel_jumps >= 2 AS impossible_travel,
+    p.impossible_travel_jumps = 1 AS one_country_jump,
+    w.max_countries_in_a_week >= ${d.max_countries_per_week} AS country_hopping,
+    p.sessions >= ${d.min_sessions_for_patterns} AND p.gap_cv < ${d.max_gap_cv_for_robot} AS robotic_regularity,
+    p.sessions >= ${d.min_sessions_for_patterns} AND p.avg_session_sec >= 5 AND p.std_session_sec < 1 AS identical_session_length,
+    p.sessions >= ${d.min_sessions_for_patterns} AND p.zero_engagement_share >= ${d.zero_engagement_share} AND p.page_views >= p.sessions AS never_engages,
+    p.sessions >= ${d.min_sessions_for_patterns} AND p.median_session_sec <= ${d.blink_session_seconds} AS blink_sessions,
+    p.user_ids >= ${d.max_user_ids_per_device} AS many_user_ids,
+    p.sessions >= 10 AND p.night_share >= ${d.night_share} AS night_shift_robot,
+    COALESCE(n.page_views, 0) >= 5 AND SAFE_DIVIDE(n.not_found_views, n.page_views) >= ${d.not_found_share} AS not_found_scanner,
+    -- the cookie survived but the behaviour is the 'one and done' every single time
+    p.sessions >= ${d.min_sessions_for_patterns} AND p.one_page_idle_sessions = p.sessions AS always_one_page_idle
+  FROM per_device AS p
+  LEFT JOIN weekly_countries AS w USING (user_pseudo_id)
+  LEFT JOIN not_found_views AS n USING (user_pseudo_id)
+),
+
+score_it AS (
+  SELECT
+    *,
+    LEAST(100,
+      IF(impossible_travel, 45, 0)
+      + IF(one_country_jump, 15, 0)
+      + IF(COALESCE(country_hopping, FALSE), 35, 0)
+      + IF(COALESCE(robotic_regularity, FALSE), 40, 0)
+      + IF(COALESCE(identical_session_length, FALSE), 30, 0)
+      + IF(COALESCE(never_engages, FALSE), 25, 0)
+      + IF(COALESCE(blink_sessions, FALSE), 20, 0)
+      + IF(many_user_ids, 45, 0)
+      + IF(night_shift_robot, 15, 0)
+      + IF(headless_browser, 60, 0)
+      + IF(COALESCE(outdated_browser, FALSE), 20, 0)
+      + IF(COALESCE(not_found_scanner, FALSE), 40, 0)
+      + IF(always_one_page_idle, 25, 0)
+    ) AS device_bot_score,
+    ARRAY_CONCAT(
+      IF(impossible_travel, ['impossible_travel'], []),
+      IF(one_country_jump, ['one_country_jump'], []),
+      IF(COALESCE(country_hopping, FALSE), ['country_hopping'], []),
+      IF(COALESCE(robotic_regularity, FALSE), ['robotic_regularity'], []),
+      IF(COALESCE(identical_session_length, FALSE), ['identical_session_length'], []),
+      IF(COALESCE(never_engages, FALSE), ['never_engages'], []),
+      IF(COALESCE(blink_sessions, FALSE), ['blink_sessions'], []),
+      IF(many_user_ids, ['many_user_ids'], []),
+      IF(night_shift_robot, ['night_shift_robot'], []),
+      IF(headless_browser, ['headless_browser'], []),
+      IF(COALESCE(outdated_browser, FALSE), ['outdated_browser'], []),
+      IF(COALESCE(not_found_scanner, FALSE), ['not_found_scanner'], []),
+      IF(always_one_page_idle, ['always_one_page_idle'], [])
+    ) AS device_bot_signals
+  FROM check_signals
+)
+
+SELECT
+  user_pseudo_id,
+  sessions,
+  active_days,
+  countries,
+  max_countries_in_a_week,
+  impossible_travel_jumps,
+  ROUND(gap_cv, 3) AS gap_cv,
+  ROUND(median_session_sec, 1) AS median_session_sec,
+  ROUND(zero_engagement_share, 3) AS zero_engagement_share,
+  user_ids,
+  ROUND(night_share, 3) AS night_share,
+  ROUND(not_found_share, 3) AS not_found_share,
+  device_bot_score,
+  device_bot_signals,
+  device_bot_score >= ${b.min_score_to_flag} AS is_bot_device,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM score_it

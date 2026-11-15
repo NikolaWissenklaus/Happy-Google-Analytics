@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_deletion_preview",
+  description: "Dry run of the LGPD deletion, always on: for the approved deletion requests, how many rows each table would lose. Look at this before turning enable_dsr_deletion on",
+  dependencies: ["priv_dsr_identifiers", "priv_dsr_deletion_log"],
+  tags: ["monitoring", "lgpd", "daily"]
+}
+
+DECLARE requests ARRAY<STRING> DEFAULT ${privacy.pendingDeletionRequestsSql(ref("priv_dsr_identifiers"), ref("priv_dsr_deletion_log"))};
+
+CREATE OR REPLACE TABLE ${self()} (
+  target_table STRING OPTIONS (description = "dataset.table (raw export tables start with the GA4 dataset)"),
+  id_columns ARRAY<STRING> OPTIONS (description = "Identifier columns used to find the rows"),
+  rows_to_delete INT64 OPTIONS (description = "Rows that priv_dsr_deletion would delete"),
+  request_ids ARRAY<STRING> OPTIONS (description = "Requests in this preview"),
+  checked_at TIMESTAMP
+)
+OPTIONS (description = "LGPD deletion dry run");
+
+IF COALESCE(ARRAY_LENGTH(requests), 0) > 0 THEN
+  FOR t IN (${privacy.userLevelTablesSql(ref("priv_dsr_identifiers"))}) DO
+    EXECUTE IMMEDIATE FORMAT(
+      "INSERT INTO ${self()} SELECT '%s.%s', %T, COUNT(*), @requests, CURRENT_TIMESTAMP() FROM `${constants.PROJECT}.%s.%s` WHERE %s",
+      t.table_schema, t.table_name, t.id_columns, t.table_schema, t.table_name, t.id_condition
+    ) USING requests AS requests;
+  END FOR;
+  ${constants.PRIVACY.dsr_include_raw_export ? `
+  FOR t IN (${privacy.rawExportTablesSql(ref("priv_dsr_identifiers"))}) DO
+    EXECUTE IMMEDIATE FORMAT(
+      "INSERT INTO ${self()} SELECT '${constants.GA4_DATASET}.%s', CAST(NULL AS ARRAY<STRING>), COUNT(*), @requests, CURRENT_TIMESTAMP() FROM \`${constants.GA4_PROJECT}.${constants.GA4_DATASET}.%s\` WHERE %s",
+      t.table_name, t.table_name, t.id_condition
+    ) USING requests AS requests;
+  END FOR;` : ``}
+END IF;

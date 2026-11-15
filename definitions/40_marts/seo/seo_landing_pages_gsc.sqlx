@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_landing_pages_gsc",
+  disabled: !constants.ENABLE.search_console,
+  description: "Search Console x GA4 per landing page (last 28 days): Google impressions, clicks, CTR and position next to the GA4 organic sessions, engagement and revenue. Revenue per Google click = the value of ranking each page",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo" }
+  },
+  tags: ["marts", "seo", "daily", "search_console", "optional"],
+  columns: {
+    sessions_per_click: "GA4 google organic sessions / GSC clicks. Much lower than 1 = consent denied, slow page, or tag missing in that template"
+  }
+}
+
+WITH
+gsc AS (
+  SELECT
+    page_path,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SAFE_DIVIDE(SUM(sum_position), SUM(impressions)) + 1 AS avg_position,
+    COUNT(DISTINCT query) AS queries
+  FROM ${ref("stg_gsc__url_impressions")}
+  WHERE data_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+    AND search_type = 'WEB'
+  GROUP BY 1
+),
+
+ga4 AS (
+  SELECT
+    landing_page_path AS page_path,
+    SUM(sessions) AS sessions,
+    SUM(engaged_sessions) AS engaged_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM ${ref("seo_organic_daily")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+    AND search_engine = 'google'
+  GROUP BY 1
+)
+
+SELECT
+  COALESCE(g.page_path, a.page_path) AS page_path,
+  g.impressions,
+  g.clicks,
+  SAFE_DIVIDE(g.clicks, g.impressions) AS ctr,
+  g.avg_position,
+  g.queries,
+  a.sessions,
+  a.engaged_sessions,
+  a.transactions,
+  a.revenue,
+  SAFE_DIVIDE(a.sessions, g.clicks) AS sessions_per_click,
+  SAFE_DIVIDE(a.revenue, g.clicks) AS revenue_per_click,
+  SAFE_DIVIDE(a.engaged_sessions, a.sessions) AS engagement_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM gsc AS g
+FULL OUTER JOIN ga4 AS a USING (page_path)

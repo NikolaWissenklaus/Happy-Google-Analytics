@@ -1,0 +1,96 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__key_events",
+  description: "Key events (conversions) from cfg_key_events.js, one row per occurrence, with value and GA4 counting method applied (is_counted)",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["key_event_name", "session_key"],
+    labels: { layer: "intermediate", domain: "conversions" }
+  },
+  tags: ["ga4", "intermediate", "daily", "conversions"],
+  columns: {
+    key_event_id: "key_event_name + event_id",
+    key_event_name: "Name of the key event in cfg_key_events.js (not always the GA4 event name)",
+    is_counted: "TRUE when it counts as a conversion: every_event, or the first one of the session for once_per_session",
+    key_event_value: "Value of the key event according to the config (revenue, value param or fixed value)"
+  }
+}
+
+js {
+  const valueExpr = k => {
+    if (k.value === "revenue") return "COALESCE(purchase_revenue, event_value, (SELECT SUM(COALESCE(i.item_revenue, i.price * COALESCE(i.quantity, 1))) FROM UNNEST(items) AS i), 0)";
+    if (k.value === "param") return "COALESCE(event_value, 0)";
+    if (k.value === "fixed") return `CAST(${Number(k.fixed_value || 0)} AS FLOAT64)`;
+    return "CAST(0 AS FLOAT64)";
+  };
+  const events = cfg_key_events.key_events;
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events", "int_ga4__transactions"] })}
+}
+
+WITH
+${events.map(k => `ke_${k.name} AS (
+  SELECT
+    '${k.name}' AS key_event_name,
+    '${k.category || "other"}' AS key_event_category,
+    event_id,
+    event_name,
+    event_date,
+    event_ts,
+    session_key,
+    user_pseudo_id,
+    user_id,
+    transaction_id,
+    COALESCE(currency, '${constants.CURRENCY}') AS currency,
+    ${valueExpr(k)} AS key_event_value,
+    '${k.counting || "every_event"}' AS counting_method,
+    ${k.is_primary ? "TRUE" : "FALSE"} AS is_primary
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND event_name = '${k.event_name}'
+    ${k.condition ? `AND (${k.condition})` : ""}
+    ${helpers.noiseFilter()}
+    ${k.dedupe_by_transaction ? `AND event_id IN (SELECT event_id FROM ${ref("int_ga4__transactions")} WHERE transaction_date >= DATE_SUB(run_from, INTERVAL 1 DAY) AND NOT is_test_transaction)` : ""}
+)`).join(",\n\n")},
+
+all_key_events AS (
+  ${events.map(k => `SELECT * FROM ke_${k.name}`).join("\n  UNION ALL\n  ")}
+),
+
+apply_counting_method AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY key_event_name, session_key ORDER BY event_ts, event_id) AS occurrence_in_session
+  FROM all_key_events
+)
+
+SELECT
+  CONCAT(key_event_name, ':', CAST(event_id AS STRING)) AS key_event_id,
+  key_event_name,
+  key_event_category,
+  event_id,
+  event_name,
+  event_date,
+  event_ts,
+  session_key,
+  user_pseudo_id,
+  user_id,
+  transaction_id,
+  currency,
+  key_event_value,
+  counting_method,
+  is_primary,
+  occurrence_in_session,
+  (counting_method = 'every_event' OR occurrence_in_session = 1 OR session_key IS NULL) AS is_counted,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM apply_counting_method
+WHERE event_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

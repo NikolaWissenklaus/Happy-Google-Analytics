@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_opportunity_sizing",
+  description: "Where is the money (last 90 days): for each device x channel x new/returning segment, the revenue we would make if it converted like the best quartile of comparable segments. Sorted by money, so the CRO / media roadmap starts from the top",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "cro"],
+  columns: {
+    benchmark_conversion_rate: "75th percentile of conversion among segments of the same device and user type with 1000+ sessions",
+    revenue_opportunity_90d: "(benchmark - current conversion) x sessions x AOV of the segment, when positive"
+  }
+}
+
+WITH
+segments AS (
+  SELECT
+    device_category,
+    session_default_channel_group,
+    IF(is_new_user, 'new', 'returning') AS user_type,
+    COUNT(*) AS sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3
+),
+
+with_rates AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+    SAFE_DIVIDE(revenue, transactions) AS aov
+  FROM segments
+),
+
+benchmarks AS (
+  SELECT
+    device_category,
+    user_type,
+    APPROX_QUANTILES(conversion_rate, 4)[OFFSET(3)] AS benchmark_conversion_rate,
+    SAFE_DIVIDE(SUM(revenue), SUM(transactions)) AS device_aov
+  FROM with_rates
+  WHERE sessions >= 1000
+  GROUP BY 1, 2
+)
+
+SELECT
+  w.*,
+  b.benchmark_conversion_rate,
+  GREATEST(b.benchmark_conversion_rate - w.conversion_rate, 0) * w.sessions * COALESCE(w.aov, b.device_aov) AS revenue_opportunity_90d,
+  ${helpers.wilsonLower("w.transactions", "w.sessions")} AS conversion_rate_wilson_low,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_rates AS w
+LEFT JOIN benchmarks AS b USING (device_category, user_type)
+WHERE w.sessions >= 200

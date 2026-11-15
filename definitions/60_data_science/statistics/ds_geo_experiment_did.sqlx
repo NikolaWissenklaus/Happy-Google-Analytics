@@ -1,0 +1,83 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_geo_experiment_did",
+  description: "Geo experiments by brazilian state (cfg_experiments.geo_experiments): difference-in-differences of daily revenue and sessions between test UFs and control UFs, pre vs test period, plus the pre period correlation of the two groups (parallel trends sanity check). Incrementality of TV / OOH / regional campaigns without any vendor",
+  bigquery: {
+    labels: { layer: "data_science", domain: "experiments" }
+  },
+  tags: ["data_science", "statistics", "daily", "experiments"],
+  columns: {
+    did_revenue_per_day: "(test during - test before) - (control during - control before), per day and per group average",
+    relative_lift: "did / expected test revenue without the treatment",
+    pre_period_correlation: "Correlation of the daily series of test and control in the pre period. Below 0.7 = groups are not comparable, dont trust the DiD"
+  }
+}
+
+WITH
+experiments AS (SELECT * FROM ${ref("seed_geo_experiments")}),
+
+daily_uf AS (
+  SELECT session_date, geo_uf, COUNT(*) AS sessions, SUM(revenue) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE geo_uf IS NOT NULL
+    AND session_date >= (SELECT MIN(pre_start) FROM experiments)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+),
+
+grouped AS (
+  SELECT
+    e.experiment_id,
+    e.experiment_name,
+    d.session_date,
+    IF(d.geo_uf IN UNNEST(e.test_ufs), 'test', 'control') AS grp,
+    IF(d.session_date BETWEEN e.pre_start AND e.pre_end, 'pre', 'test_period') AS period,
+    SUM(d.sessions) AS sessions,
+    SUM(d.revenue) AS revenue
+  FROM experiments AS e
+  JOIN daily_uf AS d
+    ON (d.geo_uf IN UNNEST(e.test_ufs) OR d.geo_uf IN UNNEST(e.control_ufs))
+    AND (d.session_date BETWEEN e.pre_start AND e.pre_end OR d.session_date BETWEEN e.test_start AND e.test_end)
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+averages AS (
+  SELECT
+    experiment_id,
+    ANY_VALUE(experiment_name) AS experiment_name,
+    AVG(IF(grp = 'test' AND period = 'pre', revenue, NULL)) AS test_pre_revenue,
+    AVG(IF(grp = 'test' AND period = 'test_period', revenue, NULL)) AS test_during_revenue,
+    AVG(IF(grp = 'control' AND period = 'pre', revenue, NULL)) AS control_pre_revenue,
+    AVG(IF(grp = 'control' AND period = 'test_period', revenue, NULL)) AS control_during_revenue,
+    AVG(IF(grp = 'test' AND period = 'pre', sessions, NULL)) AS test_pre_sessions,
+    AVG(IF(grp = 'test' AND period = 'test_period', sessions, NULL)) AS test_during_sessions,
+    AVG(IF(grp = 'control' AND period = 'pre', sessions, NULL)) AS control_pre_sessions,
+    AVG(IF(grp = 'control' AND period = 'test_period', sessions, NULL)) AS control_during_sessions
+  FROM grouped
+  GROUP BY experiment_id
+),
+
+pre_correlation AS (
+  SELECT t.experiment_id, CORR(t.revenue, c.revenue) AS pre_period_correlation
+  FROM grouped AS t
+  JOIN grouped AS c ON c.experiment_id = t.experiment_id AND c.session_date = t.session_date AND c.grp = 'control' AND c.period = 'pre'
+  WHERE t.grp = 'test' AND t.period = 'pre'
+  GROUP BY 1
+)
+
+SELECT
+  a.*,
+  (a.test_during_revenue - a.test_pre_revenue) - (a.control_during_revenue - a.control_pre_revenue) AS did_revenue_per_day,
+  SAFE_DIVIDE(
+    (a.test_during_revenue - a.test_pre_revenue) - (a.control_during_revenue - a.control_pre_revenue),
+    a.test_pre_revenue * SAFE_DIVIDE(a.control_during_revenue, a.control_pre_revenue)
+  ) AS relative_lift,
+  (a.test_during_sessions - a.test_pre_sessions) - (a.control_during_sessions - a.control_pre_sessions) AS did_sessions_per_day,
+  p.pre_period_correlation,
+  COALESCE(p.pre_period_correlation >= 0.7, FALSE) AS groups_look_comparable,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM averages AS a
+LEFT JOIN pre_correlation AS p USING (experiment_id)

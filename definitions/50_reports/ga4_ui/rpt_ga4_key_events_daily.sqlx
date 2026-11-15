@@ -1,0 +1,36 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_key_events_daily",
+  description: "GA4 Reports > Engagement > Key events: count, users and value of each key event (cfg_key_events.js, GA4 counting method applied) by session channel and device, per day",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["key_event_name"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["int_ga4__key_events"] })}
+}
+
+SELECT
+  event_date,
+  key_event_name,
+  COALESCE(session_default_channel_group, '(not set)') AS session_default_channel_group,
+  COALESCE(device_category, '(not set)') AS device_category,
+  COUNT(*) AS key_events,
+  COUNT(DISTINCT user_key) AS users,
+  HLL_COUNT.INIT(user_key) AS users_hll,
+  SUM(key_event_value) AS key_event_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_key_events")}
+WHERE event_date >= run_from
+GROUP BY 1, 2, 3, 4
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

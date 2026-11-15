@@ -1,0 +1,84 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_daily_kpis",
+  description: "Ecommerce KPIs per day: sessions, buyers, orders, revenue (gross / valid / net of refunds), AOV, conversion, items per order, new x repeat customers, coupon and boleto/pix share",
+  bigquery: {
+    partitionBy: "kpi_date",
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"],
+  columns: {
+    valid_revenue: "Revenue of the valid transactions (no tests, no outliers, and not cancelled when the CRM module is on). This is THE revenue",
+    deferred_payment_share: "Share of orders paid with boleto / pix (revenue that may never arrive)"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "kpi_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH
+sessions_per_day AS (
+  SELECT
+    session_date AS kpi_date,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT user_key) AS users,
+    HLL_COUNT.INIT(user_key) AS users_hll,
+    COUNTIF(has_view_item) AS sessions_with_product_view,
+    COUNTIF(has_add_to_cart) AS sessions_with_cart,
+    COUNTIF(has_begin_checkout) AS sessions_with_checkout,
+    COUNTIF(has_purchase) AS sessions_with_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+orders_per_day AS (
+  SELECT
+    transaction_date AS kpi_date,
+    COUNT(*) AS orders_all,
+    COUNTIF(is_valid_for_revenue) AS orders,
+    COUNT(DISTINCT IF(is_valid_for_revenue, user_key, NULL)) AS buyers,
+    SUM(revenue) AS gross_revenue_all,
+    SUM(IF(is_valid_for_revenue, revenue, 0)) AS valid_revenue,
+    SUM(IF(is_valid_for_revenue, net_revenue, 0)) AS net_revenue,
+    SUM(IF(is_valid_for_revenue, refunded_value, 0)) AS refunded_value,
+    SUM(IF(is_valid_for_revenue, shipping_value, 0)) AS shipping_value,
+    SUM(IF(is_valid_for_revenue, tax_value, 0)) AS tax_value,
+    SUM(IF(is_valid_for_revenue, item_quantity, 0)) AS items_sold,
+    COUNTIF(is_valid_for_revenue AND is_first_purchase) AS new_customer_orders,
+    SUM(IF(is_valid_for_revenue AND is_first_purchase, revenue, 0)) AS new_customer_revenue,
+    COUNTIF(is_valid_for_revenue AND NOT COALESCE(is_first_purchase, FALSE)) AS repeat_customer_orders,
+    COUNTIF(is_valid_for_revenue AND coupon IS NOT NULL) AS coupon_orders,
+    COUNTIF(is_valid_for_revenue AND is_deferred_payment) AS deferred_payment_orders,
+    COUNTIF(is_test_transaction) AS test_orders,
+    COUNTIF(is_revenue_outlier) AS outlier_orders
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= run_from
+  GROUP BY 1
+)
+
+SELECT
+  COALESCE(s.kpi_date, o.kpi_date) AS kpi_date,
+  s.* EXCEPT (kpi_date),
+  o.* EXCEPT (kpi_date),
+  SAFE_DIVIDE(o.orders, s.sessions) AS conversion_rate,
+  SAFE_DIVIDE(o.valid_revenue, o.orders) AS average_order_value,
+  SAFE_DIVIDE(o.items_sold, o.orders) AS items_per_order,
+  SAFE_DIVIDE(o.valid_revenue, s.sessions) AS revenue_per_session,
+  SAFE_DIVIDE(o.valid_revenue, s.users) AS revenue_per_user,
+  SAFE_DIVIDE(o.new_customer_orders, o.orders) AS new_customer_share,
+  SAFE_DIVIDE(o.coupon_orders, o.orders) AS coupon_share,
+  SAFE_DIVIDE(o.deferred_payment_orders, o.orders) AS deferred_payment_share,
+  SAFE_DIVIDE(o.refunded_value, o.valid_revenue) AS refund_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions_per_day AS s
+FULL OUTER JOIN orders_per_day AS o ON o.kpi_date = s.kpi_date
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

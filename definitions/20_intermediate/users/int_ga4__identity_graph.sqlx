@@ -1,0 +1,176 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__identity_graph",
+  description: "Identity graph: devices linked by things only one person has (login, the same order, the same ad click minutes apart on the same OS), grouped in clusters by label propagation. int_ga4__user_stitching uses it to merge devices that never logged in. Rules and limits in cfg_identity.js",
+  bigquery: {
+    clusterBy: ["user_pseudo_id"],
+    labels: { layer: "intermediate", domain: "identity" }
+  },
+  tags: ["ga4", "intermediate", "daily", "identity"],
+  columns: {
+    cluster_id: "Smallest user_pseudo_id of the cluster. Same value = same person for the graph",
+    cluster_user_id: "user_id of the most recent login inside the cluster (NULL = nobody of the cluster ever logged in)",
+    device_link_types: "How THIS device is linked: login, transaction, click_id",
+    cluster_link_types: "Every link type used inside the cluster",
+    is_oversized_cluster: "More devices than cfg_identity.graph.max_devices_per_person: not merged, something is wrong (shared link, reused order id)"
+  }
+}
+
+js {
+  const g = cfg_identity.graph;
+  const placeholders = helpers.sqlList(cfg_identity.user_id_placeholders);
+  const testPattern = cfg_project.test_transaction_patterns.join("|");
+  const rounds = Array.from({ length: g.iterations }, (_, i) => i + 1);
+}
+
+WITH
+login_pairs AS (
+  SELECT user_pseudo_id, user_id, MAX(last_seen_ts) AS last_seen_ts
+  FROM ${ref("int_ga4__user_id_pairs_daily")}
+  WHERE LOWER(TRIM(user_id)) NOT IN (${placeholders})
+    AND TRIM(user_id) != ''
+  GROUP BY 1, 2
+),
+
+-- shared / test accounts are not a person
+login_ok AS (
+  SELECT p.*
+  FROM login_pairs AS p
+  JOIN (
+    SELECT user_id
+    FROM login_pairs
+    GROUP BY user_id
+    HAVING COUNT(*) <= ${cfg_identity.max_devices_per_user_id}
+  ) USING (user_id)
+),
+
+${g.use_transaction_links ? `
+-- the same order seen by 2+ devices: checkout in another domain without the linker, thank you
+-- page opened from the e-mail in another browser, app + web...
+transaction_devices AS (
+  SELECT transaction_id, user_pseudo_id, MIN(event_ts) AS first_ts, MAX(event_ts) AS last_ts
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_name = 'purchase'
+    AND event_date >= ${helpers.martWindowStart()}
+    AND transaction_id IS NOT NULL
+    AND user_pseudo_id IS NOT NULL
+    AND NOT REGEXP_CONTAINS(LOWER(transaction_id), r'(${testPattern})')
+    AND NOT is_non_production_host
+  GROUP BY 1, 2
+),
+
+transaction_links AS (
+  SELECT d.user_pseudo_id, CONCAT('t:', d.transaction_id) AS identifier, 'transaction' AS link_type
+  FROM transaction_devices AS d
+  JOIN (
+    SELECT transaction_id
+    FROM transaction_devices
+    GROUP BY transaction_id
+    HAVING COUNT(*) BETWEEN 2 AND ${g.max_devices_per_transaction}
+      AND TIMESTAMP_DIFF(MAX(last_ts), MIN(first_ts), HOUR) <= ${g.transaction_window_hours}
+  ) USING (transaction_id)
+),` : ``}
+
+${g.use_click_id_links ? `
+click_sessions AS (
+  SELECT
+    r.user_pseudo_id,
+    r.session_start_ts,
+    b.device_os,
+    COALESCE(r.gclid, r.gbraid, r.wbraid, r.dclid, r.fbclid, r.msclkid, r.ttclid) AS click_id
+  FROM ${ref("int_ga4__session_sources_raw")} AS r
+  JOIN ${ref("int_ga4__sessions_base")} AS b USING (session_key)
+  WHERE r.session_date >= ${helpers.martWindowStart()}
+    AND b.session_date >= ${helpers.martWindowStart()}
+    AND COALESCE(r.gclid, r.gbraid, r.wbraid, r.dclid, r.fbclid, r.msclkid, r.ttclid) IS NOT NULL
+),
+
+-- the same click on 2 or 3 devices, minutes apart: in-app browser -> real browser, cookie lost
+-- in a redirect. more devices than that = the link was shared, not the same person
+click_links AS (
+  SELECT DISTINCT c.user_pseudo_id, CONCAT('c:', c.click_id) AS identifier, 'click_id' AS link_type
+  FROM click_sessions AS c
+  JOIN (
+    SELECT click_id
+    FROM click_sessions
+    GROUP BY click_id
+    HAVING COUNT(DISTINCT user_pseudo_id) BETWEEN 2 AND ${g.max_devices_per_click_id}
+      AND TIMESTAMP_DIFF(MAX(session_start_ts), MIN(session_start_ts), MINUTE) <= ${g.click_id_window_minutes}
+      ${g.click_id_same_os ? `AND COUNT(DISTINCT COALESCE(device_os, '?')) = 1` : ``}
+  ) USING (click_id)
+),` : ``}
+
+all_links AS (
+  SELECT user_pseudo_id, CONCAT('u:', user_id) AS identifier, 'login' AS link_type FROM login_ok
+  ${g.use_transaction_links ? `UNION ALL SELECT user_pseudo_id, identifier, link_type FROM transaction_links` : ``}
+  ${g.use_click_id_links ? `UNION ALL SELECT user_pseudo_id, identifier, link_type FROM click_links` : ``}
+),
+
+-- label propagation over the graph device <-> identifier. every round the identifier takes the
+-- smallest label of its devices and the device the smallest label of its identifiers
+labels_0 AS (
+  SELECT DISTINCT user_pseudo_id, user_pseudo_id AS label FROM all_links
+),
+${rounds.map(i => `
+identifier_labels_${i} AS (
+  SELECT a.identifier, MIN(l.label) AS label
+  FROM all_links AS a
+  JOIN labels_${i - 1} AS l USING (user_pseudo_id)
+  GROUP BY a.identifier
+),
+
+labels_${i} AS (
+  SELECT a.user_pseudo_id, MIN(il.label) AS label
+  FROM all_links AS a
+  JOIN identifier_labels_${i} AS il USING (identifier)
+  GROUP BY a.user_pseudo_id
+),`).join("")}
+
+clusters AS (
+  SELECT user_pseudo_id, label AS cluster_id
+  FROM labels_${g.iterations}
+),
+
+device_links AS (
+  SELECT user_pseudo_id, ARRAY_AGG(DISTINCT link_type ORDER BY link_type) AS device_link_types
+  FROM all_links
+  GROUP BY user_pseudo_id
+),
+
+cluster_stats AS (
+  SELECT
+    c.cluster_id,
+    COUNT(DISTINCT c.user_pseudo_id) AS cluster_devices,
+    ARRAY_AGG(DISTINCT a.link_type ORDER BY a.link_type) AS cluster_link_types
+  FROM clusters AS c
+  JOIN all_links AS a USING (user_pseudo_id)
+  GROUP BY c.cluster_id
+),
+
+cluster_person AS (
+  SELECT
+    c.cluster_id,
+    ARRAY_AGG(l.user_id ORDER BY l.last_seen_ts DESC LIMIT 1)[OFFSET(0)] AS cluster_user_id,
+    COUNT(DISTINCT l.user_id) AS cluster_user_ids
+  FROM clusters AS c
+  JOIN login_ok AS l USING (user_pseudo_id)
+  GROUP BY c.cluster_id
+)
+
+SELECT
+  c.user_pseudo_id,
+  c.cluster_id,
+  s.cluster_devices,
+  p.cluster_user_id,
+  COALESCE(p.cluster_user_ids, 0) AS cluster_user_ids,
+  d.device_link_types,
+  s.cluster_link_types,
+  s.cluster_devices > ${g.max_devices_per_person} AS is_oversized_cluster,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM clusters AS c
+JOIN cluster_stats AS s USING (cluster_id)
+JOIN device_links AS d USING (user_pseudo_id)
+LEFT JOIN cluster_person AS p USING (cluster_id)

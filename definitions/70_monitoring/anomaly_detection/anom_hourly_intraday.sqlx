@@ -1,0 +1,65 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_hourly_intraday",
+  disabled: !constants.INCLUDE_INTRADAY,
+  description: "Near real time check (needs include_intraday): today, hour by hour, sessions / purchases / revenue vs the same hour of the same weekday in the last 4 weeks. Schedule the 'hourly' tag every hour and you know the checkout broke at 10h, not tomorrow",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "hourly", "alerts", "optional"]
+}
+
+WITH
+hourly AS (
+  SELECT
+    event_date,
+    EXTRACT(HOUR FROM event_datetime_local) AS hour_local,
+    COUNTIF(event_name = 'session_start') AS sessions,
+    COUNTIF(event_name = 'purchase') AS purchases,
+    SUM(IF(event_name = 'purchase', COALESCE(purchase_revenue, event_value, 0), 0)) AS revenue,
+    COUNTIF(event_name = 'add_to_cart') AS add_to_carts
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date IN (
+      CURRENT_DATE('${constants.TIMEZONE}'),
+      DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY),
+      DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 14 DAY),
+      DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 21 DAY),
+      DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY))
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2
+),
+
+compare AS (
+  SELECT
+    h.hour_local,
+    m.metric,
+    MAX(IF(h.event_date = CURRENT_DATE('${constants.TIMEZONE}'), m.value, NULL)) AS today_value,
+    AVG(IF(h.event_date < CURRENT_DATE('${constants.TIMEZONE}'), m.value, NULL)) AS baseline_value,
+    STDDEV_SAMP(IF(h.event_date < CURRENT_DATE('${constants.TIMEZONE}'), m.value, NULL)) AS baseline_sd
+  FROM hourly AS h,
+    UNNEST([
+      STRUCT('sessions' AS metric, CAST(h.sessions AS FLOAT64) AS value),
+      STRUCT('purchases', CAST(h.purchases AS FLOAT64)),
+      STRUCT('revenue', h.revenue),
+      STRUCT('add_to_carts', CAST(h.add_to_carts AS FLOAT64))
+    ]) AS m
+  GROUP BY 1, 2
+)
+
+SELECT
+  CURRENT_DATE('${constants.TIMEZONE}') AS metric_date,
+  hour_local,
+  metric,
+  today_value,
+  baseline_value,
+  SAFE_DIVIDE(today_value - baseline_value, NULLIF(baseline_sd, 0)) AS zscore,
+  SAFE_DIVIDE(today_value - baseline_value, baseline_value) AS deviation_pct,
+  hour_local < EXTRACT(HOUR FROM CURRENT_DATETIME('${constants.TIMEZONE}')) AS is_complete_hour,
+  hour_local < EXTRACT(HOUR FROM CURRENT_DATETIME('${constants.TIMEZONE}'))
+    AND ABS(SAFE_DIVIDE(today_value - baseline_value, NULLIF(baseline_sd, 0))) > 3
+    AND ABS(SAFE_DIVIDE(today_value - baseline_value, baseline_value)) > 0.3 AS is_anomaly,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM compare

@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_query_cannibalization",
+  disabled: !constants.ENABLE.search_console,
+  description: "Keyword cannibalization (last 28 days): queries where 2+ pages of the site split the impressions and none of them dominates. Google does not know which page to rank, so all of them rank worse",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo" }
+  },
+  tags: ["marts", "seo", "daily", "search_console", "optional"],
+  columns: {
+    top_page_share: "Impressions of the best page / impressions of the query. < 0.6 with 2+ pages = cannibalization"
+  }
+}
+
+WITH per_page AS (
+  SELECT query, page_path, SUM(impressions) AS impressions, SUM(clicks) AS clicks, SAFE_DIVIDE(SUM(sum_position), SUM(impressions)) + 1 AS position
+  FROM ${ref("stg_gsc__url_impressions")}
+  WHERE data_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+    AND search_type = 'WEB'
+    AND NOT is_anonymized_query
+  GROUP BY 1, 2
+  HAVING SUM(impressions) >= 20
+)
+
+SELECT
+  query,
+  COUNT(*) AS competing_pages,
+  SUM(impressions) AS impressions,
+  SUM(clicks) AS clicks,
+  SAFE_DIVIDE(MAX(impressions), SUM(impressions)) AS top_page_share,
+  ARRAY_AGG(STRUCT(page_path, impressions, clicks, position) ORDER BY impressions DESC LIMIT 5) AS pages,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_page
+GROUP BY query
+HAVING COUNT(*) >= 2 AND SAFE_DIVIDE(MAX(impressions), SUM(impressions)) < 0.6 AND SUM(impressions) >= 200

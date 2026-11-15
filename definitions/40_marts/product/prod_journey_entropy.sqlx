@@ -1,0 +1,70 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_journey_entropy",
+  description: "Shannon entropy of each user journey (last 90 days): how diverse are the channels and the page types of the user. Focused users (low entropy) vs explorers (high entropy) and the conversion of each bucket. Nobody looks at journeys like this, and it says a lot",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "data_science"],
+  columns: {
+    channel_entropy_bucket: "0 = one channel only. ~1 = two channels equally used. 2+ = many channels",
+    page_type_entropy_bucket: "Same idea with page types"
+  }
+}
+
+WITH
+user_channels AS (
+  SELECT user_key, session_default_channel_group AS item, COUNT(*) AS n
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+),
+
+user_page_types AS (
+  SELECT user_key, page_type AS item, COUNT(*) AS n
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+  GROUP BY 1, 2
+),
+
+entropy_channels AS (
+  SELECT user_key, -SUM(p * LOG(p, 2)) AS channel_entropy, SUM(n) AS sessions
+  FROM (SELECT user_key, n, n / SUM(n) OVER (PARTITION BY user_key) AS p FROM user_channels)
+  GROUP BY user_key
+),
+
+entropy_pages AS (
+  SELECT user_key, -SUM(p * LOG(p, 2)) AS page_type_entropy
+  FROM (SELECT user_key, n / SUM(n) OVER (PARTITION BY user_key) AS p FROM user_page_types)
+  GROUP BY user_key
+),
+
+users AS (
+  SELECT
+    c.user_key,
+    c.channel_entropy,
+    p.page_type_entropy,
+    c.sessions,
+    u.transactions > 0 AS is_customer,
+    u.lifetime_revenue
+  FROM entropy_channels AS c
+  LEFT JOIN entropy_pages AS p USING (user_key)
+  JOIN ${ref("dim_users")} AS u USING (user_key)
+  WHERE c.sessions >= 2
+)
+
+SELECT
+  CASE WHEN channel_entropy = 0 THEN '0 (single channel)' WHEN channel_entropy < 1 THEN '0-1' WHEN channel_entropy < 1.6 THEN '1-1.6' ELSE '1.6+' END AS channel_entropy_bucket,
+  CASE WHEN page_type_entropy IS NULL THEN '(no pages)' WHEN page_type_entropy < 1 THEN '0-1' WHEN page_type_entropy < 2 THEN '1-2' ELSE '2+' END AS page_type_entropy_bucket,
+  COUNT(*) AS users,
+  AVG(sessions) AS avg_sessions,
+  SAFE_DIVIDE(COUNTIF(is_customer), COUNT(*)) AS customer_rate,
+  AVG(lifetime_revenue) AS avg_lifetime_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM users
+GROUP BY 1, 2

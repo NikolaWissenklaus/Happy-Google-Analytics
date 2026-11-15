@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_user_property_registry",
+  description: "Every user property seen: types, approximate distinct values, devices with it in the last 7 days, first / last day and status (new / gone / type_drift / ok). GA4 standard allows 25 user scoped custom dimensions, this shows what is competing for them",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"]
+}
+
+WITH per_property AS (
+  SELECT
+    property_key,
+    MIN(event_date) AS first_seen_date,
+    MAX(event_date) AS last_seen_date,
+    ARRAY_AGG(DISTINCT value_type IGNORE NULLS) AS value_types,
+    LOGICAL_OR(value_type = 'string') AND LOGICAL_OR(value_type IN ('int', 'double', 'float')) AS has_type_drift,
+    APPROX_COUNT_DISTINCT(property_value) AS distinct_values,
+    COUNT(DISTINCT IF(event_date >= ${helpers.daysAgo(7)}, user_pseudo_id, NULL)) AS devices_last_7d
+  FROM ${ref("stg_ga4__user_properties")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+  GROUP BY property_key
+)
+
+SELECT
+  *,
+  CASE
+    WHEN first_seen_date >= ${helpers.daysAgo(7)} THEN 'new'
+    WHEN last_seen_date < ${helpers.daysAgo(3)} THEN 'gone'
+    WHEN has_type_drift THEN 'type_drift'
+    ELSE 'ok'
+  END AS status,
+  LENGTH(property_key) > ${cfg_tracking_plan.naming.max_user_property_name_length} AS name_over_ga4_limit,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_property

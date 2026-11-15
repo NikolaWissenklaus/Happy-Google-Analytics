@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "format_duration",
+  description: "Seconds to 'HH:MM:SS', like the old UA 'Avg. Session Duration' (00:02:37)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "calendar"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(seconds FLOAT64) RETURNS STRING AS ((
+  SELECT IF(s IS NULL, NULL, FORMAT('%02d:%02d:%02d', DIV(s, 3600), MOD(DIV(s, 60), 60), MOD(s, 60)))
+  FROM (SELECT CAST(ROUND(GREATEST(seconds, 0)) AS INT64) AS s)
+))
+OPTIONS (description = "Duration formatting")

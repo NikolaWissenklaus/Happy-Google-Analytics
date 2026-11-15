@@ -1,0 +1,64 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_consent_by_page",
+  description: "Consent per page (page views of the last 30 days). Finds the pages where the cookie banner is broken or missing: unknown consent way above the site, or denied rate way off (z-score against the other pages). New landing page template without the CMP is the classic one",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    denied_rate_z: "z-score of the denied rate against all pages with 100+ views (weighted by views)",
+    looks_broken: "unknown share above 50% or denied rate z-score above 3, with 100+ views"
+  }
+}
+
+WITH
+page_views AS (
+  SELECT
+    COALESCE(page_hostname, '(not set)') AS hostname,
+    COALESCE(page_path, '(not set)') AS page_path,
+    consent_analytics_storage,
+    consent_ads_storage
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND event_name = 'page_view'
+    ${helpers.noiseFilter()}
+),
+
+per_page AS (
+  SELECT
+    hostname,
+    page_path,
+    COUNT(*) AS views,
+    SAFE_DIVIDE(COUNTIF(consent_ads_storage = 'granted'), COUNT(*)) AS ads_granted_share,
+    SAFE_DIVIDE(COUNTIF(consent_ads_storage = 'denied'), COUNT(*)) AS ads_denied_share,
+    SAFE_DIVIDE(COUNTIF(consent_analytics_storage = 'denied'), COUNTIF(consent_analytics_storage IN ('granted', 'denied'))) AS analytics_denied_rate,
+    SAFE_DIVIDE(COUNTIF(consent_analytics_storage = 'unknown'), COUNT(*)) AS unknown_share
+  FROM page_views
+  GROUP BY hostname, page_path
+),
+
+site_stats AS (
+  SELECT
+    SUM(views * analytics_denied_rate) / SUM(views) AS avg_denied_rate,
+    SQRT(SUM(views * POW(analytics_denied_rate, 2)) / SUM(views) - POW(SUM(views * analytics_denied_rate) / SUM(views), 2)) AS sd_denied_rate
+  FROM per_page
+  WHERE views >= 100
+    AND analytics_denied_rate IS NOT NULL
+)
+
+SELECT
+  p.*,
+  s.avg_denied_rate AS site_denied_rate,
+  SAFE_DIVIDE(p.analytics_denied_rate - s.avg_denied_rate, NULLIF(s.sd_denied_rate, 0)) AS denied_rate_z,
+  p.views >= 100 AND (
+    p.unknown_share > 0.5
+    OR COALESCE(ABS(SAFE_DIVIDE(p.analytics_denied_rate - s.avg_denied_rate, NULLIF(s.sd_denied_rate, 0))) > 3, FALSE)
+  ) AS looks_broken,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_page AS p
+CROSS JOIN site_stats AS s
+WHERE p.views >= 20

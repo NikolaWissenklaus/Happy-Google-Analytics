@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_tracking_breaks",
+  description: "Events that died or collapsed: compared the last 3 complete days with the 28 days before, per event and platform. 'add_to_cart went from 4k/day to 0 since wednesday' is a deploy that removed the tag, and nobody noticed for a month in most companies",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "alerts", "tracking"],
+  columns: {
+    break_type: "dead (zero in the last 3 days) | collapsed (< 30% of the baseline) | new_event (did not exist in the baseline) | spike (> 5x)"
+  }
+}
+
+WITH
+daily AS (
+  SELECT event_date, platform, event_name, COUNT(*) AS events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 DAY)
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2, 3
+),
+
+windows AS (
+  SELECT
+    platform,
+    event_name,
+    SUM(IF(event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), events, 0)) / 3 AS recent_per_day,
+    SUM(IF(event_date < DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY), events, 0)) / 28 AS baseline_per_day,
+    MAX(IF(events > 0, event_date, NULL)) AS last_day_with_events
+  FROM daily
+  GROUP BY 1, 2
+)
+
+SELECT
+  platform,
+  event_name,
+  baseline_per_day,
+  recent_per_day,
+  SAFE_DIVIDE(recent_per_day, baseline_per_day) AS recent_vs_baseline,
+  last_day_with_events,
+  CASE
+    WHEN baseline_per_day >= 10 AND recent_per_day = 0 THEN 'dead'
+    WHEN baseline_per_day >= 50 AND recent_per_day < 0.3 * baseline_per_day THEN 'collapsed'
+    WHEN baseline_per_day = 0 AND recent_per_day >= 10 THEN 'new_event'
+    WHEN baseline_per_day >= 50 AND recent_per_day > 5 * baseline_per_day THEN 'spike'
+  END AS break_type,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM windows
+WHERE (baseline_per_day >= 10 AND recent_per_day = 0)
+   OR (baseline_per_day >= 50 AND recent_per_day < 0.3 * baseline_per_day)
+   OR (baseline_per_day = 0 AND recent_per_day >= 10)
+   OR (baseline_per_day >= 50 AND recent_per_day > 5 * baseline_per_day)

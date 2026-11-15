@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_duplicates_daily",
+  description: "Duplicates per day (last 60 days): exact duplicated rows in the export, purchases sent more than once (thank you page reload), and page views fired twice in less than 1 second (double tagging: gtag + GTM, or SPA history + page load)",
+  bigquery: {
+    partitionBy: "check_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"]
+}
+
+WITH
+export_dups AS (
+  SELECT event_date AS check_date, SUM(duplicated_rows_removed) AS duplicated_rows, SUM(events) AS events
+  FROM ${ref("dq_daily_volumes")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+purchase_dups AS (
+  SELECT
+    event_date AS check_date,
+    COUNT(*) AS purchase_events,
+    COUNT(DISTINCT transaction_id) AS distinct_transactions
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+    AND event_name = 'purchase'
+    AND transaction_id IS NOT NULL
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+),
+
+page_view_dups AS (
+  SELECT
+    event_date AS check_date,
+    COUNTIF(is_reload AND seconds_since_previous_view < 1) AS double_page_views,
+    COUNT(*) AS page_views
+  FROM ${ref("int_ga4__page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+checks AS (
+  SELECT check_date, 'exact_duplicated_rows' AS check_name, SAFE_DIVIDE(duplicated_rows, events + duplicated_rows) AS value, 0.001 AS warn_at, 0.01 AS fail_at, duplicated_rows AS affected FROM export_dups
+  UNION ALL SELECT check_date, 'purchase_sent_more_than_once', SAFE_DIVIDE(purchase_events - distinct_transactions, purchase_events), 0.01, 0.05, purchase_events - distinct_transactions FROM purchase_dups
+  UNION ALL SELECT check_date, 'page_view_double_tagging', SAFE_DIVIDE(double_page_views, page_views), 0.01, 0.05, double_page_views FROM page_view_dups
+)
+
+SELECT
+  check_date,
+  'uniqueness' AS check_group,
+  check_name,
+  value,
+  affected,
+  warn_at,
+  fail_at,
+  CASE WHEN value IS NULL THEN 'no_data' WHEN value >= fail_at THEN 'fail' WHEN value >= warn_at THEN 'warn' ELSE 'pass' END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checks

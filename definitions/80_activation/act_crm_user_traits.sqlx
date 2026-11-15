@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_crm_user_traits",
+  description: "Reverse ETL for the CRM / CDP (Salesforce, HubSpot, RD Station...): one row per identified customer (user_id) with what the site knows and the CRM does not: lifecycle, RFM, value and engagement tiers, purchase propensity, churn risk, CLV (BTYD), favorite category, main channel and device, open cart / checkout. Only users that can_send_to_crm",
+  bigquery: {
+    clusterBy: ["user_id"],
+    labels: { layer: "activation", destination: "crm" }
+  },
+  tags: ["activation", "daily", "crm"],
+  columns: {
+    traits_fingerprint: "Changes when any trait changes. The sync job sends only the rows whose fingerprint is different from the last sync",
+    score_method: "heuristic (no BQML) or bqml"
+  }
+}
+
+WITH
+favorite_category AS (
+  SELECT user_key, item_category AS favorite_category
+  FROM ${ref("seg_category_affinity")}
+  WHERE affinity_rank = 1
+),
+
+traits AS (
+  SELECT
+    e.user_id,
+    e.user_key,
+    l.lifecycle_stage,
+    f.rfm_segment,
+    f.value_tier,
+    f.engagement_tier,
+    ROUND(f.purchase_propensity, 4) AS purchase_propensity,
+    ROUND(f.churn_risk, 4) AS churn_risk,
+    f.score_method,
+    ROUND(b.clv_revenue, 2) AS predicted_clv,
+    b.clv_decile,
+    ROUND(b.p_alive, 4) AS p_alive,
+    fc.favorite_category,
+    u.main_channel,
+    u.main_device,
+    u.last_uf,
+    u.first_seen_date,
+    u.last_seen_date,
+    u.transactions AS orders,
+    ROUND(u.lifetime_revenue, 2) AS lifetime_revenue,
+    u.first_purchase_date,
+    u.last_purchase_date,
+    f.has_open_cart,
+    ROUND(f.open_cart_value, 2) AS open_cart_value,
+    f.has_open_checkout,
+    f.predicted_next_purchase_date
+  FROM ${ref("act_consent_eligible_users")} AS e
+  JOIN ${ref("dim_users")} AS u USING (user_key)
+  LEFT JOIN ${ref("aud_user_features")} AS f USING (user_key)
+  LEFT JOIN ${ref("seg_lifecycle")} AS l USING (user_key)
+  LEFT JOIN ${ref("ds_btyd_customer_clv")} AS b USING (user_key)
+  LEFT JOIN favorite_category AS fc USING (user_key)
+  WHERE e.can_send_to_crm
+    AND e.user_id IS NOT NULL
+)
+
+SELECT
+  *,
+  FARM_FINGERPRINT(TO_JSON_STRING(STRUCT(
+    lifecycle_stage, rfm_segment, value_tier, engagement_tier, ROUND(purchase_propensity, 2) AS p, ROUND(churn_risk, 2) AS c,
+    clv_decile, favorite_category, main_channel, orders, has_open_cart, has_open_checkout
+  ))) AS traits_fingerprint,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM traits

@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_ltv",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML regressor: revenue of the user in the next 90 days (predicted LTV). Only snapshots old enough to have the 90 day label",
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = '${cfg_ds.ltv.model_type}',
+  input_label_cols = ['future_revenue_90d'],
+  data_split_method = 'RANDOM',
+  data_split_eval_fraction = 0.2,
+  enable_global_explain = TRUE
+) AS
+SELECT
+  ${cfg_ds.features.model_columns.join(",\n  ")},
+  future_revenue_90d
+FROM ${ref("ds_feature_snapshots")}
+WHERE NOT is_current_snapshot
+  AND future_revenue_90d IS NOT NULL

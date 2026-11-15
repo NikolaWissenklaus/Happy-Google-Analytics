@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_consent_eligible_users",
+  description: "The gate of the activation layer: one row per user with the latest consent and what can be done with them (ads platforms, GA4 write back, CRM). Users with a revocation / deletion request are blocked here, whatever the consent says. Every act_ table joins this one, and priv_activation_consent_audit checks that they really do",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "activation", domain: "privacy" }
+  },
+  tags: ["activation", "daily", "lgpd"],
+  columns: {
+    can_send_to_ads: "Latest ads_storage = granted and no revocation / deletion request. Google Ads, Meta and audiences",
+    can_write_back_ga4: "Latest analytics_storage = granted and no request. Measurement Protocol user properties",
+    can_send_to_crm: "Identified (user_id), analytics not denied and no request. CRM traits and triggers",
+    blocked_by_request: "Has a revocation / deletion / anonymization request (any status except rejected)"
+  }
+}
+
+WITH
+blocked AS (
+  SELECT DISTINCT value AS user_key
+  FROM ${ref("priv_dsr_identifiers")}
+  WHERE id_type = 'user_key'
+    AND request_type IN ('revocation', 'deletion', 'anonymization')
+    AND status != 'rejected'
+)
+
+SELECT
+  u.user_key,
+  u.user_id,
+  u.last_user_pseudo_id AS user_pseudo_id,
+  u.is_identified,
+  u.latest_consent_ads,
+  u.latest_consent_analytics,
+  b.user_key IS NOT NULL AS blocked_by_request,
+  u.latest_consent_ads = 'granted' AND b.user_key IS NULL AS can_send_to_ads,
+  u.latest_consent_analytics = 'granted' AND b.user_key IS NULL AS can_write_back_ga4,
+  u.is_identified AND COALESCE(u.latest_consent_analytics, 'unknown') != 'denied' AND b.user_key IS NULL AS can_send_to_crm,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dim_users")} AS u
+LEFT JOIN blocked AS b USING (user_key)

@@ -1,0 +1,122 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__session_bot_signals",
+  description: "Bot / spam score per session (0-100) from simple signals: datacenter city, robotic speed, ghost hostnames, empty sessions, devices with dozens of sessions a day, and the 'one and done' new device (one page / screen, nothing engaged, not active, nothing converted), which alone never flags. GA4 filters known bots, not the smart ones",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["is_bot_suspect"],
+    labels: { layer: "intermediate", domain: "data_quality" }
+  },
+  tags: ["ga4", "intermediate", "daily", "data_quality"],
+  columns: {
+    bot_score: "0 = looks human, 100 = definitely not a person. Sum of the signal weights, capped",
+    bot_signals: "Which signals fired",
+    is_bot_suspect: "bot_score >= cfg_project.bot.min_score_to_flag"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["int_ga4__sessions_base"] })}
+}
+
+WITH
+-- what sessions_base does not have: distinct page paths (page_path has no query string, so
+-- ?utm=... does not make a "second page"), app screens and classes, and the GA4 active user
+-- flag (per user and day in the export, NULL before jul/2023)
+session_extras AS (
+  SELECT
+    session_key,
+    COUNT(DISTINCT IF(event_name = 'page_view', page_path, NULL)) AS distinct_paths,
+    COUNT(DISTINCT IF(event_name = 'screen_view', screen_name, NULL)) AS distinct_screens,
+    COUNT(DISTINCT IF(event_name = 'screen_view', screen_class, NULL)) AS distinct_screen_classes,
+    LOGICAL_OR(is_active_user) AS was_active_user
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+    AND session_key IS NOT NULL
+  GROUP BY session_key
+),
+
+sessions_in_window AS (
+  SELECT
+    s.*,
+    x.distinct_paths,
+    x.distinct_screens,
+    x.distinct_screen_classes,
+    x.was_active_user,
+    COUNT(*) OVER (PARTITION BY s.user_pseudo_id, s.session_date) AS device_sessions_that_day
+  FROM ${ref("int_ga4__sessions_base")} AS s
+  LEFT JOIN session_extras AS x USING (session_key)
+  WHERE s.session_date >= run_from
+),
+
+check_signals AS (
+  SELECT
+    session_key,
+    session_date,
+    user_pseudo_id,
+    -- each signal: (fired?, weight)
+    geo_city IN (SELECT city FROM ${ref("seed_bot_datacenter_cities")}) AS from_datacenter_city,
+    SAFE_DIVIDE(event_count, GREATEST(session_duration_sec / 60, 1)) > ${cfg_project.bot.max_events_per_minute} AS robotic_speed,
+    is_non_production_host AS ghost_hostname,
+    event_count <= 2 AND engagement_time_msec = 0 AND page_views <= 1 AND NOT has_first_visit AS empty_session,
+    COALESCE(device_browser, '(not set)') = '(not set)' AND COALESCE(device_os, '(not set)') = '(not set)' AS unknown_browser_and_os,
+    COALESCE(device_language, '') IN ('', 'c', 'zz', '(not set)') AND platform = 'WEB' AS weird_language,
+    device_sessions_that_day > 20 AS too_many_sessions_device,
+    page_views >= 30 AND session_duration_sec < 60 AS page_scraper,
+    -- one and done: everything a cookieless bot looks like, and also a real person that left.
+    -- weak on purpose (cfg_project.bot.one_and_done_weight), it only counts with other signals
+    is_new_user
+      AND COALESCE(distinct_paths, 0) <= 1
+      AND COALESCE(distinct_screens, 0) <= 1
+      AND COALESCE(distinct_screen_classes, 0) <= 1
+      AND NOT is_engaged
+      AND COALESCE(NOT was_active_user, TRUE)
+      AND raw_key_events = 0
+      AND purchase_events = 0 AS one_and_done_new_device
+  FROM sessions_in_window
+),
+
+score_it AS (
+  SELECT
+    *,
+    LEAST(100,
+      IF(from_datacenter_city, 35, 0)
+      + IF(robotic_speed, 30, 0)
+      + IF(ghost_hostname, 45, 0)
+      + IF(empty_session, 10, 0)
+      + IF(unknown_browser_and_os, 15, 0)
+      + IF(weird_language, 10, 0)
+      + IF(too_many_sessions_device, 30, 0)
+      + IF(page_scraper, 40, 0)
+      + IF(one_and_done_new_device, ${cfg_project.bot.one_and_done_weight}, 0)
+    ) AS bot_score,
+    ARRAY_CONCAT(
+      IF(from_datacenter_city, ['datacenter_city'], []),
+      IF(robotic_speed, ['robotic_speed'], []),
+      IF(ghost_hostname, ['ghost_hostname'], []),
+      IF(empty_session, ['empty_session'], []),
+      IF(unknown_browser_and_os, ['unknown_browser_and_os'], []),
+      IF(weird_language, ['weird_language'], []),
+      IF(too_many_sessions_device, ['too_many_sessions_device'], []),
+      IF(page_scraper, ['page_scraper'], []),
+      IF(one_and_done_new_device, ['one_and_done_new_device'], [])
+    ) AS bot_signals
+  FROM check_signals
+)
+
+SELECT
+  session_key,
+  session_date,
+  user_pseudo_id,
+  bot_score,
+  bot_signals,
+  bot_score >= ${cfg_project.bot.min_score_to_flag} AS is_bot_suspect,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM score_it
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

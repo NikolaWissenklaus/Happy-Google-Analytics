@@ -1,0 +1,49 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  uniqueKey: ["dimension", "value"],
+  schema: constants.SCHEMAS.watch,
+  name: "watch_dimension_values",
+  description: "Memory of every value ever seen for the dimensions that should not change much (hostnames, streams, app versions, currencies, payment types, shipping tiers, browsers, OS, countries, languages, event source / medium, content groups, traffic_type). first_seen_date never moves, so 'new value this week' is one WHERE away (watch_new_values)",
+  bigquery: {
+    clusterBy: ["dimension"],
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    recent_events: "Events with the value in the last processed window (lookback_days on incremental runs, all history on full refresh)"
+  }
+}
+
+js {
+  const dims = ["hostname", "stream_id", "platform", "app_version", "device_os", "device_browser", "device_language",
+    "geo_country", "currency", "payment_type", "shipping_tier", "event_source", "event_medium", "content_group", "traffic_type"];
+}
+
+WITH
+recent AS (
+  SELECT
+    d.dimension,
+    d.value,
+    MIN(e.event_date) AS first_seen_date,
+    MAX(e.event_date) AS last_seen_date,
+    COUNT(*) AS recent_events
+  FROM ${ref("stg_ga4__events")} AS e,
+    UNNEST([
+      ${dims.map(d => `STRUCT('${d}' AS dimension, CAST(e.${d} AS STRING) AS value)`).join(",\n      ")}
+    ]) AS d
+  WHERE e.event_date >= ${incremental() ? helpers.daysAgo(constants.LOOKBACK_DAYS) : `DATE '${constants.START_DATE}'`}
+    AND d.value IS NOT NULL
+  GROUP BY 1, 2
+)
+
+SELECT
+  r.dimension,
+  r.value,
+  ${incremental() ? `LEAST(COALESCE(old.first_seen_date, r.first_seen_date), r.first_seen_date)` : `r.first_seen_date`} AS first_seen_date,
+  ${incremental() ? `GREATEST(COALESCE(old.last_seen_date, r.last_seen_date), r.last_seen_date)` : `r.last_seen_date`} AS last_seen_date,
+  r.recent_events,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM recent AS r
+${incremental() ? `LEFT JOIN ${self()} AS old USING (dimension, value)` : ``}

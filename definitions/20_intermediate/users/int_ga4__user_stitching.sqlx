@@ -1,0 +1,141 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__user_stitching",
+  description: "Identity resolution: every device (user_pseudo_id) gets a user_key. Devices that ever logged in get the user_id, also for the anonymous sessions BEFORE the login (retroactive stitching, GA4 does not do that in BigQuery). Devices that never logged in inherit the person of their identity graph cluster (same order / same ad click, int_ga4__identity_graph). Placeholder and shared user_ids never stitch",
+  bigquery: {
+    clusterBy: ["user_pseudo_id", "user_key"],
+    labels: { layer: "intermediate", domain: "identity" }
+  },
+  tags: ["ga4", "intermediate", "daily", "identity"],
+  columns: Object.assign(docs.pick("user_pseudo_id", "user_key"), {
+    resolved_user_id: "user_id of the device: its own most recent login, else the one inherited from the identity graph",
+    identity_method: "login | linked_by_transaction | linked_by_click_id | merged_anonymous (devices of the same person, nobody logged in) | device_only",
+    is_identified: "Has a user_id (own login or inherited)",
+    is_identified_by_login: "Logged in on THIS device",
+    is_shared_device: "More than one user_id logged in this device (family computer, store tablet...)",
+    devices_of_user: "Devices with the same user_key (cross device)",
+    had_ignored_user_id: "The device sent a placeholder ('undefined', '0'...) or a shared account user_id, ignored on purpose"
+  })
+}
+
+js {
+  const placeholders = helpers.sqlList(cfg_identity.user_id_placeholders);
+}
+
+-- rule for shared devices: the most recent user_id wins. not perfect, but it is the
+-- same thing most CDPs do and it is explainable to the business.
+WITH
+raw_pairs AS (
+  SELECT
+    user_pseudo_id,
+    user_id,
+    MIN(first_seen_ts) AS first_seen_ts,
+    MAX(last_seen_ts) AS last_seen_ts,
+    SUM(events) AS events,
+    LOWER(TRIM(user_id)) IN (${placeholders}) OR TRIM(user_id) = '' AS is_placeholder
+  FROM ${ref("int_ga4__user_id_pairs_daily")}
+  GROUP BY 1, 2
+),
+
+overshared_user_ids AS (
+  SELECT user_id
+  FROM raw_pairs
+  WHERE NOT is_placeholder
+  GROUP BY user_id
+  HAVING COUNT(*) > ${cfg_identity.max_devices_per_user_id}
+),
+
+pairs AS (
+  SELECT r.*
+  FROM raw_pairs AS r
+  LEFT JOIN overshared_user_ids AS o USING (user_id)
+  WHERE NOT r.is_placeholder
+    AND o.user_id IS NULL
+),
+
+ignored AS (
+  SELECT DISTINCT user_pseudo_id
+  FROM raw_pairs AS r
+  LEFT JOIN overshared_user_ids AS o USING (user_id)
+  WHERE r.is_placeholder OR o.user_id IS NOT NULL
+),
+
+per_device AS (
+  SELECT
+    user_pseudo_id,
+    ARRAY_AGG(user_id ORDER BY last_seen_ts DESC LIMIT 1)[OFFSET(0)] AS own_user_id,
+    COUNT(DISTINCT user_id) AS user_ids_on_device,
+    MIN(first_seen_ts) AS first_login_ts
+  FROM pairs
+  GROUP BY 1
+),
+
+all_devices AS (
+  SELECT
+    user_pseudo_id,
+    MIN(session_start_ts) AS first_seen_ts,
+    MAX(session_start_ts) AS last_seen_ts,
+    COUNT(*) AS sessions
+  FROM ${ref("int_ga4__sessions_base")}
+  GROUP BY 1
+),
+
+resolve AS (
+  SELECT
+    d.*,
+    p.own_user_id,
+    p.user_ids_on_device,
+    p.first_login_ts,
+    g.cluster_id,
+    g.cluster_devices,
+    g.device_link_types,
+    -- the graph only counts when the cluster is sane
+    IF(COALESCE(g.is_oversized_cluster, TRUE), NULL, g.cluster_user_id) AS graph_user_id,
+    NOT COALESCE(g.is_oversized_cluster, TRUE) AND g.cluster_devices > 1 AS has_graph_cluster,
+    i.user_pseudo_id IS NOT NULL AS had_ignored_user_id
+  FROM all_devices AS d
+  LEFT JOIN per_device AS p USING (user_pseudo_id)
+  LEFT JOIN ${ref("int_ga4__identity_graph")} AS g USING (user_pseudo_id)
+  LEFT JOIN ignored AS i USING (user_pseudo_id)
+),
+
+with_key AS (
+  SELECT
+    *,
+    COALESCE(own_user_id, graph_user_id) AS resolved_user_id,
+    CASE
+      WHEN own_user_id IS NOT NULL THEN CONCAT('uid:', own_user_id)
+      WHEN graph_user_id IS NOT NULL THEN CONCAT('uid:', graph_user_id)
+      WHEN has_graph_cluster THEN CONCAT('dev:', cluster_id)
+      ELSE CONCAT('dev:', user_pseudo_id)
+    END AS user_key,
+    CASE
+      WHEN own_user_id IS NOT NULL THEN 'login'
+      WHEN graph_user_id IS NOT NULL AND 'transaction' IN UNNEST(device_link_types) THEN 'linked_by_transaction'
+      WHEN graph_user_id IS NOT NULL THEN 'linked_by_click_id'
+      WHEN has_graph_cluster THEN 'merged_anonymous'
+      ELSE 'device_only'
+    END AS identity_method
+  FROM resolve
+)
+
+SELECT
+  user_pseudo_id,
+  resolved_user_id,
+  user_key,
+  identity_method,
+  resolved_user_id IS NOT NULL AS is_identified,
+  own_user_id IS NOT NULL AS is_identified_by_login,
+  COALESCE(user_ids_on_device, 0) AS user_ids_on_device,
+  COALESCE(user_ids_on_device, 0) > 1 AS is_shared_device,
+  COUNT(*) OVER (PARTITION BY user_key) AS devices_of_user,
+  had_ignored_user_id,
+  first_login_ts,
+  first_seen_ts,
+  last_seen_ts,
+  sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_key

@@ -1,0 +1,56 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_events_daily",
+  description: "UA Behavior > Events with Category / Action / Label: uses the UA style params when the site still sends them (cfg_project.ua_event_params, very common after migrations), otherwise category = event name. Total events, unique events (sessions), event value",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_category"],
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"],
+  columns: {
+    unique_events: "Sessions with the event (UA counted unique events per session)"
+  }
+}
+
+js {
+  const p = cfg_project.ua_event_params;
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH events AS (
+  SELECT
+    event_date,
+    session_key,
+    COALESCE(${ga4.paramAny(p.category)}, event_name) AS event_category,
+    COALESCE(${ga4.paramAny(p.action)}, '(not set)') AS event_action,
+    COALESCE(${ga4.paramAny(p.label)}, '(not set)') AS event_label,
+    event_value
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+    AND event_name NOT IN ('session_start', 'first_visit', 'user_engagement', 'page_view', 'screen_view')
+    ${helpers.noiseFilter()}
+)
+
+SELECT
+  event_date,
+  event_category,
+  event_action,
+  event_label,
+  COUNT(*) AS total_events,
+  COUNT(DISTINCT session_key) AS unique_events,
+  SUM(COALESCE(event_value, 0)) AS event_value,
+  SAFE_DIVIDE(SUM(COALESCE(event_value, 0)), COUNT(*)) AS avg_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM events
+GROUP BY 1, 2, 3, 4
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

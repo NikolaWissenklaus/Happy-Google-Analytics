@@ -1,0 +1,149 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.lifts,
+  name: "lift_interventions_daily",
+  description: "Day by day of every intervention of cfg_lifts.js (new checkout, redesign, price change, TV...): the actual value of each metric and the counterfactual (what would have happened without the change). Counterfactual = control series x the pre period ratio of the same weekday when the intervention has a control, else weekday level + linear trend of the pre period (interrupted time series). The chart of lift_interventions",
+  bigquery: {
+    labels: { layer: "marts", domain: "lifts" }
+  },
+  tags: ["marts", "lifts", "daily"],
+  columns: {
+    day_index: "Days from the start of the intervention (negative = pre period)",
+    counterfactual: "Expected value without the intervention",
+    effect: "actual - counterfactual. In the pre period it is the fit error"
+  }
+}
+
+js {
+  // dimensions an intervention can be limited to (segment) or compared with (control)
+  const dims = { device_category: "device_category", channel: "session_default_channel_group", uf: "geo_uf", platform: "platform" };
+  const dimValue = dimExpr => `CASE ${dimExpr} ${Object.entries(dims).map(([k, col]) => `WHEN '${k}' THEN x.${col}`).join(" ")} END`;
+  const measures = ["sessions", "engaged_sessions", "transactions", "revenue", "converting_sessions", "cart_sessions", "checkout_sessions"];
+  const metric = p => `CAST(CASE m
+      WHEN 'sessions' THEN ${p}_sessions
+      WHEN 'engaged_sessions' THEN ${p}_engaged_sessions
+      WHEN 'transactions' THEN ${p}_transactions
+      WHEN 'revenue' THEN ${p}_revenue
+      WHEN 'conversion_rate' THEN SAFE_DIVIDE(${p}_converting_sessions, ${p}_sessions)
+      WHEN 'engagement_rate' THEN SAFE_DIVIDE(${p}_engaged_sessions, ${p}_sessions)
+      WHEN 'average_order_value' THEN SAFE_DIVIDE(${p}_revenue, ${p}_transactions)
+      WHEN 'add_to_cart_rate' THEN SAFE_DIVIDE(${p}_cart_sessions, ${p}_sessions)
+      WHEN 'checkout_rate' THEN SAFE_DIVIDE(${p}_checkout_sessions, ${p}_sessions)
+    END AS FLOAT64)`;
+}
+
+WITH
+interventions AS (
+  SELECT * FROM ${ref("seed_lift_interventions")}
+),
+
+calendar AS (
+  SELECT
+    i.intervention_name,
+    i.segment_dimension,
+    i.segment_value,
+    i.control_dimension,
+    i.control_value,
+    d AS metric_date,
+    IF(d < i.start_date, 'pre', 'post') AS period,
+    DATE_DIFF(d, i.start_date, DAY) AS day_index
+  FROM interventions AS i,
+    UNNEST(GENERATE_DATE_ARRAY(
+      DATE_SUB(i.start_date, INTERVAL i.pre_days DAY),
+      LEAST(COALESCE(i.end_date, DATE_ADD(i.start_date, INTERVAL i.post_days - 1 DAY)), ${helpers.daysAgo(1)})
+    )) AS d
+),
+
+daily AS (
+  SELECT
+    session_date,
+    device_category,
+    session_default_channel_group,
+    geo_uf,
+    platform,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    COUNTIF(has_purchase) AS converting_sessions,
+    COUNTIF(has_add_to_cart) AS cart_sessions,
+    COUNTIF(has_begin_checkout) AS checkout_sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= (SELECT COALESCE(MIN(DATE_SUB(start_date, INTERVAL pre_days DAY)), ${helpers.today()}) FROM interventions)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+-- treated series (all, or only the segment) and control series, side by side
+series AS (
+  SELECT
+    c.intervention_name,
+    c.metric_date,
+    c.period,
+    c.day_index,
+    c.control_dimension IS NOT NULL AS has_control,
+    ${measures.map(m => `SUM(IF(c.segment_dimension IS NULL OR ${dimValue("c.segment_dimension")} = c.segment_value, x.${m}, 0)) AS t_${m}`).join(",\n    ")},
+    ${measures.map(m => `SUM(IF(c.control_dimension IS NOT NULL AND ${dimValue("c.control_dimension")} = c.control_value, x.${m}, 0)) AS c_${m}`).join(",\n    ")}
+  FROM calendar AS c
+  LEFT JOIN daily AS x ON x.session_date = c.metric_date
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+metric_values AS (
+  SELECT
+    s.intervention_name,
+    s.metric_date,
+    s.period,
+    s.day_index,
+    s.has_control,
+    m AS metric,
+    ${metric("s.t")} AS actual,
+    ${metric("s.c")} AS control_actual
+  FROM series AS s
+  JOIN interventions AS i USING (intervention_name),
+    UNNEST(i.metrics) AS m
+),
+
+pre_trend AS (
+  SELECT
+    intervention_name,
+    metric,
+    COALESCE(SAFE_DIVIDE(COVAR_SAMP(day_index, actual), VAR_SAMP(day_index)), 0) AS slope
+  FROM metric_values
+  WHERE period = 'pre'
+  GROUP BY 1, 2
+),
+
+pre_weekday AS (
+  SELECT
+    v.intervention_name,
+    v.metric,
+    EXTRACT(DAYOFWEEK FROM v.metric_date) AS weekday,
+    AVG(v.actual - t.slope * v.day_index) AS weekday_level,
+    SAFE_DIVIDE(SUM(v.actual), SUM(v.control_actual)) AS control_ratio
+  FROM metric_values AS v
+  JOIN pre_trend AS t USING (intervention_name, metric)
+  WHERE v.period = 'pre'
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  v.intervention_name,
+  v.metric,
+  v.metric_date,
+  v.period,
+  v.day_index,
+  v.actual,
+  v.control_actual,
+  IF(v.has_control, v.control_actual * w.control_ratio, w.weekday_level + t.slope * v.day_index) AS counterfactual,
+  v.actual - IF(v.has_control, v.control_actual * w.control_ratio, w.weekday_level + t.slope * v.day_index) AS effect,
+  IF(v.has_control, 'control_series', 'pre_period_trend') AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM metric_values AS v
+JOIN pre_trend AS t USING (intervention_name, metric)
+LEFT JOIN pre_weekday AS w
+  ON w.intervention_name = v.intervention_name
+  AND w.metric = v.metric
+  AND w.weekday = EXTRACT(DAYOFWEEK FROM v.metric_date)

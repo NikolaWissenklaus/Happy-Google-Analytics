@@ -1,0 +1,19 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "slugify",
+  description: "'Black Friday 2026 - Calçados' -> 'black-friday-2026-calcados'. Handy for campaign names",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(text STRING) RETURNS STRING AS (
+  NULLIF(REGEXP_REPLACE(
+    REGEXP_REPLACE(LOWER(REGEXP_REPLACE(NORMALIZE(text, NFD), r'\p{M}', '')), r'[^a-z0-9]+', '-'),
+    r'^-+|-+$', ''
+  ), '')
+)
+OPTIONS (description = "Slug from text")

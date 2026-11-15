@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_meta_ads__insights",
+  disabled: !constants.ENABLE.meta_ads,
+  description: "Meta Ads (Facebook / Instagram) daily insights at ad level, normalized. Expects the usual columns of Fivetran / Airbyte / Supermetrics exports",
+  bigquery: {
+    partitionBy: "cost_date",
+    clusterBy: ["campaign_id"],
+    labels: { layer: "staging", source: "meta_ads" }
+  },
+  tags: ["staging", "daily", "meta_ads", "optional"],
+  columns: {
+    cost_date: "Date (date_start of the insight)",
+    cost: "Spend in the account currency",
+    link_clicks: "inline_link_clicks when available (this is the one to compare with GA4 sessions, not 'clicks')"
+  }
+}
+
+-- expected columns in the source table (rename here if your connector uses other names):
+--   date_start, account_id, account_currency, campaign_id, campaign_name, adset_id, adset_name,
+--   ad_id, ad_name, spend, impressions, clicks, inline_link_clicks, reach
+SELECT
+  CAST(date_start AS DATE) AS cost_date,
+  CAST(account_id AS STRING) AS account_id,
+  account_currency,
+  CAST(campaign_id AS STRING) AS campaign_id,
+  campaign_name,
+  LOWER(campaign_name) AS campaign_name_lower,
+  CAST(adset_id AS STRING) AS adset_id,
+  adset_name,
+  CAST(ad_id AS STRING) AS ad_id,
+  ad_name,
+  SAFE_CAST(spend AS FLOAT64) AS cost,
+  SAFE_CAST(impressions AS INT64) AS impressions,
+  SAFE_CAST(clicks AS INT64) AS clicks,
+  COALESCE(SAFE_CAST(inline_link_clicks AS INT64), SAFE_CAST(clicks AS INT64)) AS link_clicks,
+  SAFE_CAST(reach AS INT64) AS reach,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref(constants.META_ADS.table)}
+WHERE CAST(date_start AS DATE) >= DATE '${constants.START_DATE}'

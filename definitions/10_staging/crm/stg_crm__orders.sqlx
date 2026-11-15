@@ -1,0 +1,73 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_crm__orders",
+  disabled: !constants.ENABLE.crm,
+  description: "Backend / ERP orders normalized. This is the source of truth for revenue: paid status, boleto/pix pending, cancellations and refunds",
+  bigquery: {
+    partitionBy: "order_date",
+    clusterBy: ["ga4_transaction_id", "customer_id"],
+    labels: { layer: "staging", source: "crm" }
+  },
+  tags: ["staging", "daily", "crm", "optional"],
+  columns: {
+    ga4_transaction_id: "The id sent to GA4 as transaction_id (usually the order number). Join key with fct_transactions",
+    order_status_group: "paid | pending | cancelled | refunded | other, from the hundred status names the ERP has",
+    is_paid: "Money in the account (paid, invoiced, shipped, delivered)"
+  }
+}
+
+-- expected columns (rename here for your ERP / VTEX / Shopify / Magento / Tray / Nuvemshop export):
+--   order_id, ga4_transaction_id, customer_id, user_id, order_created_at, order_status,
+--   payment_method, order_value, discount_value, shipping_value, coupon_code, paid_at,
+--   cancelled_at, refunded_value, sales_channel
+WITH raw_orders AS (
+  SELECT * FROM ${ref(constants.CRM.orders_table)}
+),
+
+normalize_status AS (
+  SELECT
+    *,
+    LOWER(TRIM(${ref("remove_accents")}(CAST(order_status AS STRING)))) AS status_clean
+  FROM raw_orders
+)
+
+SELECT
+  CAST(order_id AS STRING) AS order_id,
+  CAST(COALESCE(ga4_transaction_id, order_id) AS STRING) AS ga4_transaction_id,
+  CAST(customer_id AS STRING) AS customer_id,
+  CAST(user_id AS STRING) AS user_id,
+  CAST(order_created_at AS TIMESTAMP) AS order_ts,
+  DATE(CAST(order_created_at AS TIMESTAMP), '${constants.TIMEZONE}') AS order_date,
+  status_clean AS order_status,
+  CASE
+    WHEN REGEXP_CONTAINS(status_clean, r'(reembols|refund|estorn|chargeback|devolv|returned)') THEN 'refunded'
+    WHEN REGEXP_CONTAINS(status_clean, r'(cancel|expir|recus|denied|declin|fail|falh|invalid|fraud)') THEN 'cancelled'
+    WHEN REGEXP_CONTAINS(status_clean, r'(pend|aguard|waiting|em analise|review|boleto emitido|awaiting|processing pay)') THEN 'pending'
+    WHEN REGEXP_CONTAINS(status_clean, r'(pago|paid|aprovad|approved|faturad|invoiced|enviad|shipped|entreg|delivered|conclu|complete|separac|handling)') THEN 'paid'
+    ELSE 'other'
+  END AS order_status_group,
+  LOWER(CAST(payment_method AS STRING)) AS payment_method,
+  CASE
+    WHEN REGEXP_CONTAINS(LOWER(CAST(payment_method AS STRING)), r'boleto|bank.?slip|billet') THEN 'boleto'
+    WHEN REGEXP_CONTAINS(LOWER(CAST(payment_method AS STRING)), r'pix') THEN 'pix'
+    WHEN REGEXP_CONTAINS(LOWER(CAST(payment_method AS STRING)), r'credit|credito|cartao|card|visa|master|elo|amex|hiper') THEN 'credit_card'
+    WHEN REGEXP_CONTAINS(LOWER(CAST(payment_method AS STRING)), r'debit|debito') THEN 'debit_card'
+    WHEN REGEXP_CONTAINS(LOWER(CAST(payment_method AS STRING)), r'paypal|mercado ?pago|picpay|pagseguro|wallet|carteira|apple|google pay') THEN 'wallet'
+    ELSE 'other'
+  END AS payment_method_group,
+  SAFE_CAST(order_value AS FLOAT64) AS order_value,
+  SAFE_CAST(discount_value AS FLOAT64) AS discount_value,
+  SAFE_CAST(shipping_value AS FLOAT64) AS shipping_value,
+  UPPER(TRIM(CAST(coupon_code AS STRING))) AS coupon_code,
+  CAST(paid_at AS TIMESTAMP) AS paid_ts,
+  CAST(cancelled_at AS TIMESTAMP) AS cancelled_ts,
+  COALESCE(SAFE_CAST(refunded_value AS FLOAT64), 0) AS refunded_value,
+  LOWER(CAST(sales_channel AS STRING)) AS sales_channel,
+  REGEXP_CONTAINS(status_clean, r'(pago|paid|aprovad|approved|faturad|invoiced|enviad|shipped|entreg|delivered|conclu|complete|separac|handling)') AS is_paid,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM normalize_status
+WHERE DATE(CAST(order_created_at AS TIMESTAMP), '${constants.TIMEZONE}') >= DATE '${constants.START_DATE}'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(order_id AS STRING) ORDER BY CAST(order_created_at AS TIMESTAMP) DESC) = 1

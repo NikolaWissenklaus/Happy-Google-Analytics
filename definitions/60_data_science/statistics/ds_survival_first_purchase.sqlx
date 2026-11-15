@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_survival_first_purchase",
+  description: "Kaplan-Meier of 'time from the first visit to the first purchase' (days 0..90), overall and by first channel, with censoring for users that did not have time yet. Tells for how long it is worth to keep chasing a new visitor with remarketing",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily"]
+}
+
+WITH
+durations AS (
+  SELECT
+    first_channel,
+    LEAST(COALESCE(days_to_first_purchase, DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), first_seen_date, DAY)), 90) AS duration_days,
+    days_to_first_purchase IS NOT NULL AND days_to_first_purchase <= 90 AS had_event
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND COALESCE(days_to_first_purchase, 0) >= 0
+),
+
+segments AS (
+  SELECT 'all' AS segment, duration_days, had_event FROM durations
+  UNION ALL
+  SELECT COALESCE(first_channel, '(unknown)'), duration_days, had_event FROM durations
+),
+
+per_day AS (
+  SELECT segment, duration_days AS day, COUNTIF(had_event) AS events, COUNTIF(NOT had_event) AS censored
+  FROM segments
+  GROUP BY 1, 2
+),
+
+risk AS (
+  SELECT
+    *,
+    SUM(events + censored) OVER (PARTITION BY segment ORDER BY day DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS at_risk
+  FROM per_day
+)
+
+SELECT
+  segment,
+  day,
+  at_risk,
+  events,
+  censored,
+  EXP(SUM(LN(GREATEST(1 - SAFE_DIVIDE(events, at_risk), 1e-12))) OVER (PARTITION BY segment ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS survival_probability,
+  1 - EXP(SUM(LN(GREATEST(1 - SAFE_DIVIDE(events, at_risk), 1e-12))) OVER (PARTITION BY segment ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS cumulative_conversion_probability,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM risk

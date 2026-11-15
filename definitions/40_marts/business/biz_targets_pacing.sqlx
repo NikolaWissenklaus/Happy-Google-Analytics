@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_targets_pacing",
+  description: "Pacing of the current month against the target, day by day: expected cumulative revenue (target spread by the weekday profile of the last weeks), actual cumulative, gap, and the daily revenue needed from now on to hit the target",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    expected_cumulative_revenue: "Target x share of the month that should be done by this day (weekday weighted, not linear)",
+    required_daily_revenue: "What each remaining day must sell to hit the target"
+  }
+}
+
+WITH
+target AS (
+  SELECT revenue AS target_revenue
+  FROM ${ref("seed_monthly_targets")}
+  WHERE target_month = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH)
+),
+
+weekday_weight AS (
+  SELECT EXTRACT(DAYOFWEEK FROM kpi_date) AS weekday, AVG(valid_revenue) AS avg_revenue
+  FROM ${ref("ecom_daily_kpis")}
+  WHERE kpi_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 56 DAY)
+    AND kpi_date < CURRENT_DATE('${constants.TIMEZONE}')
+  GROUP BY 1
+),
+
+month_days AS (
+  SELECT
+    d AS day,
+    w.avg_revenue AS weight
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), LAST_DAY(CURRENT_DATE('${constants.TIMEZONE}')))) AS d
+  LEFT JOIN weekday_weight AS w ON w.weekday = EXTRACT(DAYOFWEEK FROM d)
+),
+
+actuals AS (
+  SELECT kpi_date AS day, valid_revenue AS revenue
+  FROM ${ref("ecom_daily_kpis")}
+  WHERE kpi_date >= DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH)
+)
+
+SELECT
+  m.day,
+  a.revenue AS actual_revenue,
+  SUM(a.revenue) OVER (ORDER BY m.day) AS actual_cumulative_revenue,
+  t.target_revenue,
+  t.target_revenue * SUM(m.weight) OVER (ORDER BY m.day) / SUM(m.weight) OVER () AS expected_cumulative_revenue,
+  SUM(a.revenue) OVER (ORDER BY m.day) - t.target_revenue * SUM(m.weight) OVER (ORDER BY m.day) / SUM(m.weight) OVER () AS gap_vs_expected,
+  SAFE_DIVIDE(
+    t.target_revenue - SUM(COALESCE(a.revenue, 0)) OVER (),
+    COUNTIF(m.day >= CURRENT_DATE('${constants.TIMEZONE}')) OVER ()
+  ) AS required_daily_revenue,
+  m.day >= CURRENT_DATE('${constants.TIMEZONE}') AS is_future_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM month_days AS m
+LEFT JOIN actuals AS a USING (day)
+CROSS JOIN target AS t

@@ -1,0 +1,81 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_site_search_terms",
+  description: "Site search (UA 'Site Search Terms' style, last 90 days): normalized term (no accents, lower), searches, unique searches, % search exits, % refinements, product views after the search, conversion of the sessions and zero results (when the site sends the results count param)",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "ua_report"],
+  columns: {
+    search_term_normalized: "lower case, no accents, single spaces ('Tênis  Azul' and 'tenis azul' are the same)",
+    pct_search_exits: "Searches that were the last thing of the session",
+    pct_refinements: "Searches followed by another search in the same session (the first try was bad)",
+    zero_results_searches: "Searches with results count = 0 (needs the param in cfg_project.search_results_count_param)"
+  }
+}
+
+WITH
+search_events AS (
+  SELECT
+    event_id,
+    session_key,
+    event_ts,
+    ${ref("normalize_text")}(${ref("url_decode")}(search_term)) AS term,
+    ${ga4.paramInt(cfg_project.search_results_count_param)} AS results_count,
+    LEAD(event_ts) OVER (PARTITION BY session_key ORDER BY event_ts) AS next_search_ts
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name = 'view_search_results'
+    AND search_term IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+session_after_search AS (
+  SELECT
+    s.event_id,
+    LOGICAL_OR(e.event_name = 'view_item' AND e.event_ts > s.event_ts) AS viewed_product_after,
+    LOGICAL_OR(e.event_ts > s.event_ts) AS did_something_after
+  FROM search_events AS s
+  JOIN ${ref("stg_ga4__events")} AS e
+    ON e.session_key = s.session_key
+    AND e.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 91 DAY)
+    AND e.event_name IN ('view_item', 'page_view', 'add_to_cart', 'select_item', 'view_search_results')
+  GROUP BY s.event_id
+),
+
+-- revenue counted once per session and term (a session searching 3 times does not triple it)
+revenue_per_term AS (
+  SELECT t.term, SUM(f.revenue) AS revenue_of_sessions
+  FROM (SELECT DISTINCT term, session_key FROM search_events) AS t
+  JOIN ${ref("fct_sessions")} AS f ON f.session_key = t.session_key
+  GROUP BY t.term
+),
+
+per_term AS (
+  SELECT
+    s.term,
+    COUNT(*) AS searches,
+    COUNT(DISTINCT s.session_key) AS unique_searches,
+    SAFE_DIVIDE(COUNTIF(NOT COALESCE(a.did_something_after, FALSE)), COUNT(*)) AS pct_search_exits,
+    SAFE_DIVIDE(COUNTIF(s.next_search_ts IS NOT NULL), COUNT(*)) AS pct_refinements,
+    SAFE_DIVIDE(COUNTIF(a.viewed_product_after), COUNT(*)) AS product_view_after_search_rate,
+    COUNTIF(s.results_count = 0) AS zero_results_searches,
+    SAFE_DIVIDE(COUNT(DISTINCT IF(f.has_purchase, s.session_key, NULL)), COUNT(DISTINCT s.session_key)) AS session_conversion_rate
+  FROM search_events AS s
+  LEFT JOIN session_after_search AS a USING (event_id)
+  LEFT JOIN ${ref("fct_sessions")} AS f ON f.session_key = s.session_key
+  WHERE s.term IS NOT NULL
+  GROUP BY 1
+  HAVING COUNT(*) >= 3
+)
+
+SELECT
+  p.term AS search_term_normalized,
+  p.* EXCEPT (term),
+  COALESCE(r.revenue_of_sessions, 0) AS revenue_of_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_term AS p
+LEFT JOIN revenue_per_term AS r USING (term)

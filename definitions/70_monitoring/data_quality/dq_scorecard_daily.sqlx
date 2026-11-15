@@ -1,0 +1,57 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_scorecard_daily",
+  description: "All the data quality checks of all the DQ tables in one place (check date x check), with group, value, thresholds, status and weight. Feed of the DQ dashboard and of the data trust index",
+  bigquery: {
+    partitionBy: "check_date",
+    clusterBy: ["status"],
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"],
+  columns: {
+    weight: "How much the check matters for the trust index (revenue / identity checks weigh more)"
+  }
+}
+
+WITH
+all_checks AS (
+  SELECT check_date, check_group, check_name, value, warn_at, fail_at, status FROM ${ref("dq_completeness_daily")}
+  UNION ALL
+  SELECT check_date, check_group, check_name, value, warn_at, fail_at, status FROM ${ref("dq_validity_daily")}
+  UNION ALL
+  SELECT check_date, check_group, check_name, value, warn_at, fail_at, status FROM ${ref("dq_duplicates_daily")}
+  UNION ALL
+  SELECT check_date, check_group, check_name, value, warn_at, fail_at, status FROM ${ref("dq_tracking_integrity")}
+  UNION ALL
+  -- export freshness, one check per day it is evaluated (today)
+  SELECT
+    CURRENT_DATE('${constants.TIMEZONE}'), 'freshness', 'export_days_behind', CAST(days_behind AS FLOAT64), 2.0, 3.0,
+    CASE status WHEN 'ok' THEN 'pass' WHEN 'late' THEN 'warn' ELSE 'fail' END
+  FROM ${ref("dq_export_freshness")}
+  UNION ALL
+  SELECT
+    session_date, 'traffic_quality', 'bot_suspect_share', bot_suspect_share, 0.05, 0.15,
+    CASE WHEN bot_suspect_share >= 0.15 THEN 'fail' WHEN bot_suspect_share >= 0.05 THEN 'warn' ELSE 'pass' END
+  FROM ${ref("dq_session_quality_daily")}
+  UNION ALL
+  SELECT
+    CURRENT_DATE('${constants.TIMEZONE}'), 'tracking', 'events_dead_or_collapsed', CAST(COUNT(*) AS FLOAT64), 1.0, 3.0,
+    CASE WHEN COUNT(*) >= 3 THEN 'fail' WHEN COUNT(*) >= 1 THEN 'warn' ELSE 'pass' END
+  FROM ${ref("dq_tracking_breaks")}
+  WHERE break_type IN ('dead', 'collapsed')
+)
+
+SELECT
+  *,
+  CASE
+    WHEN check_name IN ('purchase_without_transaction_id', 'purchase_without_revenue', 'purchase_sent_more_than_once',
+                        'negative_purchase_revenue', 'absurd_purchase_revenue', 'test_orders_in_production', 'export_days_behind') THEN 3
+    WHEN check_name IN ('events_without_session_id', 'user_id_looks_like_pii', 'events_dead_or_collapsed', 'bot_suspect_share',
+                        'page_view_double_tagging', 'unassigned_channel_share') THEN 2
+    ELSE 1
+  END AS weight,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_checks

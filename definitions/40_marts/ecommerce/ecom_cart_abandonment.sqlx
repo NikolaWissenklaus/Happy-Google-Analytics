@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_cart_abandonment",
+  description: "Cart abandonment per day / device / channel with the money left in the carts and how much came back: carts recovered = same user purchased within 7 days after the abandoned session (organically or by the CRM flow)",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "crm"],
+  columns: {
+    recovered_7d: "Abandoned carts whose user bought something in the next 7 days",
+    recovery_rate_7d: "recovered / abandoned. NULL for the last 7 days (not complete yet)"
+  }
+}
+
+WITH
+cart_sessions AS (
+  SELECT
+    session_key,
+    session_date,
+    session_start_ts,
+    user_key,
+    device_category,
+    session_default_channel_group,
+    is_new_user,
+    cart_value,
+    is_cart_abandoned,
+    is_checkout_abandoned
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart(180)}
+    AND has_add_to_cart
+    ${helpers.martSessionFilter()}
+),
+
+later_purchases AS (
+  SELECT user_key, transaction_ts, revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.martWindowStart(180)}
+),
+
+recovery AS (
+  SELECT
+    c.session_key,
+    LOGICAL_OR(p.transaction_ts IS NOT NULL) AS recovered,
+    SUM(p.revenue) AS recovered_revenue
+  FROM cart_sessions AS c
+  LEFT JOIN later_purchases AS p
+    ON p.user_key = c.user_key
+    AND p.transaction_ts > c.session_start_ts
+    AND p.transaction_ts <= TIMESTAMP_ADD(c.session_start_ts, INTERVAL 7 DAY)
+  WHERE c.is_cart_abandoned
+  GROUP BY c.session_key
+)
+
+SELECT
+  c.session_date,
+  c.device_category,
+  c.session_default_channel_group,
+  IF(c.is_new_user, 'new', 'returning') AS user_type,
+  COUNT(*) AS sessions_with_cart,
+  COUNTIF(c.is_cart_abandoned) AS abandoned_carts,
+  COUNTIF(c.is_checkout_abandoned) AS abandoned_checkouts,
+  SUM(IF(c.is_cart_abandoned, c.cart_value, 0)) AS abandoned_cart_value,
+  COUNTIF(r.recovered) AS recovered_7d,
+  SUM(COALESCE(r.recovered_revenue, 0)) AS recovered_revenue_7d,
+  SAFE_DIVIDE(COUNTIF(c.is_cart_abandoned), COUNT(*)) AS abandonment_rate,
+  IF(c.session_date <= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 8 DAY), SAFE_DIVIDE(COUNTIF(r.recovered), COUNTIF(c.is_cart_abandoned)), NULL) AS recovery_rate_7d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM cart_sessions AS c
+LEFT JOIN recovery AS r USING (session_key)
+GROUP BY 1, 2, 3, 4

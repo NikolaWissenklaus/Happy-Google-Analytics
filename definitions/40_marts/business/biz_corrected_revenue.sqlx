@@ -1,0 +1,84 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_corrected_revenue",
+  description: "From 'GA4 says' to 'the bank says', per day: raw purchase revenue of the export, minus duplicated purchases, internal/debug traffic, test orders, outliers, cancelled or never paid orders (boleto/pix), plus orders GA4 never saw (CRM). The number the CFO should look at, with every step visible",
+  bigquery: {
+    partitionBy: "revenue_date",
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "data_quality"],
+  columns: {
+    raw_ga4_revenue: "Sum of every purchase event of the export (what a naive query gives)",
+    corrected_revenue: "raw - duplicates - internal - tests - outliers - cancelled/unpaid + not tracked",
+    unpaid_estimate_method: "crm (real status) or heuristic (expected paid rate per payment method, cfg_project.expected_paid_rate)"
+  }
+}
+
+WITH
+raw_purchases AS (
+  SELECT
+    event_date AS revenue_date,
+    SUM(COALESCE(purchase_revenue, event_value, 0)) AS raw_ga4_revenue,
+    SUM(IF(is_internal_traffic OR is_debug, COALESCE(purchase_revenue, event_value, 0), 0)) AS internal_revenue
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_name = 'purchase'
+    AND event_date >= ${helpers.martWindowStart()}
+  GROUP BY 1
+),
+
+deduped AS (
+  SELECT
+    transaction_date AS revenue_date,
+    SUM(revenue) AS deduped_revenue,
+    SUM(IF(is_test_transaction, revenue, 0)) AS test_revenue,
+    SUM(IF(NOT is_test_transaction AND is_revenue_outlier, revenue, 0)) AS outlier_revenue,
+    ${constants.ENABLE.crm
+      ? `SUM(IF(NOT is_test_transaction AND NOT is_revenue_outlier
+          AND (crm_status = 'cancelled' OR (crm_status = 'pending' AND transaction_date < DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 5 DAY))),
+          revenue, 0)) AS unpaid_revenue`
+      : `SUM(IF(is_valid_for_revenue AND is_deferred_payment,
+          revenue * (1 - CASE
+            WHEN REGEXP_CONTAINS(payment_type, r'boleto|bank_slip|billet') THEN ${cfg_project.expected_paid_rate.boleto}
+            WHEN REGEXP_CONTAINS(payment_type, r'pix') THEN ${cfg_project.expected_paid_rate.pix}
+            ELSE ${cfg_project.expected_paid_rate.default}
+          END), 0)) AS unpaid_revenue`}
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${helpers.martWindowStart()}
+  GROUP BY 1
+)
+
+${constants.ENABLE.crm ? `,
+not_tracked AS (
+  SELECT o.order_date AS revenue_date, SUM(o.order_value) AS not_tracked_revenue, COUNT(*) AS not_tracked_orders
+  FROM ${ref("stg_crm__orders")} AS o
+  LEFT JOIN ${ref("fct_transactions")} AS t ON t.transaction_id = o.ga4_transaction_id
+  WHERE o.is_paid
+    AND o.order_date >= ${helpers.martWindowStart()}
+    AND COALESCE(o.sales_channel, 'site') IN ('site', 'app', 'web', 'ecommerce')
+    AND t.transaction_id IS NULL
+  GROUP BY 1
+)` : ``}
+
+SELECT
+  r.revenue_date,
+  r.raw_ga4_revenue,
+  r.internal_revenue,
+  r.raw_ga4_revenue - r.internal_revenue - COALESCE(d.deduped_revenue, 0) AS duplicated_revenue,
+  COALESCE(d.test_revenue, 0) AS test_revenue,
+  COALESCE(d.outlier_revenue, 0) AS outlier_revenue,
+  COALESCE(d.unpaid_revenue, 0) AS unpaid_revenue,
+  ${constants.ENABLE.crm ? "COALESCE(n.not_tracked_revenue, 0)" : "CAST(0 AS FLOAT64)"} AS not_tracked_revenue,
+  COALESCE(d.deduped_revenue, 0) - COALESCE(d.test_revenue, 0) - COALESCE(d.outlier_revenue, 0) - COALESCE(d.unpaid_revenue, 0)
+    + ${constants.ENABLE.crm ? "COALESCE(n.not_tracked_revenue, 0)" : "0"} AS corrected_revenue,
+  SAFE_DIVIDE(
+    COALESCE(d.deduped_revenue, 0) - COALESCE(d.test_revenue, 0) - COALESCE(d.outlier_revenue, 0) - COALESCE(d.unpaid_revenue, 0)
+      + ${constants.ENABLE.crm ? "COALESCE(n.not_tracked_revenue, 0)" : "0"},
+    r.raw_ga4_revenue) AS corrected_to_raw_ratio,
+  '${constants.ENABLE.crm ? "crm" : "heuristic"}' AS unpaid_estimate_method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM raw_purchases AS r
+LEFT JOIN deduped AS d USING (revenue_date)
+${constants.ENABLE.crm ? "LEFT JOIN not_tracked AS n USING (revenue_date)" : ""}

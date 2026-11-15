@@ -1,0 +1,59 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_retention_monthly",
+  description: "Monthly cohorts by acquisition month AND first channel x months since acquisition (0..12): active users, retention, buyers and revenue per cohort user. first_channel = 'all' row has the total of the cohort",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "retention"]
+}
+
+WITH
+users AS (
+  SELECT user_key, DATE_TRUNC(first_seen_date, MONTH) AS cohort_month, first_channel
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 18 MONTH)
+),
+
+activity AS (
+  SELECT
+    u.user_key,
+    u.cohort_month,
+    u.first_channel,
+    DATE_DIFF(DATE_TRUNC(d.activity_date, MONTH), u.cohort_month, MONTH) AS months_since_acquisition,
+    d.transactions,
+    d.revenue
+  FROM users AS u
+  JOIN ${ref("fct_user_daily")} AS d USING (user_key)
+),
+
+both_levels AS (
+  SELECT * FROM activity
+  UNION ALL
+  SELECT * REPLACE ('all' AS first_channel) FROM activity
+),
+
+sizes AS (
+  SELECT cohort_month, first_channel, COUNT(*) AS cohort_users
+  FROM (SELECT * FROM users UNION ALL SELECT * REPLACE ('all' AS first_channel) FROM users)
+  GROUP BY 1, 2
+)
+
+SELECT
+  b.cohort_month,
+  b.first_channel,
+  b.months_since_acquisition,
+  s.cohort_users,
+  COUNT(DISTINCT b.user_key) AS active_users,
+  SAFE_DIVIDE(COUNT(DISTINCT b.user_key), s.cohort_users) AS retention,
+  COUNT(DISTINCT IF(b.transactions > 0, b.user_key, NULL)) AS buyers,
+  SAFE_DIVIDE(SUM(b.revenue), s.cohort_users) AS revenue_per_cohort_user,
+  DATE_ADD(b.cohort_month, INTERVAL b.months_since_acquisition + 1 MONTH) <= CURRENT_DATE('${constants.TIMEZONE}') AS is_complete,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM both_levels AS b
+JOIN sizes AS s USING (cohort_month, first_channel)
+WHERE b.months_since_acquisition BETWEEN 0 AND 12
+GROUP BY 1, 2, 3, 4

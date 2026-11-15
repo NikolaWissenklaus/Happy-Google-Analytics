@@ -1,0 +1,18 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "detect_pii",
+  description: "Returns the kinds of PII found in a text: email, cpf, cnpj, phone_br, cep, credit_card, sensitive_url_key",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+-- detect_pii('https://loja.com/?email=ana%40gmail.com&cpf=529.982.247-25') = ['email', 'cpf', 'sensitive_url_key']
+-- CPF / CNPJ / cards are validated with check digits, regex alone gives too many false positives
+CREATE OR REPLACE FUNCTION ${self()}(text STRING) RETURNS ARRAY<STRING> AS (
+  ${privacy.detectKinds("text", { cpfFn: ref("is_valid_cpf"), cnpjFn: ref("is_valid_cnpj"), luhnFn: ref("luhn_check") })}
+)
+OPTIONS (description = "PII detection (LGPD)")

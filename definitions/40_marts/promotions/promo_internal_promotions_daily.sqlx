@@ -1,0 +1,83 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_internal_promotions_daily",
+  description: "Internal promotions (banners, sliders, menu highlights): views, clicks, CTR by promotion / creative / slot per day, and the revenue of the sessions that clicked (GA4 'Promotions' report + UA 'Internal Promotion')",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["promotion_name"],
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily", "ua_report"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__event_items", "int_ga4__sessions_base"] })}
+}
+
+WITH
+promo_events AS (
+  SELECT
+    event_date,
+    event_name,
+    session_key,
+    COALESCE(promotion_id, '(not set)') AS promotion_id,
+    COALESCE(promotion_name, '(not set)') AS promotion_name,
+    COALESCE(creative_name, '(not set)') AS creative_name,
+    COALESCE(creative_slot, '(not set)') AS creative_slot
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= run_from
+    AND event_name IN ('view_promotion', 'select_promotion')
+    AND NOT is_internal_traffic
+),
+
+clicked_sessions AS (
+  SELECT DISTINCT event_date, session_key, promotion_id, promotion_name, creative_name, creative_slot
+  FROM promo_events
+  WHERE event_name = 'select_promotion'
+),
+
+session_results AS (
+  SELECT session_key, transactions, revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+),
+
+clicks_with_results AS (
+  SELECT
+    c.event_date, c.promotion_id, c.promotion_name, c.creative_name, c.creative_slot,
+    COUNT(*) AS sessions_with_click,
+    COUNTIF(r.transactions > 0) AS sessions_with_click_and_purchase,
+    SUM(COALESCE(r.revenue, 0)) AS revenue_sessions_with_click
+  FROM clicked_sessions AS c
+  LEFT JOIN session_results AS r USING (session_key)
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+views_and_clicks AS (
+  SELECT
+    event_date, promotion_id, promotion_name, creative_name, creative_slot,
+    COUNTIF(event_name = 'view_promotion') AS promotion_views,
+    COUNTIF(event_name = 'select_promotion') AS promotion_clicks,
+    COUNT(DISTINCT IF(event_name = 'view_promotion', session_key, NULL)) AS sessions_with_view
+  FROM promo_events
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  v.*,
+  COALESCE(c.sessions_with_click, 0) AS sessions_with_click,
+  COALESCE(c.sessions_with_click_and_purchase, 0) AS sessions_with_click_and_purchase,
+  COALESCE(c.revenue_sessions_with_click, 0) AS revenue_sessions_with_click,
+  SAFE_DIVIDE(v.promotion_clicks, v.promotion_views) AS ctr,
+  SAFE_DIVIDE(c.sessions_with_click_and_purchase, c.sessions_with_click) AS click_to_purchase_rate,
+  SAFE_DIVIDE(c.revenue_sessions_with_click, v.promotion_views) AS revenue_per_view,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM views_and_clicks AS v
+LEFT JOIN clicks_with_results AS c USING (event_date, promotion_id, promotion_name, creative_name, creative_slot)
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

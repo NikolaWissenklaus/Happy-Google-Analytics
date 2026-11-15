@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "hash_phone_br",
+  description: "SHA256 hex of a BR phone in E.164. Google wants it with '+' (with_plus = TRUE), Meta wants only digits",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(phone STRING, with_plus BOOL) RETURNS STRING AS ((
+  SELECT IF(n IS NULL, NULL, TO_HEX(SHA256(IF(COALESCE(with_plus, TRUE), n, REPLACE(n, '+', '')))))
+  FROM (SELECT ${ref("normalize_phone_br")}(phone) AS n)
+))
+OPTIONS (description = "Normalized + hashed BR phone")

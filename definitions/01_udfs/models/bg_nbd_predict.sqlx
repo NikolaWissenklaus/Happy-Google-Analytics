@@ -1,0 +1,56 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "bg_nbd_predict",
+  description: "BG/NBD per customer: probability of being alive and expected purchases in the next N time units (horizon)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "data_science"]
+}
+
+-- formulas from Fader, Hardie & Lee (2005), eq. 10 (expected) and P(alive).
+-- the gaussian hypergeometric 2F1 converges fast because z = t / (alpha + T + t) < 1
+CREATE OR REPLACE FUNCTION ${self()}(
+  x FLOAT64, t_x FLOAT64, t_cal FLOAT64, horizon FLOAT64,
+  r FLOAT64, alpha FLOAT64, a FLOAT64, b FLOAT64
+)
+RETURNS STRUCT<p_alive FLOAT64, expected_purchases FLOAT64>
+LANGUAGE js AS r"""
+  if (x === null || t_cal === null || r === null || alpha === null || a === null || b === null) return null;
+  var tx = (t_x === null) ? 0 : t_x;
+  var T = t_cal;
+  var t = (horizon === null) ? 0 : horizon;
+
+  // log of (a / (b + x - 1)) * ((alpha + T) / (alpha + t_x)) ^ (r + x)
+  var logOdds = x > 0
+    ? Math.log(a) - Math.log(b + x - 1) + (r + x) * (Math.log(alpha + T) - Math.log(alpha + tx))
+    : -Infinity;
+  var pAlive = x > 0 ? (logOdds > 700 ? 0 : 1 / (1 + Math.exp(logOdds))) : 1;
+
+  function hyp2f1(a1, b1, c1, z) {
+    var term = 1, sum = 1;
+    for (var j = 0; j < 2000; j++) {
+      term *= (a1 + j) * (b1 + j) / ((c1 + j) * (j + 1)) * z;
+      sum += term;
+      if (Math.abs(term) < 1e-14 * Math.abs(sum)) break;
+    }
+    return sum;
+  }
+
+  // (a - 1) is in the denominator, but the formula is fine for a < 1 too (both terms flip sign).
+  // only a == 1 exactly is a problem, then we nudge it a little.
+  var aa = Math.abs(a - 1) < 1e-9 ? 1 + 1e-9 : a;
+  var expected = null;
+  if (t > 0) {
+    var hyp = hyp2f1(r + x, b + x, aa + b + x - 1, t / (alpha + T + t));
+    var first = (aa + b + x - 1) / (aa - 1);
+    var second = 1 - Math.exp((r + x) * (Math.log(alpha + T) - Math.log(alpha + T + t))) * hyp;
+    var denom = x > 0 ? (logOdds > 700 ? Infinity : 1 + Math.exp(logOdds)) : 1;
+    expected = first * second / denom;
+    if (!isFinite(expected)) expected = null;
+  }
+  return { p_alive: pAlive, expected_purchases: expected };
+"""
+OPTIONS (description = "BG/NBD P(alive) and conditional expected purchases")

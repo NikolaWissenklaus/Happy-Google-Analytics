@@ -1,0 +1,87 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_credits_rule_based",
+  description: "Credit of each touch of each conversion for 7 rule based models: first click, last click, last non-direct click (GA4 cross-channel last click), linear, time decay, position based (40/20/40) and W-shaped (first / first add to cart / last). Credits of a conversion always sum 1 per model",
+  bigquery: {
+    partitionBy: "conversion_date",
+    clusterBy: ["key_event_name", "channel"],
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily"],
+  columns: {
+    credit_time_decay: "2^(-days_before / half life), normalized. Half life = var time_decay_half_life_days (GA4 used 7)",
+    credit_position_based: "40% first, 40% last, 20% split in the middle (1 touch = 100%, 2 touches = 50/50)",
+    credit_w_shaped: "30% first touch, 30% first touch with add_to_cart, 30% last touch, 10% the rest. Normalized when milestones overlap"
+  }
+}
+
+WITH
+exploded AS (
+  SELECT
+    p.conversion_id,
+    p.key_event_name,
+    p.is_primary,
+    p.conversion_date,
+    p.conversion_value,
+    p.path_length,
+    p.last_non_direct_index,
+    p.first_cart_index,
+    pos + 1 AS touch_index,
+    t.session_key,
+    t.channel,
+    t.source_medium,
+    t.campaign,
+    t.is_direct,
+    t.days_before_conversion
+  FROM ${ref("attr_conversion_paths")} AS p,
+    UNNEST(p.touches) AS t WITH OFFSET AS pos
+),
+
+raw_weights AS (
+  SELECT
+    *,
+    POW(2, -GREATEST(days_before_conversion, 0) / ${constants.TIME_DECAY_HALF_LIFE_DAYS}) AS decay_weight,
+    -- W-shaped: special positions get 0.3, the others share 0.1
+    0.3 * IF(touch_index = 1, 1, 0)
+      + 0.3 * IF(touch_index = first_cart_index, 1, 0)
+      + 0.3 * IF(touch_index = path_length, 1, 0)
+      + IF(touch_index != 1 AND touch_index != path_length AND touch_index IS DISTINCT FROM first_cart_index,
+           0.1 / NULLIF(path_length
+             - 1
+             - IF(path_length > 1, 1, 0)
+             - IF(first_cart_index IS NOT NULL AND first_cart_index NOT IN (1, path_length), 1, 0), 0),
+           0) AS w_weight
+  FROM exploded
+)
+
+SELECT
+  conversion_id,
+  key_event_name,
+  is_primary,
+  conversion_date,
+  conversion_value,
+  path_length,
+  touch_index,
+  session_key,
+  channel,
+  source_medium,
+  campaign,
+  is_direct,
+  days_before_conversion,
+  IF(touch_index = 1, 1.0, 0.0) AS credit_first_click,
+  IF(touch_index = path_length, 1.0, 0.0) AS credit_last_click,
+  IF(touch_index = COALESCE(last_non_direct_index, path_length), 1.0, 0.0) AS credit_last_non_direct,
+  1.0 / path_length AS credit_linear,
+  SAFE_DIVIDE(decay_weight, SUM(decay_weight) OVER (PARTITION BY conversion_id)) AS credit_time_decay,
+  CASE
+    WHEN path_length = 1 THEN 1.0
+    WHEN path_length = 2 THEN 0.5
+    WHEN touch_index = 1 OR touch_index = path_length THEN 0.4
+    ELSE 0.2 / (path_length - 2)
+  END AS credit_position_based,
+  SAFE_DIVIDE(w_weight, SUM(w_weight) OVER (PARTITION BY conversion_id)) AS credit_w_shaped,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM raw_weights

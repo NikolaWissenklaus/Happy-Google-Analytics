@@ -1,0 +1,52 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_pii_summary",
+  description: "One row per leak (field x kind of PII) with status (active / intermittent / fixed / new), when it started, volume in the last 7 days and what to do about it. This is the table to send to the dev team",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    status: "new (first seen in the last 3 days) | active (seen in the last 2 days) | intermittent | fixed (nothing in the last 7 days)",
+    how_to_fix: "First thing to try. GA4 web streams also have 'data redaction' for email and query params, turn it on"
+  }
+}
+
+WITH per_leak AS (
+  SELECT
+    field,
+    pii_kind,
+    MIN(event_date) AS first_detected_date,
+    MAX(event_date) AS last_detected_date,
+    COUNT(DISTINCT event_date) AS days_detected,
+    SUM(IF(event_date >= ${helpers.daysAgo(7)}, occurrences, 0)) AS occurrences_last_7d,
+    SUM(IF(event_date >= ${helpers.daysAgo(7)}, devices, 0)) AS devices_last_7d,
+    ARRAY_AGG(DISTINCT event_name LIMIT 10) AS event_names,
+    ARRAY_AGG(masked_example ORDER BY event_date DESC LIMIT 1)[OFFSET(0)] AS latest_masked_example
+  FROM ${ref("priv_pii_findings")}
+  GROUP BY field, pii_kind
+)
+
+SELECT
+  *,
+  CASE
+    WHEN first_detected_date >= ${helpers.daysAgo(3)} THEN 'new'
+    WHEN last_detected_date >= ${helpers.daysAgo(2)} THEN 'active'
+    WHEN last_detected_date < ${helpers.daysAgo(7)} THEN 'fixed'
+    ELSE 'intermittent'
+  END AS status,
+  CASE
+    WHEN field = 'user_id' THEN 'user_id must be the internal customer id. Never email, CPF or phone, change the dataLayer'
+    WHEN STARTS_WITH(field, 'user_properties.') THEN 'Remove this user property from the tag, or send an internal id instead'
+    WHEN field IN ('event_params.page_location', 'event_params.page_referrer') AND pii_kind IN ('email', 'cpf', 'cnpj', 'phone_br', 'sensitive_url_key')
+      THEN 'Some form sends data by GET (query string). Change the form to POST, or strip the param in GTM before the page_view. Turn on GA4 data redaction too'
+    WHEN STARTS_WITH(field, 'collected_traffic_source.') THEN 'Email campaigns putting the email in the UTM. Talk to CRM, use an internal id in utm_content'
+    WHEN field = 'event_params.page_title' THEN 'The page title has personal data (ex: "Olá, Fulano"). Override page_title in the tag for logged pages'
+    WHEN pii_kind = 'credit_card' THEN 'URGENT: card number in analytics is a PCI problem too. Find the tag today'
+    ELSE 'Fix the tag that sends this param, or block / transform it in GTM'
+  END AS how_to_fix,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_leak

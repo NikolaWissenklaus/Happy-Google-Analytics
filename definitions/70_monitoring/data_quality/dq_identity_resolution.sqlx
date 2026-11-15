@@ -1,0 +1,108 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_identity_resolution",
+  description: "How well we know who is who (devices active in the last 90 days): devices, people and dedup rate per identity method (login, linked by order, linked by ad click, merged anonymous, device only), people by number of devices, placeholder user_ids that were ignored ('undefined', '0'...), shared accounts and oversized clusters of the identity graph. Every 'users' number of the project depends on this",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "identity" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "identity"],
+  columns: {
+    section: "identity_method | devices_per_person | ignored_user_ids | identity_graph",
+    dedup_rate: "1 - people / devices. 0.15 = 15% of the devices were the same person of another device"
+  }
+}
+
+js {
+  const placeholders = helpers.sqlList(cfg_identity.user_id_placeholders);
+}
+
+WITH
+devices AS (
+  SELECT *
+  FROM ${ref("int_ga4__user_stitching")}
+  WHERE last_seen_ts >= TIMESTAMP(${helpers.daysAgo(90)})
+),
+
+per_person AS (
+  SELECT user_key, COUNT(*) AS devices
+  FROM devices
+  GROUP BY user_key
+),
+
+by_method AS (
+  SELECT
+    'identity_method' AS section,
+    identity_method AS item,
+    COUNT(*) AS devices,
+    COUNT(DISTINCT user_key) AS people
+  FROM devices
+  GROUP BY identity_method
+),
+
+by_size AS (
+  SELECT
+    'devices_per_person' AS section,
+    CASE
+      WHEN devices = 1 THEN '1'
+      WHEN devices = 2 THEN '2'
+      WHEN devices <= 5 THEN '3-5'
+      WHEN devices <= 10 THEN '6-10'
+      ELSE '11+'
+    END AS item,
+    SUM(devices) AS devices,
+    COUNT(*) AS people
+  FROM per_person
+  GROUP BY item
+),
+
+ignored AS (
+  SELECT
+    'ignored_user_ids' AS section,
+    IF(LOWER(TRIM(user_id)) IN (${placeholders}) OR TRIM(user_id) = '', CONCAT('placeholder: ', LOWER(TRIM(user_id))), 'shared account (more than ${cfg_identity.max_devices_per_user_id} devices)') AS item,
+    COUNT(DISTINCT user_pseudo_id) AS devices,
+    COUNT(DISTINCT user_id) AS people
+  FROM ${ref("int_ga4__user_id_pairs_daily")}
+  WHERE event_date >= ${helpers.daysAgo(90)}
+    AND (
+      LOWER(TRIM(user_id)) IN (${placeholders})
+      OR TRIM(user_id) = ''
+      OR user_id IN (
+        SELECT user_id
+        FROM ${ref("int_ga4__user_id_pairs_daily")}
+        GROUP BY user_id
+        HAVING COUNT(DISTINCT user_pseudo_id) > ${cfg_identity.max_devices_per_user_id}
+      )
+    )
+  GROUP BY item
+),
+
+graph AS (
+  SELECT
+    'identity_graph' AS section,
+    CONCAT(IF(is_oversized_cluster, 'oversized cluster (not merged): ', 'cluster linked by: '), ARRAY_TO_STRING(cluster_link_types, ' + ')) AS item,
+    COUNT(*) AS devices,
+    COUNT(DISTINCT cluster_id) AS people
+  FROM ${ref("int_ga4__identity_graph")}
+  WHERE cluster_devices > 1
+  GROUP BY item
+),
+
+all_rows AS (
+  SELECT * FROM by_method
+  UNION ALL SELECT * FROM by_size
+  UNION ALL SELECT * FROM ignored
+  UNION ALL SELECT * FROM graph
+)
+
+SELECT
+  section,
+  item,
+  devices,
+  people,
+  IF(section IN ('identity_method', 'identity_graph'), SAFE_DIVIDE(devices - people, devices), NULL) AS dedup_rate,
+  SAFE_DIVIDE(devices, SUM(IF(section = 'identity_method', devices, 0)) OVER ()) AS share_of_devices,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_rows

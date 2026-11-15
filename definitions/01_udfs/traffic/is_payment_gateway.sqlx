@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "is_payment_gateway",
+  description: "TRUE for payment gateways / 3DS / bank pages that steal the attribution (pagseguro, mercadopago, paypal...)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+CREATE OR REPLACE FUNCTION ${self()}(source STRING) RETURNS BOOL AS ((
+  SELECT ${channels.isPaymentGateway("s")}
+  FROM (SELECT LOWER(TRIM(source)) AS s)
+))
+OPTIONS (description = "Payment gateway referral check")

@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_personas",
+  description: "Behavioral personas (last 90 days, rule based so everybody understands them): bargain_hunter, window_shopper, serial_cart_abandoner, researcher, impulse_buyer, loyalist, content_reader, app_lover, night_owl, weekend_shopper. A user can have more than one, main_persona is the first that matches",
+  bigquery: {
+    clusterBy: ["main_persona"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"]
+}
+
+WITH
+sessions AS (
+  SELECT *
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    ${helpers.martSessionFilter()}
+),
+
+content_views AS (
+  SELECT user_key, SAFE_DIVIDE(COUNTIF(page_type = 'blog'), COUNT(*)) AS blog_view_share
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY user_key
+),
+
+per_user AS (
+  SELECT
+    s.user_key,
+    COUNT(*) AS sessions,
+    SUM(s.view_item_events) AS product_views,
+    COUNTIF(s.has_add_to_cart) AS cart_sessions,
+    COUNTIF(s.is_cart_abandoned) AS abandoned_carts,
+    COUNTIF(s.has_purchase) AS purchase_sessions,
+    COUNTIF(s.has_site_search) AS search_sessions,
+    COUNTIF(s.used_coupon) AS coupon_sessions,
+    COUNTIF(s.has_promotion_click) AS promo_click_sessions,
+    COUNTIF(s.has_purchase AND s.session_number = 1) AS bought_in_first_session,
+    COUNTIF(s.platform IN ('ANDROID', 'IOS')) AS app_sessions,
+    COUNTIF(s.session_hour >= 22 OR s.session_hour < 5) AS night_sessions,
+    COUNTIF(s.session_iso_weekday >= 6) AS weekend_sessions
+  FROM sessions AS s
+  GROUP BY s.user_key
+),
+
+flags AS (
+  SELECT
+    p.*,
+    COALESCE(c.blog_view_share, 0) AS blog_view_share,
+    COALESCE(u.transactions, 0) AS lifetime_orders,
+    ARRAY_CONCAT(
+      IF(p.coupon_sessions >= 1 AND SAFE_DIVIDE(p.coupon_sessions, NULLIF(p.purchase_sessions, 0)) >= 0.5 OR p.promo_click_sessions >= 3, ['bargain_hunter'], []),
+      IF(p.product_views >= 15 AND p.cart_sessions = 0, ['window_shopper'], []),
+      IF(p.abandoned_carts >= 2, ['serial_cart_abandoner'], []),
+      IF(p.search_sessions >= 3 AND p.sessions >= 4, ['researcher'], []),
+      IF(p.bought_in_first_session > 0, ['impulse_buyer'], []),
+      IF(COALESCE(u.transactions, 0) >= 3, ['loyalist'], []),
+      IF(COALESCE(c.blog_view_share, 0) >= 0.4, ['content_reader'], []),
+      IF(SAFE_DIVIDE(p.app_sessions, p.sessions) >= 0.7, ['app_lover'], []),
+      IF(SAFE_DIVIDE(p.night_sessions, p.sessions) >= 0.6 AND p.sessions >= 3, ['night_owl'], []),
+      IF(SAFE_DIVIDE(p.weekend_sessions, p.sessions) >= 0.7 AND p.sessions >= 3, ['weekend_shopper'], [])
+    ) AS personas
+  FROM per_user AS p
+  LEFT JOIN content_views AS c USING (user_key)
+  LEFT JOIN ${ref("dim_users")} AS u USING (user_key)
+)
+
+SELECT
+  *,
+  COALESCE(personas[SAFE_OFFSET(0)], 'regular') AS main_persona,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM flags

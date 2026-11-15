@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_category_transitions",
+  description: "Next best category: Markov chain of the purchase journey (main category of order k -> main category of order k+1, last 2 years). P(next category | last category) with the median days between them. Feeds cross sell emails: 'bought shoes 30 days ago -> socks'",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily", "crm"]
+}
+
+WITH
+order_main_category AS (
+  SELECT
+    user_key,
+    transaction_id,
+    ANY_VALUE(transaction_ts) AS transaction_ts,
+    ARRAY_AGG(COALESCE(item_category, '(not set)') ORDER BY item_revenue DESC LIMIT 1)[OFFSET(0)] AS main_category
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 730 DAY)
+    AND is_valid_for_revenue
+  GROUP BY 1, 2
+),
+
+sequenced AS (
+  SELECT
+    *,
+    LEAD(main_category) OVER (PARTITION BY user_key ORDER BY transaction_ts) AS next_category,
+    LEAD(transaction_ts) OVER (PARTITION BY user_key ORDER BY transaction_ts) AS next_ts
+  FROM order_main_category
+)
+
+SELECT
+  main_category AS from_category,
+  next_category AS to_category,
+  COUNT(*) AS transitions,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY main_category)) AS transition_probability,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(next_ts, transaction_ts, DAY), 2)[OFFSET(1)] AS median_days_between,
+  ROW_NUMBER() OVER (PARTITION BY main_category ORDER BY COUNT(*) DESC) AS rank_for_from_category,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sequenced
+WHERE next_category IS NOT NULL
+GROUP BY 1, 2

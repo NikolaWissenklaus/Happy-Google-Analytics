@@ -1,0 +1,72 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_web_vitals",
+  description: "Core Web Vitals from GA4 (web-vitals library sending LCP / CLS / INP / FCP / TTFB as events, cfg_project.web_vitals) by page type and device, last 28 days: p75 like Google uses, share good / needs improvement / poor, and the conversion of sessions with poor vs good LCP",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "performance"],
+  columns: {
+    p75_value: "75th percentile of the metric (the number Google Search Console uses). LCP/INP/FCP/TTFB in ms, CLS unitless"
+  }
+}
+
+js {
+  const wv = cfg_project.web_vitals;
+}
+
+WITH
+vitals AS (
+  SELECT
+    e.session_key,
+    UPPER(COALESCE(${ga4.paramStr(wv.metric_name_param)}, e.event_name)) AS metric,
+    ${ga4.paramNum(wv.value_param)} AS metric_value,
+    LOWER(${ga4.paramStr(wv.rating_param)}) AS rating,
+    ${content.pageTypeCase("e.page_path")} AS page_type,
+    e.device_category
+  FROM ${ref("stg_ga4__events")} AS e
+  WHERE e.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+    AND e.event_name IN (${helpers.sqlList(wv.event_names)})
+    ${helpers.noiseFilter("e")}
+),
+
+per_metric AS (
+  SELECT
+    metric,
+    page_type,
+    device_category,
+    COUNT(*) AS measurements,
+    APPROX_QUANTILES(metric_value, 100)[OFFSET(75)] AS p75_value,
+    SAFE_DIVIDE(COUNTIF(rating = 'good'), COUNT(*)) AS good_share,
+    SAFE_DIVIDE(COUNTIF(rating = 'needs-improvement'), COUNT(*)) AS needs_improvement_share,
+    SAFE_DIVIDE(COUNTIF(rating = 'poor'), COUNT(*)) AS poor_share
+  FROM vitals
+  WHERE metric IN ('LCP', 'CLS', 'INP', 'FCP', 'TTFB')
+  GROUP BY 1, 2, 3
+),
+
+lcp_sessions AS (
+  SELECT session_key, MAX(IF(rating = 'poor', 1, 0)) AS had_poor_lcp
+  FROM vitals
+  WHERE metric = 'LCP'
+  GROUP BY 1
+),
+
+lcp_conversion AS (
+  SELECT
+    SAFE_DIVIDE(COUNTIF(l.had_poor_lcp = 1 AND s.has_purchase), COUNTIF(l.had_poor_lcp = 1)) AS conversion_poor_lcp,
+    SAFE_DIVIDE(COUNTIF(l.had_poor_lcp = 0 AND s.has_purchase), COUNTIF(l.had_poor_lcp = 0)) AS conversion_not_poor_lcp
+  FROM lcp_sessions AS l
+  JOIN ${ref("fct_sessions")} AS s USING (session_key)
+)
+
+SELECT
+  p.*,
+  c.conversion_poor_lcp,
+  c.conversion_not_poor_lcp,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_metric AS p
+CROSS JOIN lcp_conversion AS c

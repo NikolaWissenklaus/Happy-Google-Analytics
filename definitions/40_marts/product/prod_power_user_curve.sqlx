@@ -1,0 +1,33 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_power_user_curve",
+  description: "Power user curve (L28, the a16z one): of the users active in the last 28 days, how many were active 1 day, 2 days ... 28 days. A 'smile' at the right end = a product people use as habit",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"]
+}
+
+WITH active_days AS (
+  SELECT
+    user_key,
+    COUNT(*) AS days_active,
+    LOGICAL_OR(used_app) AS used_app,
+    SUM(transactions) AS transactions
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date > DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+  GROUP BY user_key
+)
+
+SELECT
+  days_active,
+  COUNT(*) AS users,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()) AS share_of_users,
+  COUNTIF(used_app) AS app_users,
+  SAFE_DIVIDE(COUNTIF(transactions > 0), COUNT(*)) AS buyer_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM active_days
+GROUP BY days_active

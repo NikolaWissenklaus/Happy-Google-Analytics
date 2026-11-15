@@ -1,0 +1,65 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_performance_daily",
+  description: "Item funnel per day: list impressions, clicks, detail views, add to cart, checkouts, unique purchases, units, item revenue and refunds, with the UA rates (cart-to-detail, buy-to-detail) and list CTR",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["item_id"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"],
+  columns: {
+    unique_purchases: "Distinct transactions that had the item (UA 'Unique Purchases')",
+    buy_to_detail_rate: "unique purchases / detail views (UA metric)",
+    cart_to_detail_rate: "add to carts / detail views (UA metric)"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__event_items"] })}
+}
+
+WITH agg AS (
+  SELECT
+    event_date,
+    item_id,
+    ARRAY_AGG(item_name IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_name,
+    ARRAY_AGG(item_brand IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_brand,
+    ARRAY_AGG(item_category IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS item_category,
+    COUNTIF(event_name = 'view_item_list') AS list_impressions,
+    COUNTIF(event_name = 'select_item') AS list_clicks,
+    COUNTIF(event_name = 'view_item') AS detail_views,
+    COUNT(DISTINCT IF(event_name = 'view_item', session_key, NULL)) AS sessions_with_view,
+    COUNTIF(event_name = 'add_to_cart') AS add_to_carts,
+    SUM(IF(event_name = 'add_to_cart', COALESCE(quantity, 1), 0)) AS units_added_to_cart,
+    COUNTIF(event_name = 'remove_from_cart') AS removes_from_cart,
+    COUNTIF(event_name = 'begin_checkout') AS checkouts,
+    COUNT(DISTINCT IF(event_name = 'purchase', transaction_id, NULL)) AS unique_purchases,
+    SUM(IF(event_name = 'purchase', COALESCE(quantity, 1), 0)) AS units_sold,
+    SUM(IF(event_name = 'purchase', item_revenue_fixed, 0)) AS item_revenue,
+    SUM(IF(event_name = 'refund', COALESCE(item_refund, item_value), 0)) AS item_refund_value,
+    AVG(IF(event_name = 'view_item', price, NULL)) AS avg_viewed_price
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= run_from
+    AND item_id IS NOT NULL
+    AND NOT is_internal_traffic
+    AND NOT is_debug
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(list_clicks, list_impressions) AS list_ctr,
+  SAFE_DIVIDE(add_to_carts, detail_views) AS cart_to_detail_rate,
+  SAFE_DIVIDE(unique_purchases, detail_views) AS buy_to_detail_rate,
+  SAFE_DIVIDE(item_revenue, units_sold) AS avg_price_sold,
+  SAFE_DIVIDE(units_sold, unique_purchases) AS avg_quantity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

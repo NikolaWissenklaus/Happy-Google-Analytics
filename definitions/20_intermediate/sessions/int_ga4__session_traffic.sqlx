@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__session_traffic",
+  description: "Final session traffic source, GA4 style: last non-direct click with carry over from previous sessions of the device (session_lookback_days), plus default and custom channel groups",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_default_channel_group", "user_pseudo_id"],
+    labels: { layer: "intermediate", domain: "attribution" }
+  },
+  tags: ["ga4", "intermediate", "daily", "attribution"],
+  columns: Object.assign(docs.pick("session_key", "user_pseudo_id", "session_date", "session_source", "session_medium", "session_campaign",
+    "session_default_channel_group", "session_custom_channel_group", "loaded_at"), {
+    session_source_only: "Source of the session alone (direct stays direct). Compare with session_source to see how much GA4 'gives back' to old campaigns",
+    is_carried_over: "Direct session that inherited the source of a previous non-direct session",
+    carried_days_ago: "How many days ago was the session we inherited the source from",
+    session_channel_only: "Default channel group of the session alone (no carry over)"
+  })
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["int_ga4__session_sources_raw"] })}
+}
+
+WITH
+-- we need the previous sessions of the device inside the lookback to find the last non-direct one
+recent_and_history AS (
+  SELECT *
+  FROM ${ref("int_ga4__session_sources_raw")}
+  WHERE session_date >= DATE_SUB(run_from, INTERVAL ${constants.SESSION_LOOKBACK_DAYS} DAY)
+),
+
+find_last_non_direct AS (
+  SELECT
+    *,
+    LAST_VALUE(
+      IF(is_direct, NULL, STRUCT(source, medium, campaign, campaign_id, term, content, source_platform,
+                                 session_start_ts AS touch_ts, session_key AS touch_session_key))
+      IGNORE NULLS
+    ) OVER (PARTITION BY user_pseudo_id ORDER BY session_start_ts ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS last_non_direct
+  FROM recent_and_history
+),
+
+decide_carry_over AS (
+  SELECT
+    *,
+    COALESCE(is_direct AND last_non_direct IS NOT NULL
+      AND TIMESTAMP_DIFF(session_start_ts, last_non_direct.touch_ts, DAY) <= ${constants.SESSION_LOOKBACK_DAYS}, FALSE) AS use_carry_over
+  FROM find_last_non_direct
+  WHERE session_date >= run_from
+),
+
+${constants.ENABLE.google_ads ? `
+-- gclid in hand + Google Ads click report = we know the real campaign, even when GA4 says (not set)
+google_ads_rescue AS (
+  SELECT
+    c.gclid,
+    LOWER(cd.campaign_name) AS campaign_name,
+    c.campaign_id,
+    c.keyword_text
+  FROM ${ref("stg_google_ads__clicks")} AS c
+  LEFT JOIN (
+    SELECT campaign_id, ANY_VALUE(campaign_name) AS campaign_name
+    FROM ${ref("stg_google_ads__campaign_daily")}
+    GROUP BY campaign_id
+  ) AS cd USING (campaign_id)
+),` : ``}
+
+session_values AS (
+  SELECT
+    d.session_key,
+    d.user_pseudo_id,
+    d.session_date,
+    d.session_start_ts,
+    IF(d.use_carry_over, d.last_non_direct.source, d.source) AS session_source,
+    IF(d.use_carry_over, d.last_non_direct.medium, d.medium) AS session_medium,
+    ${constants.ENABLE.google_ads
+      ? `CASE
+      WHEN d.use_carry_over THEN d.last_non_direct.campaign
+      WHEN d.source = 'google' AND d.medium = 'cpc' AND COALESCE(d.campaign, '(not set)') IN ('(not set)', '(direct)') THEN COALESCE(g.campaign_name, d.campaign)
+      ELSE d.campaign
+    END`
+      : `IF(d.use_carry_over, d.last_non_direct.campaign, d.campaign)`} AS session_campaign,
+    IF(d.use_carry_over, d.last_non_direct.campaign_id, d.campaign_id) AS session_campaign_id,
+    IF(d.use_carry_over, d.last_non_direct.term, ${constants.ENABLE.google_ads ? "COALESCE(d.term, LOWER(g.keyword_text))" : "d.term"}) AS session_term,
+    IF(d.use_carry_over, d.last_non_direct.content, d.content) AS session_content,
+    IF(d.use_carry_over, d.last_non_direct.source_platform, d.source_platform) AS session_source_platform,
+    d.use_carry_over AS is_carried_over,
+    IF(d.use_carry_over, d.last_non_direct.touch_session_key, NULL) AS carried_from_session_key,
+    IF(d.use_carry_over, TIMESTAMP_DIFF(d.session_start_ts, d.last_non_direct.touch_ts, DAY), NULL) AS carried_days_ago,
+    d.source AS session_source_only,
+    d.medium AS session_medium_only,
+    d.campaign AS session_campaign_only,
+    d.is_direct AS is_direct_only,
+    d.collected_source,
+    d.collected_medium,
+    d.collected_campaign,
+    d.fix_applied,
+    d.excluded_referral_source,
+    d.excluded_referral_reason,
+    d.external_referrer,
+    d.gclid,
+    d.gbraid,
+    d.wbraid,
+    d.dclid,
+    d.srsltid,
+    d.fbclid,
+    d.msclkid,
+    d.ttclid,
+    d.ga4_native_source,
+    d.ga4_native_medium,
+    d.ga4_native_campaign,
+    d.ga4_native_default_channel_group,
+    d.google_ads_customer_id,
+    d.google_ads_account_name,
+    d.google_ads_campaign_id,
+    d.google_ads_campaign_name,
+    d.google_ads_ad_group_id,
+    d.google_ads_ad_group_name
+  FROM decide_carry_over AS d
+  ${constants.ENABLE.google_ads ? `LEFT JOIN google_ads_rescue AS g ON g.gclid = d.gclid` : ``}
+),
+
+put_channels AS (
+  SELECT
+    *,
+    ${channels.defaultChannelGroup("session_source", "session_medium", "LOWER(session_campaign)")} AS session_default_channel_group,
+    ${channels.defaultChannelGroup("session_source_only", "session_medium_only", "LOWER(session_campaign_only)")} AS session_channel_only
+  FROM session_values
+)
+
+SELECT
+  *,
+  CONCAT(COALESCE(session_source, '(direct)'), ' / ', COALESCE(session_medium, '(none)')) AS session_source_medium,
+  ${channels.customChannelGroup("session_source", "session_medium", "LOWER(session_campaign)", "session_default_channel_group")} AS session_custom_channel_group,
+  ${channels.customChannelGroup("session_source_only", "session_medium_only", "LOWER(session_campaign_only)", "session_channel_only")} AS session_custom_channel_only,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM put_channels
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

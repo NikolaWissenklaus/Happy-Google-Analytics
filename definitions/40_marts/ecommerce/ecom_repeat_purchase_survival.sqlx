@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_repeat_purchase_survival",
+  description: "Kaplan-Meier survival curve of 'time until the second purchase', overall and by first purchase channel. Handles censoring (customers that did not have time to buy again yet), which a simple 'repeat rate' does not",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "data_science", "retention"],
+  columns: {
+    survival_probability: "P(still no second purchase at day t). 1 - survival = cumulative repeat probability",
+    at_risk: "Customers still 'alive' (no second purchase and not censored) at the start of day t"
+  }
+}
+
+-- each customer: time from 1st to 2nd purchase (event) or time from 1st purchase to today (censored)
+WITH
+customers AS (
+  SELECT
+    user_key,
+    MIN(IF(order_number = 1, transaction_date, NULL)) AS first_purchase_date,
+    MIN(IF(order_number = 2, transaction_date, NULL)) AS second_purchase_date,
+    ANY_VALUE(IF(order_number = 1, session_default_channel_group, NULL)) AS first_purchase_channel
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND order_number <= 2
+  GROUP BY user_key
+),
+
+durations AS (
+  SELECT
+    user_key,
+    COALESCE(first_purchase_channel, '(unknown)') AS first_purchase_channel,
+    LEAST(DATE_DIFF(COALESCE(second_purchase_date, CURRENT_DATE('${constants.TIMEZONE}')), first_purchase_date, DAY), 365) AS duration_days,
+    second_purchase_date IS NOT NULL AND DATE_DIFF(second_purchase_date, first_purchase_date, DAY) <= 365 AS had_event
+  FROM customers
+  WHERE first_purchase_date IS NOT NULL
+    AND first_purchase_date >= ${helpers.martWindowStart(730)}
+),
+
+-- run for the whole base (segment = 'all') and per first channel
+by_segment AS (
+  SELECT 'all' AS segment, duration_days, had_event FROM durations
+  UNION ALL
+  SELECT first_purchase_channel, duration_days, had_event FROM durations
+),
+
+events_per_day AS (
+  SELECT
+    segment,
+    duration_days AS day,
+    COUNTIF(had_event) AS events,
+    COUNTIF(NOT had_event) AS censored
+  FROM by_segment
+  GROUP BY 1, 2
+),
+
+risk_set AS (
+  SELECT
+    segment,
+    day,
+    events,
+    censored,
+    SUM(events + censored) OVER (PARTITION BY segment ORDER BY day DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS at_risk
+  FROM events_per_day
+)
+
+SELECT
+  segment,
+  day,
+  at_risk,
+  events,
+  censored,
+  -- S(t) = product of (1 - d/n). product via exp(sum(ln)), the classic SQL trick
+  EXP(SUM(LN(GREATEST(1 - SAFE_DIVIDE(events, at_risk), 1e-12))) OVER (PARTITION BY segment ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS survival_probability,
+  1 - EXP(SUM(LN(GREATEST(1 - SAFE_DIVIDE(events, at_risk), 1e-12))) OVER (PARTITION BY segment ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS cumulative_repeat_probability,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM risk_set

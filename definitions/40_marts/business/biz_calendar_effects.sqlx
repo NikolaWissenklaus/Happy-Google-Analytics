@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_calendar_effects",
+  description: "Calendar effects for planning (last 365 days): revenue index by weekday, by day of month (salary days!), by holiday and by retail event vs a normal day of the same weekday. 'Carnaval sells 35% less, 5o dia util sells 18% more'",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "planning"],
+  columns: {
+    effect: "weekday | day_of_month | holiday | retail_event | salary_window",
+    revenue_index: "average revenue of these days / average revenue of normal days with the same weekday. 1.2 = +20%"
+  }
+}
+
+WITH
+days AS (
+  SELECT k.kpi_date, k.valid_revenue AS revenue, k.orders, k.sessions, c.*
+  FROM ${ref("ecom_daily_kpis")} AS k
+  JOIN ${ref("dim_calendar")} AS c ON c.date_day = k.kpi_date
+  WHERE k.kpi_date BETWEEN DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY) AND DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 DAY)
+),
+
+normal_weekday AS (
+  SELECT iso_weekday, AVG(revenue) AS normal_revenue, AVG(orders) AS normal_orders
+  FROM days
+  WHERE NOT is_special_day AND retail_event IS NULL
+  GROUP BY iso_weekday
+),
+
+tagged AS (
+  SELECT d.*, n.normal_revenue, n.normal_orders
+  FROM days AS d
+  JOIN normal_weekday AS n USING (iso_weekday)
+),
+
+effects AS (
+  SELECT 'weekday' AS effect, weekday_name_pt AS label, AVG(revenue) AS avg_revenue, AVG(normal_revenue) AS avg_normal_revenue, COUNT(*) AS days FROM tagged GROUP BY 2
+  UNION ALL
+  SELECT 'day_of_month', CAST(day_of_month AS STRING), AVG(revenue), AVG(normal_revenue), COUNT(*) FROM tagged GROUP BY 2
+  UNION ALL
+  SELECT 'holiday', holiday_name, AVG(revenue), AVG(normal_revenue), COUNT(*) FROM tagged WHERE holiday_name IS NOT NULL GROUP BY 2
+  UNION ALL
+  SELECT 'retail_event', retail_event, AVG(revenue), AVG(normal_revenue), COUNT(*) FROM tagged WHERE retail_event IS NOT NULL GROUP BY 2
+  UNION ALL
+  SELECT 'salary_window', IF(is_salary_window, 'salary window (5o dia util)', 'rest of the month'), AVG(revenue), AVG(normal_revenue), COUNT(*) FROM tagged GROUP BY 2
+)
+
+SELECT
+  effect,
+  label,
+  days,
+  avg_revenue,
+  avg_normal_revenue,
+  IF(effect = 'weekday',
+    SAFE_DIVIDE(avg_revenue, AVG(avg_revenue) OVER (PARTITION BY effect)),
+    SAFE_DIVIDE(avg_revenue, avg_normal_revenue)) AS revenue_index,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM effects

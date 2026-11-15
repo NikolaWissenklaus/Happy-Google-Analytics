@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_engagement_overview_daily",
+  description: "GA4 Reports > Engagement > Overview per day: average engagement time, engaged sessions per user, views, events, plus DAU / WAU / MAU and stickiness (DAU/MAU, DAU/WAU, WAU/MAU)",
+  tags: ["reports", "ga4_report", "daily"]
+}
+
+WITH daily AS (
+  SELECT
+    session_date,
+    HLL_COUNT.MERGE(active_users_hll) AS active_users,
+    SUM(engaged_sessions) AS engaged_sessions,
+    SUM(user_engagement_sec) AS user_engagement_sec,
+    SUM(views) AS views,
+    SUM(event_count) AS event_count
+  FROM ${ref("rpt_ga4_traffic_acquisition_daily")}
+  GROUP BY session_date
+)
+
+SELECT
+  d.session_date,
+  d.active_users,
+  SAFE_DIVIDE(d.user_engagement_sec, d.active_users) AS average_engagement_time,
+  SAFE_DIVIDE(d.engaged_sessions, d.active_users) AS engaged_sessions_per_user,
+  d.views,
+  d.event_count,
+  a.dau,
+  a.wau,
+  a.mau,
+  a.stickiness AS dau_per_mau,
+  SAFE_DIVIDE(a.dau, a.wau) AS dau_per_wau,
+  a.wau_mau_ratio AS wau_per_mau
+FROM daily AS d
+LEFT JOIN ${ref("prod_active_users_daily")} AS a ON a.activity_date = d.session_date

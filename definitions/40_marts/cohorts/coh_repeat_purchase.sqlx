@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_repeat_purchase",
+  description: "First purchase cohorts: customers grouped by the month of the first order and how many bought again in each following month, cumulative repeat rate and cumulative revenue per customer (0..12 months). The retention that pays the bills",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "retention", "ecommerce"]
+}
+
+WITH
+first_orders AS (
+  SELECT user_key, DATE_TRUNC(MIN(transaction_date), MONTH) AS cohort_month
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+  GROUP BY user_key
+),
+
+orders AS (
+  SELECT
+    f.user_key,
+    f.cohort_month,
+    DATE_DIFF(DATE_TRUNC(t.transaction_date, MONTH), f.cohort_month, MONTH) AS months_since_first_order,
+    t.order_number,
+    t.revenue
+  FROM first_orders AS f
+  JOIN ${ref("fct_transactions")} AS t USING (user_key)
+  WHERE t.is_valid_for_revenue
+    AND f.cohort_month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 24 MONTH)
+),
+
+monthly AS (
+  SELECT
+    cohort_month,
+    months_since_first_order,
+    COUNT(DISTINCT IF(order_number >= 2, user_key, NULL)) AS customers_buying_again_in_month,
+    SUM(revenue) AS revenue_in_month
+  FROM orders
+  GROUP BY 1, 2
+),
+
+-- month where each customer did the 2nd order, counted once per customer
+first_repeat AS (
+  SELECT cohort_month, first_repeat_month, COUNT(*) AS new_repeaters
+  FROM (
+    SELECT user_key, cohort_month, MIN(IF(order_number >= 2, months_since_first_order, NULL)) AS first_repeat_month
+    FROM orders
+    GROUP BY 1, 2
+  )
+  WHERE first_repeat_month IS NOT NULL
+  GROUP BY 1, 2
+),
+
+grid AS (
+  SELECT s.cohort_month, s.customers, m AS months_since_first_order
+  FROM (SELECT cohort_month, COUNT(*) AS customers FROM first_orders GROUP BY 1) AS s,
+    UNNEST(GENERATE_ARRAY(0, 12)) AS m
+  WHERE DATE_ADD(s.cohort_month, INTERVAL m MONTH) <= CURRENT_DATE('${constants.TIMEZONE}')
+    AND s.cohort_month >= DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 24 MONTH)
+)
+
+SELECT
+  g.cohort_month,
+  g.months_since_first_order,
+  g.customers,
+  COALESCE(m.customers_buying_again_in_month, 0) AS customers_buying_again_in_month,
+  SAFE_DIVIDE(SUM(COALESCE(r.new_repeaters, 0)) OVER (PARTITION BY g.cohort_month ORDER BY g.months_since_first_order), g.customers) AS cumulative_repeat_rate,
+  SAFE_DIVIDE(SUM(COALESCE(m.revenue_in_month, 0)) OVER (PARTITION BY g.cohort_month ORDER BY g.months_since_first_order), g.customers) AS cumulative_revenue_per_customer,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM grid AS g
+LEFT JOIN monthly AS m USING (cohort_month, months_since_first_order)
+LEFT JOIN first_repeat AS r ON r.cohort_month = g.cohort_month AND r.first_repeat_month = g.months_since_first_order

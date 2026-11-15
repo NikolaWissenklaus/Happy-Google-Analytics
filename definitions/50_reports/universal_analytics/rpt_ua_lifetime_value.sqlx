@@ -1,0 +1,64 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_lifetime_value",
+  description: "UA Audience > Lifetime Value: users acquired per month and acquisition channel, with what they did in the first 7 / 30 / 90 days (revenue, transactions, views, goal completions, sessions, engagement time per user). Last 13 acquisition months",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily", "business"],
+  columns: {
+    days_observed: "How many of the 90 days we already have for the youngest users of the month. Below 90 the 90d numbers are still growing",
+    is_complete_90d: "TRUE when every user of the row already lived 90 days. Compare months only when this is TRUE"
+  }
+}
+
+WITH
+acquired_users AS (
+  SELECT
+    user_key,
+    first_seen_date,
+    DATE_TRUNC(first_seen_date, MONTH) AS acquisition_month,
+    COALESCE(first_channel, '(not set)') AS acquisition_channel
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 12 MONTH)
+),
+
+activity_first_90_days AS (
+  SELECT
+    a.user_key,
+    SUM(IF(DATE_DIFF(d.activity_date, a.first_seen_date, DAY) < 7, d.revenue, 0)) AS revenue_7d,
+    SUM(IF(DATE_DIFF(d.activity_date, a.first_seen_date, DAY) < 30, d.revenue, 0)) AS revenue_30d,
+    SUM(d.revenue) AS revenue_90d,
+    SUM(d.transactions) AS transactions_90d,
+    SUM(d.views) AS views_90d,
+    SUM(d.key_events) AS key_events_90d,
+    SUM(d.sessions) AS sessions_90d,
+    SUM(d.engagement_time_sec) AS engagement_time_90d
+  FROM acquired_users AS a
+  JOIN ${ref("fct_user_daily")} AS d
+    ON d.user_key = a.user_key
+    AND d.activity_date BETWEEN a.first_seen_date AND DATE_ADD(a.first_seen_date, INTERVAL 89 DAY)
+  GROUP BY a.user_key
+)
+
+SELECT
+  a.acquisition_month,
+  a.acquisition_channel,
+  COUNT(*) AS users,
+  SAFE_DIVIDE(SUM(COALESCE(f.revenue_7d, 0)), COUNT(*)) AS ltv_revenue_7d,
+  SAFE_DIVIDE(SUM(COALESCE(f.revenue_30d, 0)), COUNT(*)) AS ltv_revenue_30d,
+  SAFE_DIVIDE(SUM(COALESCE(f.revenue_90d, 0)), COUNT(*)) AS ltv_revenue_90d,
+  SAFE_DIVIDE(SUM(COALESCE(f.transactions_90d, 0)), COUNT(*)) AS transactions_per_user_90d,
+  SAFE_DIVIDE(SUM(COALESCE(f.views_90d, 0)), COUNT(*)) AS pageviews_per_user_90d,
+  SAFE_DIVIDE(SUM(COALESCE(f.key_events_90d, 0)), COUNT(*)) AS goal_completions_per_user_90d,
+  SAFE_DIVIDE(SUM(COALESCE(f.sessions_90d, 0)), COUNT(*)) AS sessions_per_user_90d,
+  SAFE_DIVIDE(SUM(COALESCE(f.engagement_time_90d, 0)), COUNT(*)) AS engagement_time_per_user_90d,
+  LEAST(DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), MAX(a.first_seen_date), DAY), 90) AS days_observed,
+  DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), MAX(a.first_seen_date), DAY) >= 90 AS is_complete_90d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM acquired_users AS a
+LEFT JOIN activity_first_90_days AS f USING (user_key)
+GROUP BY a.acquisition_month, a.acquisition_channel

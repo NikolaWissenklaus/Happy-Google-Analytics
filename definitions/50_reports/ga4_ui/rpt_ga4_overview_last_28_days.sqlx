@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_overview_last_28_days",
+  description: "The GA4 home cards (last 28 days vs the 28 before): active users, new users, sessions, engagement rate, average engagement time, events, key events and revenue, with the change. Users merged with HLL, like they should",
+  tags: ["reports", "ga4_report", "daily"]
+}
+
+WITH periods AS (
+  SELECT
+    IF(session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY), 'last_28', 'previous_28') AS period,
+    *
+  FROM ${ref("rpt_ga4_traffic_acquisition_daily")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 56 DAY)
+    AND session_date < CURRENT_DATE('${constants.TIMEZONE}')
+),
+
+totals AS (
+  SELECT
+    period,
+    HLL_COUNT.MERGE(active_users_hll) AS active_users,
+    SUM(new_users) AS new_users,
+    SUM(sessions) AS sessions,
+    SAFE_DIVIDE(SUM(engaged_sessions), SUM(sessions)) AS engagement_rate,
+    SAFE_DIVIDE(SUM(user_engagement_sec), HLL_COUNT.MERGE(active_users_hll)) AS average_engagement_time,
+    SUM(event_count) AS event_count,
+    SUM(key_events) AS key_events,
+    SUM(total_revenue) AS total_revenue
+  FROM periods
+  GROUP BY period
+)
+
+SELECT
+  c.*,
+  ${helpers.pctChange("c.active_users", "p.active_users")} AS active_users_change,
+  ${helpers.pctChange("c.new_users", "p.new_users")} AS new_users_change,
+  ${helpers.pctChange("c.sessions", "p.sessions")} AS sessions_change,
+  c.engagement_rate - p.engagement_rate AS engagement_rate_change_pp,
+  ${helpers.pctChange("c.key_events", "p.key_events")} AS key_events_change,
+  ${helpers.pctChange("c.total_revenue", "p.total_revenue")} AS total_revenue_change
+FROM totals AS c
+LEFT JOIN totals AS p ON p.period = 'previous_28'
+WHERE c.period = 'last_28'

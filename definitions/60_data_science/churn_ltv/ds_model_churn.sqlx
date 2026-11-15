@@ -1,0 +1,29 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_churn",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML classifier for customers: probability of NOT coming back in the next 30 days (cfg_ds.churn). Customers only, newest training snapshot kept out",
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = '${cfg_ds.churn.model_type}',
+  input_label_cols = ['churned_30d'],
+  auto_class_weights = TRUE,
+  data_split_method = 'RANDOM',
+  data_split_eval_fraction = 0.2,
+  enable_global_explain = TRUE
+) AS
+SELECT
+  ${cfg_ds.features.model_columns.join(",\n  ")},
+  churned_30d
+FROM ${ref("ds_feature_snapshots")}
+WHERE NOT is_current_snapshot
+  AND is_customer
+  AND churned_30d IS NOT NULL
+  AND snapshot_date < (SELECT MAX(snapshot_date) FROM ${ref("ds_feature_snapshots")} WHERE NOT is_current_snapshot)

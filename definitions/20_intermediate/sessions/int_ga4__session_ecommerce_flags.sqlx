@@ -1,0 +1,103 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__session_ecommerce_flags",
+  description: "Ecommerce behaviour per session: first time of each step (view_item ... purchase), counts and values. Base of shopping behavior, cart abandonment and the funnels",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_key"],
+    labels: { layer: "intermediate", domain: "ecommerce" }
+  },
+  tags: ["ga4", "intermediate", "daily", "ecommerce"],
+  columns: {
+    first_add_to_cart_ts: "First add_to_cart of the session (NULL if none). Same for the other first_*_ts",
+    cart_value: "Sum of the add_to_cart values (value param, else price * quantity of the items)",
+    checkout_value: "Value of the last begin_checkout of the session"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+ecommerce_events AS (
+  SELECT
+    session_key,
+    event_date,
+    event_ts,
+    event_name,
+    COALESCE(event_value, (SELECT SUM(COALESCE(i.price, 0) * COALESCE(i.quantity, 1)) FROM UNNEST(items) AS i)) AS value_fixed,
+    items_count,
+    coupon,
+    payment_type,
+    shipping_tier
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND session_key IS NOT NULL
+    AND event_name IN ('view_item_list', 'select_item', 'view_item', 'add_to_wishlist', 'add_to_cart', 'remove_from_cart',
+                       'view_cart', 'begin_checkout', 'add_shipping_info', 'add_payment_info', 'purchase', 'refund',
+                       'view_promotion', 'select_promotion', 'view_search_results', 'session_start')
+    ${helpers.noiseFilter()}
+),
+
+per_session AS (
+  SELECT
+    session_key,
+    MIN(event_date) AS session_date,
+    MIN(IF(event_name = 'view_item_list', event_ts, NULL)) AS first_view_item_list_ts,
+    MIN(IF(event_name = 'select_item', event_ts, NULL)) AS first_select_item_ts,
+    MIN(IF(event_name = 'view_item', event_ts, NULL)) AS first_view_item_ts,
+    MIN(IF(event_name = 'add_to_wishlist', event_ts, NULL)) AS first_add_to_wishlist_ts,
+    MIN(IF(event_name = 'add_to_cart', event_ts, NULL)) AS first_add_to_cart_ts,
+    MIN(IF(event_name = 'view_cart', event_ts, NULL)) AS first_view_cart_ts,
+    MIN(IF(event_name = 'begin_checkout', event_ts, NULL)) AS first_begin_checkout_ts,
+    MIN(IF(event_name = 'add_shipping_info', event_ts, NULL)) AS first_add_shipping_info_ts,
+    MIN(IF(event_name = 'add_payment_info', event_ts, NULL)) AS first_add_payment_info_ts,
+    MIN(IF(event_name = 'purchase', event_ts, NULL)) AS first_purchase_ts,
+    MIN(IF(event_name = 'select_promotion', event_ts, NULL)) AS first_select_promotion_ts,
+    MIN(IF(event_name = 'view_search_results', event_ts, NULL)) AS first_search_ts,
+
+    COUNTIF(event_name = 'view_item_list') AS view_item_list_events,
+    COUNTIF(event_name = 'view_item') AS view_item_events,
+    COUNTIF(event_name = 'add_to_cart') AS add_to_cart_events,
+    COUNTIF(event_name = 'remove_from_cart') AS remove_from_cart_events,
+    COUNTIF(event_name = 'begin_checkout') AS begin_checkout_events,
+    COUNTIF(event_name = 'add_shipping_info') AS add_shipping_info_events,
+    COUNTIF(event_name = 'add_payment_info') AS add_payment_info_events,
+    COUNTIF(event_name = 'purchase') AS purchase_events,
+    COUNTIF(event_name = 'view_promotion') AS view_promotion_events,
+    COUNTIF(event_name = 'select_promotion') AS select_promotion_events,
+    COUNTIF(event_name = 'view_search_results') AS search_events,
+
+    SUM(IF(event_name = 'add_to_cart', value_fixed, 0)) AS cart_value,
+    SUM(IF(event_name = 'remove_from_cart', value_fixed, 0)) AS removed_from_cart_value,
+    ARRAY_AGG(IF(event_name = 'begin_checkout', value_fixed, NULL) IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS checkout_value,
+    ARRAY_AGG(coupon IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_coupon,
+    ARRAY_AGG(payment_type IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_payment_type,
+    ARRAY_AGG(shipping_tier IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_shipping_tier
+  FROM ecommerce_events
+  GROUP BY session_key
+)
+
+SELECT
+  *,
+  first_view_item_ts IS NOT NULL AS has_view_item,
+  first_add_to_cart_ts IS NOT NULL AS has_add_to_cart,
+  first_begin_checkout_ts IS NOT NULL AS has_begin_checkout,
+  first_add_shipping_info_ts IS NOT NULL AS has_add_shipping_info,
+  first_add_payment_info_ts IS NOT NULL AS has_add_payment_info,
+  first_purchase_ts IS NOT NULL AS has_purchase,
+  first_add_to_cart_ts IS NOT NULL AND first_purchase_ts IS NULL AS is_cart_abandoned,
+  first_begin_checkout_ts IS NOT NULL AND first_purchase_ts IS NULL AS is_checkout_abandoned,
+  -- add_payment_info 3+ times in the same session = card declined / payment problem, usually
+  add_payment_info_events >= 3 AS has_payment_retries,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_session
+WHERE session_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

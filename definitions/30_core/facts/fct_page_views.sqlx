@@ -1,0 +1,34 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.core,
+  name: "fct_page_views",
+  description: "Page views with session context (channel, device, landing page, new/returning, user_key) and the page type. Filter event_date!",
+  tags: ["ga4", "core", "daily", "pages"]
+}
+
+SELECT
+  pv.*,
+  ${content.pageTypeCase("pv.page_path")} AS page_type,
+  ${content.isNotFoundTitle("pv.page_title")} AS is_not_found_page,
+  s.user_key,
+  s.session_date,
+  s.session_number,
+  s.is_new_user,
+  s.is_engaged AS is_engaged_session,
+  s.has_purchase AS session_has_purchase,
+  s.has_key_event AS session_has_key_event,
+  s.revenue AS session_revenue,
+  s.landing_page_path,
+  s.session_source,
+  s.session_medium,
+  s.session_default_channel_group,
+  s.session_custom_channel_group,
+  s.device_category,
+  s.device_browser,
+  s.geo_country,
+  s.geo_uf,
+  s.is_bot_suspect
+FROM ${ref("int_ga4__page_views")} AS pv
+LEFT JOIN ${ref("fct_sessions")} AS s ON s.session_key = pv.session_key

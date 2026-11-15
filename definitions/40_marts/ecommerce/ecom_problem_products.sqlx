@@ -1,0 +1,52 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_problem_products",
+  description: "Products with traffic and bad conversion (last 30 days): view-to-cart rate way below the category, ranked by the money on the table if they converted like the category median. The merchandising team todo list",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "cro"],
+  columns: {
+    cart_rate_wilson_high: "Upper bound of the Wilson interval. Even being optimistic the product is below the category = real problem, not noise",
+    revenue_opportunity_30d: "(category cart rate - item cart rate) x views x revenue per cart of the item"
+  }
+}
+
+WITH
+items_30d AS (
+  SELECT
+    p.item_id,
+    COALESCE(d.item_category, '(not set)') AS item_category,
+    ANY_VALUE(d.item_name) AS item_name,
+    ANY_VALUE(d.current_price) AS current_price,
+    SUM(p.detail_views) AS detail_views,
+    SUM(p.add_to_carts) AS add_to_carts,
+    SUM(p.unique_purchases) AS unique_purchases,
+    SUM(p.item_revenue) AS item_revenue
+  FROM ${ref("ecom_item_performance_daily")} AS p
+  LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+  WHERE p.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  GROUP BY 1, 2
+),
+
+with_category AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(add_to_carts, detail_views) AS cart_rate,
+    PERCENTILE_CONT(SAFE_DIVIDE(add_to_carts, NULLIF(detail_views, 0)), 0.5) OVER (PARTITION BY item_category) AS category_median_cart_rate,
+    SAFE_DIVIDE(SUM(item_revenue) OVER (PARTITION BY item_category), SUM(add_to_carts) OVER (PARTITION BY item_category)) AS category_revenue_per_cart
+  FROM items_30d
+  WHERE detail_views >= 100
+)
+
+SELECT
+  *,
+  ${helpers.wilsonUpper("add_to_carts", "detail_views")} AS cart_rate_wilson_high,
+  GREATEST(category_median_cart_rate - cart_rate, 0) * detail_views * COALESCE(SAFE_DIVIDE(item_revenue, NULLIF(add_to_carts, 0)), category_revenue_per_cart) AS revenue_opportunity_30d,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_category
+WHERE ${helpers.wilsonUpper("add_to_carts", "detail_views")} < category_median_cart_rate
+ORDER BY revenue_opportunity_30d DESC

@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_campaign_daily",
+  description: "Daily campaign performance (session scoped, last non-direct click) with new customers and revenue from new customers. Join with costs in mkt_paid_media_performance",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["campaign", "session_source_medium"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"],
+  columns: {
+    campaign: "session campaign in lower case",
+    new_customers: "First purchase ever of the customer (user_key) in a session of this campaign",
+    new_customer_revenue: "Revenue of those first purchases"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH
+campaign_sessions AS (
+  SELECT
+    session_date,
+    COALESCE(LOWER(session_campaign), '(not set)') AS campaign,
+    session_source,
+    session_medium,
+    session_source_medium,
+    session_default_channel_group,
+    session_custom_channel_group,
+    ${metrics.sessionMetrics()}
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5, 6, 7
+),
+
+new_customers AS (
+  SELECT
+    transaction_date AS session_date,
+    COALESCE(LOWER(session_campaign), '(not set)') AS campaign,
+    session_source,
+    session_medium,
+    COUNT(*) AS new_customers,
+    SUM(revenue) AS new_customer_revenue
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= run_from
+    AND is_first_purchase
+    AND is_valid_for_revenue
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  c.*,
+  COALESCE(n.new_customers, 0) AS new_customers,
+  COALESCE(n.new_customer_revenue, 0) AS new_customer_revenue,
+  SAFE_DIVIDE(c.engaged_sessions, c.sessions) AS engagement_rate,
+  SAFE_DIVIDE(c.transactions, c.sessions) AS conversion_rate,
+  SAFE_DIVIDE(c.revenue, c.transactions) AS average_order_value,
+  SAFE_DIVIDE(c.revenue, c.sessions) AS revenue_per_session,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM campaign_sessions AS c
+LEFT JOIN new_customers AS n
+  ON n.session_date = c.session_date
+  AND n.campaign = c.campaign
+  AND n.session_source = c.session_source
+  AND n.session_medium = c.session_medium
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

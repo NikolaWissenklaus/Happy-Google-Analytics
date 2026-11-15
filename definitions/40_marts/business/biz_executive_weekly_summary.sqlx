@@ -1,0 +1,85 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_executive_weekly_summary",
+  description: "One row per week for the leadership: revenue, orders, conversion, ticket, new customers, WoW and YoY (same week of last year), plus the biggest mover up and down, the number of anomaly alerts and the data trust index of the week, and a headline sentence ready for the slide / email",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily"],
+  columns: {
+    headline: "Auto generated sentence. ex: 'Revenue R$ 412.3k (+8.1% WoW, +22.4% YoY). Up: Paid Search. Down: Email. 2 anomaly alerts. Data trust 94/100.'"
+  }
+}
+
+WITH
+weekly AS (
+  SELECT
+    DATE_TRUNC(kpi_date, WEEK(MONDAY)) AS week_start,
+    SUM(sessions) AS sessions,
+    SUM(orders) AS orders,
+    SUM(valid_revenue) AS revenue,
+    SUM(new_customer_orders) AS new_customers,
+    COUNT(*) AS days_with_data
+  FROM ${ref("ecom_daily_kpis")}
+  WHERE kpi_date < DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), WEEK(MONDAY))
+  GROUP BY 1
+),
+
+with_comparisons AS (
+  SELECT
+    w.*,
+    SAFE_DIVIDE(w.orders, w.sessions) AS conversion_rate,
+    SAFE_DIVIDE(w.revenue, w.orders) AS average_order_value,
+    ${helpers.pctChange("w.revenue", "LAG(w.revenue) OVER (ORDER BY w.week_start)")} AS revenue_wow,
+    ${helpers.pctChange("w.revenue", "ly.revenue")} AS revenue_yoy,
+    ${helpers.pctChange("w.orders", "ly.orders")} AS orders_yoy
+  FROM weekly AS w
+  LEFT JOIN weekly AS ly ON ly.week_start = DATE_SUB(w.week_start, INTERVAL 364 DAY)
+),
+
+movers AS (
+  SELECT
+    week_start,
+    ARRAY_AGG(IF(direction = 'up', value, NULL) IGNORE NULLS ORDER BY revenue_delta DESC LIMIT 1)[SAFE_OFFSET(0)] AS top_channel_up,
+    ARRAY_AGG(IF(direction = 'down', value, NULL) IGNORE NULLS ORDER BY revenue_delta ASC LIMIT 1)[SAFE_OFFSET(0)] AS top_channel_down
+  FROM ${ref("biz_top_movers_weekly")}
+  WHERE dimension = 'channel'
+  GROUP BY week_start
+),
+
+alerts AS (
+  SELECT DATE_TRUNC(metric_date, WEEK(MONDAY)) AS week_start, COUNT(*) AS anomaly_alerts
+  FROM ${ref("anom_ensemble")}
+  WHERE is_alert
+  GROUP BY 1
+),
+
+trust AS (
+  SELECT DATE_TRUNC(check_date, WEEK(MONDAY)) AS week_start, AVG(data_trust_index) AS data_trust_index
+  FROM ${ref("dq_data_trust_index_daily")}
+  GROUP BY 1
+)
+
+SELECT
+  c.*,
+  m.top_channel_up,
+  m.top_channel_down,
+  COALESCE(a.anomaly_alerts, 0) AS anomaly_alerts,
+  t.data_trust_index,
+  CONCAT(
+    'Revenue R$ ', FORMAT('%.1f', c.revenue / 1000), 'k',
+    ' (', FORMAT('%+.1f', 100 * COALESCE(c.revenue_wow, 0)), '% WoW',
+    IF(c.revenue_yoy IS NULL, '', CONCAT(', ', FORMAT('%+.1f', 100 * c.revenue_yoy), '% YoY')), '). ',
+    IF(m.top_channel_up IS NULL, '', CONCAT('Up: ', m.top_channel_up, '. ')),
+    IF(m.top_channel_down IS NULL, '', CONCAT('Down: ', m.top_channel_down, '. ')),
+    CAST(COALESCE(a.anomaly_alerts, 0) AS STRING), ' anomaly alerts. ',
+    IF(t.data_trust_index IS NULL, '', CONCAT('Data trust ', FORMAT('%.0f', t.data_trust_index), '/100.'))
+  ) AS headline,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_comparisons AS c
+LEFT JOIN movers AS m USING (week_start)
+LEFT JOIN alerts AS a USING (week_start)
+LEFT JOIN trust AS t USING (week_start)

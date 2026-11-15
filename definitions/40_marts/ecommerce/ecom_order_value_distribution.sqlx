@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_order_value_distribution",
+  description: "Histogram of order values (last 180 days, R$ 10 buckets up to the p99) with cumulative share and a 'threshold effect' detector: buckets right above a value with way more orders than the bucket below = people adding items to reach free shipping (or the next installment)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "pricing"],
+  columns: {
+    bunching_ratio: "orders in this bucket / orders in the previous bucket. Spikes > 1.5 right after a round number = threshold (frete gratis acima de R$ X?)"
+  }
+}
+
+WITH
+orders AS (
+  SELECT revenue
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND is_valid_for_revenue
+    AND revenue > 0
+),
+
+p99 AS (
+  SELECT APPROX_QUANTILES(revenue, 100)[OFFSET(99)] AS p99_value FROM orders
+),
+
+buckets AS (
+  SELECT
+    IF(o.revenue > p.p99_value, NULL, CAST(FLOOR(o.revenue / 10) * 10 AS INT64)) AS bucket_start,
+    o.revenue > p.p99_value AS is_tail
+  FROM orders AS o
+  CROSS JOIN p99 AS p
+),
+
+counts AS (
+  SELECT
+    COALESCE(CAST(bucket_start AS STRING), 'p99+') AS bucket_label,
+    COALESCE(bucket_start, 999999999) AS bucket_order,
+    COUNT(*) AS orders
+  FROM buckets
+  GROUP BY 1, 2
+)
+
+SELECT
+  bucket_label,
+  bucket_order,
+  orders,
+  SAFE_DIVIDE(orders, SUM(orders) OVER ()) AS share_of_orders,
+  SAFE_DIVIDE(SUM(orders) OVER (ORDER BY bucket_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), SUM(orders) OVER ()) AS cumulative_share,
+  SAFE_DIVIDE(orders, LAG(orders) OVER (ORDER BY bucket_order)) AS bunching_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM counts

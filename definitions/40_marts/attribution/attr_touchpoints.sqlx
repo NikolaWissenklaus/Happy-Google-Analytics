@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_touchpoints",
+  description: "Every marketing touch (session) of every user in the attribution window, with the session OWN source (no carry over, otherwise the previous touch would count twice)",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["user_key"],
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily"],
+  columns: {
+    channel: "Channel used by the attribution models (var attribution_channel_grouping: default or custom)",
+    is_direct: "Direct touch. Last non-direct model skips it"
+  }
+}
+
+SELECT
+  user_key,
+  session_key,
+  session_date,
+  session_start_ts,
+  ${constants.ATTRIBUTION_GROUPING === "custom" ? "session_custom_channel_only" : "session_channel_only"} AS channel,
+  session_channel_only AS default_channel,
+  session_custom_channel_only AS custom_channel,
+  CONCAT(COALESCE(session_source_only, '(direct)'), ' / ', COALESCE(session_medium_only, '(none)')) AS source_medium,
+  COALESCE(LOWER(session_campaign_only), '(not set)') AS campaign,
+  session_channel_only = 'Direct' AS is_direct,
+  has_add_to_cart,
+  has_key_event,
+  is_new_user,
+  device_category,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_sessions")}
+WHERE session_date >= DATE_SUB(${helpers.martWindowStart()}, INTERVAL ${constants.CONVERSION_LOOKBACK_DAYS} DAY)
+  ${helpers.martSessionFilter()}

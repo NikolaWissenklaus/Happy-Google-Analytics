@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.crm,
+  name: "crm_lead_to_customer",
+  disabled: !constants.ENABLE.crm,
+  description: "Lead to customer (B2B / high ticket / WhatsApp sales): GA4 leads of logged users joined with the backend orders after the lead, by the channel that generated the lead. Lead volume is vanity, revenue per lead is sanity",
+  bigquery: {
+    labels: { layer: "marts", domain: "crm" }
+  },
+  tags: ["marts", "crm", "daily", "optional"],
+  columns: {
+    revenue_per_lead: "Backend paid value of orders up to 90 days after the lead / leads"
+  }
+}
+
+WITH
+leads AS (
+  SELECT
+    k.user_key,
+    REGEXP_EXTRACT(k.user_key, r'^uid:(.*)$') AS user_id,
+    k.event_ts AS lead_ts,
+    k.event_date AS lead_date,
+    k.session_default_channel_group,
+    k.session_source_medium,
+    k.session_campaign
+  FROM ${ref("fct_key_events")} AS k
+  WHERE k.key_event_category = 'lead'
+    AND k.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+),
+
+orders AS (
+  SELECT user_id, order_ts, order_value, is_paid
+  FROM ${ref("stg_crm__orders")}
+  WHERE user_id IS NOT NULL
+),
+
+lead_outcome AS (
+  SELECT
+    l.user_key,
+    l.lead_ts,
+    l.lead_date,
+    l.session_default_channel_group,
+    l.session_source_medium,
+    l.session_campaign,
+    l.user_id IS NOT NULL AS is_identified_lead,
+    MIN(IF(o.is_paid, o.order_ts, NULL)) AS first_paid_order_ts,
+    SUM(IF(o.is_paid, o.order_value, 0)) AS paid_value_90d
+  FROM leads AS l
+  LEFT JOIN orders AS o
+    ON o.user_id = l.user_id
+    AND o.order_ts >= l.lead_ts
+    AND o.order_ts <= TIMESTAMP_ADD(l.lead_ts, INTERVAL 90 DAY)
+  GROUP BY 1, 2, 3, 4, 5, 6, 7
+)
+
+SELECT
+  DATE_TRUNC(lead_date, MONTH) AS lead_month,
+  session_default_channel_group AS lead_channel,
+  session_source_medium,
+  COUNT(*) AS leads,
+  COUNTIF(is_identified_lead) AS identified_leads,
+  COUNTIF(first_paid_order_ts IS NOT NULL) AS leads_that_bought_90d,
+  SAFE_DIVIDE(COUNTIF(first_paid_order_ts IS NOT NULL), COUNTIF(is_identified_lead)) AS lead_to_customer_rate,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(first_paid_order_ts, lead_ts, HOUR) / 24, 2)[OFFSET(1)] AS median_days_to_buy,
+  SUM(paid_value_90d) AS paid_value_90d,
+  SAFE_DIVIDE(SUM(paid_value_90d), COUNTIF(is_identified_lead)) AS revenue_per_lead,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM lead_outcome
+GROUP BY 1, 2, 3

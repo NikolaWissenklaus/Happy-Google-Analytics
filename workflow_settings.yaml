@@ -1,0 +1,88 @@
+# author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+# happy_google_analytics - Dataform settings
+#
+# Change the 4 things below first (project, location, ga4 project/dataset)
+# and you can already compile. The rest has sane defaults for a brazilian
+# e-commerce, so read docs/configuration.md before going to production.
+#
+# Remember: Dataform vars are ALWAYS strings. "false" here is parsed in
+# includes/constants.js, never compare vars directly in the models.
+
+dataformCoreVersion: 3.0.71
+defaultProject: your-gcp-project
+defaultLocation: US
+defaultDataset: ga4_core
+defaultAssertionDataset: ga4_assertions
+
+vars:
+  # ---------------------------------------------------------------- GA4 export
+  ga4_project: your-gcp-project
+  ga4_dataset: analytics_123456789
+  property_timezone: America/Sao_Paulo
+  property_currency: BRL
+  # comma separated, without protocol. used for self-referral and hostname checks
+  site_hostnames: "www.happystore.com.br,happystore.com.br,checkout.happystore.com.br"
+
+  # ---------------------------------------------------------------- processing
+  start_date: "2024-01-01"
+  lookback_days: "3"
+  auto_backfill_max_days: "30"
+  include_intraday: "false"
+  exclude_internal_traffic: "true"
+  exclude_debug_traffic: "true"
+  mask_pii_in_urls: "true"
+  # bots stay flagged in core. business marts drop them, GA4/UA replica reports keep them
+  exclude_bots_in_marts: "true"
+  # heavy marts (basket analysis, paths...) only look at this many days
+  mart_window_days: "400"
+
+  # ---------------------------------------------------------------- attribution
+  # session "last non-direct click" carry over, GA4 default is 90
+  session_lookback_days: "90"
+  # conversion paths lookback (GA4 acquisition key events default is 30)
+  conversion_lookback_days: "30"
+  time_decay_half_life_days: "7"
+  # default = GA4 default channel group, custom = our custom grouping (AI, WhatsApp, Brand...)
+  attribution_channel_grouping: default
+
+  # ---------------------------------------------------------------- dataset names
+  # every dataset becomes <prefix>_<layer>, ex: ga4_staging, ga4_marketing
+  schema_prefix: ga4
+
+  # ---------------------------------------------------------------- optional modules
+  enable_bqml: "false"
+  enable_google_ads: "false"
+  google_ads_project: your-gcp-project
+  google_ads_dataset: google_ads
+  google_ads_customer_id: "1234567890"
+
+  enable_meta_ads: "false"
+  meta_ads_project: your-gcp-project
+  meta_ads_dataset: meta_ads
+  meta_ads_table: ads_insights
+
+  enable_search_console: "false"
+  search_console_project: your-gcp-project
+  search_console_dataset: searchconsole
+
+  enable_crm: "false"
+  crm_project: your-gcp-project
+  crm_dataset: crm
+  crm_orders_table: orders
+  crm_customers_table: customers
+
+  enable_user_export: "false"
+
+  # ---------------------------------------------------------------- LGPD
+  # destructive stuff stays OFF until the DPO (encarregado) says go
+  enable_dsr_deletion: "false"
+  enable_retention_purge: "false"
+  data_retention_months: "26"
+  pii_scan_days: "7"
+  # optional table with data subject requests (titulares). leave empty to use includes/cfg_privacy.js
+  dsr_table: ""
+  # the GA4 User Deletion API does not clean the BigQuery export. with these ON the deletion
+  # and the purge also touch the raw export dataset (events_*, users_*). read docs/lgpd.md first
+  dsr_include_raw_export: "false"
+  retention_include_raw_export: "false"

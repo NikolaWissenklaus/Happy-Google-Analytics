@@ -1,0 +1,154 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_ab_test_results",
+  description: "A/B test analyzer for every experiment in cfg_experiments.js (exposure event in GA4, user level): per variant users, conversions, conversion with Wilson CI, uplift vs control, z-test p value, Bayesian P(beats control), revenue per user with Welch t-test, SRM check (chi-square) and a plain english verdict",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "stats", "experiments"],
+  columns: {
+    srm_p_value: "Sample ratio mismatch. < 0.01 = the split is broken (bot, redirect, cache...), results are NOT trustworthy",
+    prob_beats_control: "Bayesian probability (Beta(1,1) prior) that the variant converts better than control",
+    required_users_per_variant: "Users per variant needed to detect a 10% relative uplift (alpha 5%, power 80%) at the control conversion",
+    verdict: "srm_problem | winner | loser | keep_running | no_difference"
+  }
+}
+
+js {
+  const exp = cfg_experiments.exposure;
+}
+
+WITH
+tests AS (
+  SELECT * FROM ${ref("seed_ab_tests")}
+),
+
+exposure_events AS (
+  SELECT
+    ${ga4.paramAny(exp.experiment_param)} AS experiment_id,
+    ${ga4.paramAny(exp.variant_param)} AS variant_id,
+    e.user_pseudo_id,
+    e.event_ts
+  FROM ${ref("stg_ga4__events")} AS e
+  WHERE e.event_date >= (SELECT MIN(start_date) FROM tests)
+    AND e.event_name = '${exp.event_name}'
+    ${helpers.noiseFilter("e")}
+),
+
+assignments AS (
+  SELECT
+    x.experiment_id,
+    COALESCE(id.user_key, CONCAT('dev:', x.user_pseudo_id)) AS user_key,
+    ARRAY_AGG(x.variant_id ORDER BY x.event_ts LIMIT 1)[OFFSET(0)] AS variant_id,
+    MIN(x.event_ts) AS first_exposure_ts,
+    COUNT(DISTINCT x.variant_id) > 1 AS saw_multiple_variants
+  FROM exposure_events AS x
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  JOIN tests AS t USING (experiment_id)
+  WHERE x.variant_id IS NOT NULL
+    AND DATE(x.event_ts, '${constants.TIMEZONE}') BETWEEN t.start_date AND COALESCE(t.end_date, CURRENT_DATE('${constants.TIMEZONE}'))
+  GROUP BY 1, 2
+),
+
+outcomes AS (
+  SELECT
+    a.experiment_id,
+    a.user_key,
+    a.variant_id,
+    a.saw_multiple_variants,
+    COUNT(k.key_event_id) > 0 AS converted,
+    COALESCE(SUM(k.key_event_value), 0) AS value
+  FROM assignments AS a
+  JOIN tests AS t USING (experiment_id)
+  LEFT JOIN ${ref("fct_key_events")} AS k
+    ON k.user_key = a.user_key
+    AND k.key_event_name = t.goal_key_event
+    AND k.event_ts >= a.first_exposure_ts
+    AND k.event_date <= COALESCE(t.end_date, CURRENT_DATE('${constants.TIMEZONE}'))
+  GROUP BY 1, 2, 3, 4
+),
+
+per_variant AS (
+  SELECT
+    experiment_id,
+    variant_id,
+    COUNT(*) AS users,
+    COUNTIF(converted) AS conversions,
+    SUM(value) AS revenue,
+    AVG(value) AS revenue_per_user,
+    VAR_SAMP(value) AS revenue_per_user_variance,
+    COUNTIF(saw_multiple_variants) AS contaminated_users
+  FROM outcomes
+  GROUP BY 1, 2
+),
+
+srm AS (
+  SELECT
+    v.experiment_id,
+    COUNT(*) AS variants,
+    SUM(POW(v.users - tot.total_users / tot.n_variants, 2) / (tot.total_users / tot.n_variants)) AS chi2
+  FROM per_variant AS v
+  JOIN (SELECT experiment_id, SUM(users) AS total_users, COUNT(*) AS n_variants FROM per_variant GROUP BY 1) AS tot USING (experiment_id)
+  GROUP BY 1
+),
+
+compare AS (
+  SELECT
+    v.*,
+    t.experiment_name,
+    t.control_variant,
+    t.goal_key_event,
+    t.start_date,
+    t.end_date,
+    v.variant_id = t.control_variant AS is_control,
+    c.users AS control_users,
+    c.conversions AS control_conversions,
+    ${ref("z_test_proportions")}(c.conversions, c.users, v.conversions, v.users) AS z_test,
+    ${ref("wilson_interval")}(v.conversions, v.users, 1.96) AS conversion_ci,
+    ${ref("prob_b_beats_a")}(1 + c.conversions, 1 + c.users - c.conversions, 1 + v.conversions, 1 + v.users - v.conversions) AS prob_beats_control,
+    ${ref("welch_t_test")}(c.revenue_per_user, c.revenue_per_user_variance, c.users, v.revenue_per_user, v.revenue_per_user_variance, v.users) AS revenue_test,
+    ${ref("chi_square_pvalue")}(s.chi2, s.variants - 1) AS srm_p_value,
+    -- n = (1.96 + 0.84)^2 * 2 * p * (1 - p) / (0.1 * p)^2
+    SAFE_DIVIDE(7.84 * 2 * SAFE_DIVIDE(c.conversions, c.users) * (1 - SAFE_DIVIDE(c.conversions, c.users)), POW(0.1 * SAFE_DIVIDE(c.conversions, c.users), 2)) AS required_users_per_variant
+  FROM per_variant AS v
+  JOIN tests AS t USING (experiment_id)
+  LEFT JOIN per_variant AS c ON c.experiment_id = v.experiment_id AND c.variant_id = t.control_variant
+  LEFT JOIN srm AS s ON s.experiment_id = v.experiment_id
+)
+
+SELECT
+  experiment_id,
+  experiment_name,
+  variant_id,
+  is_control,
+  goal_key_event,
+  start_date,
+  end_date,
+  users,
+  conversions,
+  SAFE_DIVIDE(conversions, users) AS conversion_rate,
+  conversion_ci.low AS conversion_ci_low,
+  conversion_ci.high AS conversion_ci_high,
+  revenue,
+  revenue_per_user,
+  contaminated_users,
+  IF(is_control, NULL, z_test.rel_uplift) AS conversion_uplift,
+  IF(is_control, NULL, z_test.p_value) AS p_value,
+  IF(is_control, NULL, prob_beats_control) AS prob_beats_control,
+  IF(is_control, NULL, revenue_test.rel_diff) AS revenue_per_user_uplift,
+  IF(is_control, NULL, revenue_test.p_value) AS revenue_per_user_p_value,
+  srm_p_value,
+  required_users_per_variant,
+  CASE
+    WHEN srm_p_value < 0.01 THEN 'srm_problem'
+    WHEN is_control THEN 'control'
+    WHEN z_test.p_value < 0.05 AND z_test.rel_uplift > 0 THEN 'winner'
+    WHEN z_test.p_value < 0.05 AND z_test.rel_uplift < 0 THEN 'loser'
+    WHEN users < required_users_per_variant THEN 'keep_running'
+    ELSE 'no_difference'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM compare

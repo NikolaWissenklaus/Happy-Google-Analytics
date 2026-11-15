@@ -1,0 +1,111 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_media_quality_scorecard",
+  description: "Media quality per source / medium / campaign (last 30 days, campaign as it was TAGGED, so the lost sessions count for the campaign that paid for them): bot share, tagging problems, attribution loss, engagement and conversion of the humans, cost and the cost that went to bots, a 0-100 score and the main problem. The table to open before renewing a media contract",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "media_quality"],
+  columns: {
+    bot_share: "Sessions flagged as bot (session or device signals)",
+    attribution_loss_share: "Tagged sessions that GA4 did not attribute (no source / medium param, or (direct) / (not set))",
+    tagging_issue_share: "Sessions with a structural problem in the url, internal utm or utm that arrived late",
+    cost: "Cost of the campaign name in fct_ad_costs_daily (matched by campaign name, all platforms)",
+    cost_on_bots: "cost x bot_share. What was paid for traffic that is not a person",
+    media_quality_score: "100 - 45 x bot share - 25 x attribution loss - 15 x tagging issues - 15 x (1 - engagement rate of the humans)",
+    main_problem: "The biggest of the four penalties"
+  }
+}
+
+WITH
+checks AS (
+  SELECT *
+  FROM ${ref("int_ga4__session_tagging_checks")}
+  WHERE session_date >= ${helpers.daysAgo(31)}
+),
+
+sessions AS (
+  SELECT
+    COALESCE(c.utm_source, s.session_source_only, '(direct)') AS source,
+    COALESCE(c.utm_medium, s.session_medium_only, '(none)') AS medium,
+    COALESCE(c.utm_campaign, s.session_campaign_only, '(not set)') AS campaign,
+    s.session_channel_only AS channel,
+    s.user_key,
+    s.is_bot_suspect,
+    s.is_engaged,
+    s.engagement_time_sec,
+    s.has_purchase,
+    s.revenue,
+    COALESCE(c.is_tagged, FALSE) AS is_tagged,
+    COALESCE(ARRAY_LENGTH(c.url_issues) > 0 OR c.has_internal_utm OR c.has_utm_not_on_first_page, FALSE) AS has_tagging_issue,
+    COALESCE(c.is_attribution_lost, FALSE) AS is_attribution_lost
+  FROM ${ref("fct_sessions")} AS s
+  LEFT JOIN checks AS c USING (session_key)
+  WHERE s.session_date >= ${helpers.daysAgo(30)}
+),
+
+per_campaign AS (
+  SELECT
+    source,
+    medium,
+    campaign,
+    APPROX_TOP_COUNT(channel, 1)[SAFE_OFFSET(0)].value AS channel,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT user_key) AS users,
+    SAFE_DIVIDE(COUNTIF(is_bot_suspect), COUNT(*)) AS bot_share,
+    SAFE_DIVIDE(COUNTIF(is_tagged), COUNT(*)) AS tagged_share,
+    SAFE_DIVIDE(COUNTIF(has_tagging_issue), COUNT(*)) AS tagging_issue_share,
+    SAFE_DIVIDE(COUNTIF(is_attribution_lost), COUNTIF(is_tagged)) AS attribution_loss_share,
+    COUNTIF(NOT is_bot_suspect) AS human_sessions,
+    SAFE_DIVIDE(COUNTIF(is_engaged AND NOT is_bot_suspect), COUNTIF(NOT is_bot_suspect)) AS engagement_rate_humans,
+    SAFE_DIVIDE(SUM(IF(is_bot_suspect, 0, engagement_time_sec)), COUNTIF(NOT is_bot_suspect)) AS avg_engagement_time_humans,
+    SAFE_DIVIDE(COUNTIF(has_purchase AND NOT is_bot_suspect), COUNTIF(NOT is_bot_suspect)) AS conversion_rate_humans,
+    SUM(IF(is_bot_suspect, 0, revenue)) AS revenue_humans,
+    COUNTIF(is_engaged AND NOT is_bot_suspect) AS engaged_human_sessions
+  FROM sessions
+  GROUP BY source, medium, campaign
+  HAVING COUNT(*) >= 50
+),
+
+costs AS (
+  SELECT LOWER(campaign) AS campaign_lower, SUM(cost) AS cost
+  FROM ${ref("fct_ad_costs_daily")}
+  WHERE cost_date >= ${helpers.daysAgo(30)}
+    AND campaign IS NOT NULL
+  GROUP BY 1
+),
+
+scored AS (
+  SELECT
+    p.*,
+    c.cost,
+    SAFE_DIVIDE(c.cost, p.engaged_human_sessions) AS cost_per_engaged_human_session,
+    c.cost * p.bot_share AS cost_on_bots,
+    45 * COALESCE(p.bot_share, 0) AS bot_penalty,
+    25 * COALESCE(p.attribution_loss_share, 0) AS loss_penalty,
+    15 * COALESCE(p.tagging_issue_share, 0) AS tagging_penalty,
+    15 * (1 - COALESCE(p.engagement_rate_humans, 0)) AS engagement_penalty
+  FROM per_campaign AS p
+  LEFT JOIN costs AS c ON c.campaign_lower = LOWER(p.campaign)
+)
+
+SELECT
+  * EXCEPT (bot_penalty, loss_penalty, tagging_penalty, engagement_penalty),
+  ROUND(GREATEST(0, 100 - bot_penalty - loss_penalty - tagging_penalty - engagement_penalty), 1) AS media_quality_score,
+  CASE
+    WHEN 100 - bot_penalty - loss_penalty - tagging_penalty - engagement_penalty >= 85 THEN 'A'
+    WHEN 100 - bot_penalty - loss_penalty - tagging_penalty - engagement_penalty >= 70 THEN 'B'
+    WHEN 100 - bot_penalty - loss_penalty - tagging_penalty - engagement_penalty >= 55 THEN 'C'
+    ELSE 'D'
+  END AS grade,
+  CASE GREATEST(bot_penalty, loss_penalty, tagging_penalty, engagement_penalty)
+    WHEN bot_penalty THEN 'bots'
+    WHEN loss_penalty THEN 'attribution_loss'
+    WHEN tagging_penalty THEN 'url_tagging'
+    ELSE 'low_engagement'
+  END AS main_problem,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored

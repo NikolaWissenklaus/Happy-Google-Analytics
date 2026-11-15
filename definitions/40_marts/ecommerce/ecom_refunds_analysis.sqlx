@@ -1,0 +1,48 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_refunds_analysis",
+  description: "Refund rate (GA4 refund events) by category, payment type, channel and new x repeat, last 180 days. A channel with high refund rate is buying the wrong customers (or the product page promises too much)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"]
+}
+
+WITH orders AS (
+  SELECT *
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND is_valid_for_revenue
+)
+
+SELECT 'channel' AS dimension, session_default_channel_group AS dimension_value,
+  COUNT(*) AS orders, COUNTIF(refunded_value > 0) AS refunded_orders, SUM(revenue) AS revenue, SUM(refunded_value) AS refunded_value,
+  SAFE_DIVIDE(COUNTIF(refunded_value > 0), COUNT(*)) AS refund_order_rate, SAFE_DIVIDE(SUM(refunded_value), SUM(revenue)) AS refund_value_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM orders GROUP BY 2
+UNION ALL
+SELECT 'payment_type', COALESCE(payment_type, '(not set)'),
+  COUNT(*), COUNTIF(refunded_value > 0), SUM(revenue), SUM(refunded_value),
+  SAFE_DIVIDE(COUNTIF(refunded_value > 0), COUNT(*)), SAFE_DIVIDE(SUM(refunded_value), SUM(revenue)), CURRENT_TIMESTAMP()
+FROM orders GROUP BY 2
+UNION ALL
+SELECT 'customer_type', IF(is_first_purchase, 'new', 'repeat'),
+  COUNT(*), COUNTIF(refunded_value > 0), SUM(revenue), SUM(refunded_value),
+  SAFE_DIVIDE(COUNTIF(refunded_value > 0), COUNT(*)), SAFE_DIVIDE(SUM(refunded_value), SUM(revenue)), CURRENT_TIMESTAMP()
+FROM orders GROUP BY 2
+UNION ALL
+SELECT 'device_category', COALESCE(device_category, '(not set)'),
+  COUNT(*), COUNTIF(refunded_value > 0), SUM(revenue), SUM(refunded_value),
+  SAFE_DIVIDE(COUNTIF(refunded_value > 0), COUNT(*)), SAFE_DIVIDE(SUM(refunded_value), SUM(revenue)), CURRENT_TIMESTAMP()
+FROM orders GROUP BY 2
+UNION ALL
+SELECT 'item_category', COALESCE(i.item_category, '(not set)'),
+  COUNT(DISTINCT i.transaction_id), COUNT(DISTINCT IF(o.refunded_value > 0, i.transaction_id, NULL)), SUM(i.item_revenue), SUM(o.refunded_value * i.item_share_of_order),
+  SAFE_DIVIDE(COUNT(DISTINCT IF(o.refunded_value > 0, i.transaction_id, NULL)), COUNT(DISTINCT i.transaction_id)),
+  SAFE_DIVIDE(SUM(o.refunded_value * i.item_share_of_order), SUM(i.item_revenue)), CURRENT_TIMESTAMP()
+FROM ${ref("fct_transaction_items")} AS i
+JOIN orders AS o USING (transaction_id)
+GROUP BY 2

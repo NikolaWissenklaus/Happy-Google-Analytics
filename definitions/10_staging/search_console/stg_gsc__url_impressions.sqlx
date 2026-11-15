@@ -1,0 +1,39 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_gsc__url_impressions",
+  disabled: !constants.ENABLE.search_console,
+  description: "Search Console bulk export at url level, with the url normalized to the same page_path used in GA4 (so they can be joined)",
+  bigquery: {
+    partitionBy: "data_date",
+    clusterBy: ["page_path", "query"],
+    labels: { layer: "staging", source: "search_console" }
+  },
+  tags: ["staging", "daily", "search_console", "optional"],
+  columns: {
+    page_path: "Normalized path of the url (same rule as GA4 page_path)",
+    avg_position: "Average position, 1 based (sum_position / impressions + 1)"
+  }
+}
+
+SELECT
+  data_date,
+  site_url,
+  url,
+  ${ga4.urlPath("url")} AS page_path,
+  LOWER(NET.HOST(url)) AS hostname,
+  query,
+  is_anonymized_query,
+  country,
+  search_type,
+  device,
+  impressions,
+  clicks,
+  sum_position,
+  SAFE_DIVIDE(sum_position, impressions) + 1 AS avg_position,
+  SAFE_DIVIDE(clicks, impressions) AS ctr,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("searchdata_url_impression")}
+WHERE data_date >= ${helpers.martWindowStart()}

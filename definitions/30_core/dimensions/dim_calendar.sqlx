@@ -1,0 +1,155 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "dim_calendar",
+  description: "Calendar with brazilian national holidays (Easter based ones calculated), retail dates (Black Friday, Dia das Maes, Dia dos Pais, Natal...), business days, '5o dia util' and the right dates to compare (same weekday last year)",
+  bigquery: {
+    labels: { layer: "core", domain: "calendar" }
+  },
+  tags: ["core", "daily", "calendar"],
+  columns: {
+    date_day: "The date",
+    same_weekday_last_year: "date - 364 days. Compare with this one, not with the same date (weekday matters a lot in ecommerce)",
+    holiday_name: "Brazilian national holiday / ponto facultativo (br_holiday_name)",
+    retail_event: "Retail date: Black Friday, Cyber Monday, Dia das Maes, Dia dos Namorados, Dia dos Pais, Dia das Criancas, Natal, Dia do Consumidor...",
+    business_day_of_month: "1, 2, 3... counting only business days (no weekend, no national holiday)",
+    is_salary_window: "Between the 5th business day (when most CLT salaries are paid) and 3 days after it",
+    is_special_day: "holiday or retail event or the week before christmas. anomaly detection asks for more votes on these days"
+  }
+}
+
+WITH
+days AS (
+  SELECT date_day
+  FROM UNNEST(GENERATE_DATE_ARRAY(
+    DATE_SUB(DATE '${constants.START_DATE}', INTERVAL 400 DAY),
+    DATE_ADD(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 400 DAY)
+  )) AS date_day
+),
+
+-- moving dates of each year
+year_anchors AS (
+  SELECT
+    y AS year_number,
+    ${ref("easter_date")}(y) AS easter,
+    -- 4th thursday of november (US thanksgiving) + 1 = black friday
+    DATE_ADD(DATE(y, 11, 1), INTERVAL MOD(5 - EXTRACT(DAYOFWEEK FROM DATE(y, 11, 1)) + 7, 7) + 22 DAY) AS black_friday,
+    -- 2nd sunday of may / august
+    DATE_ADD(DATE(y, 5, 1), INTERVAL MOD(1 - EXTRACT(DAYOFWEEK FROM DATE(y, 5, 1)) + 7, 7) + 7 DAY) AS dia_das_maes,
+    DATE_ADD(DATE(y, 8, 1), INTERVAL MOD(1 - EXTRACT(DAYOFWEEK FROM DATE(y, 8, 1)) + 7, 7) + 7 DAY) AS dia_dos_pais
+  FROM UNNEST(GENERATE_ARRAY(
+    EXTRACT(YEAR FROM DATE_SUB(DATE '${constants.START_DATE}', INTERVAL 400 DAY)),
+    EXTRACT(YEAR FROM DATE_ADD(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 400 DAY))
+  )) AS y
+),
+
+with_holidays AS (
+  SELECT
+    d.date_day,
+    a.*,
+    ${ref("br_holiday_name")}(d.date_day) AS holiday_name,
+    EXTRACT(DAYOFWEEK FROM d.date_day) IN (1, 7) AS is_weekend
+  FROM days AS d
+  JOIN year_anchors AS a ON a.year_number = EXTRACT(YEAR FROM d.date_day)
+),
+
+with_retail AS (
+  SELECT
+    *,
+    CASE
+      WHEN date_day = black_friday THEN 'Black Friday'
+      WHEN date_day = DATE_ADD(black_friday, INTERVAL 3 DAY) THEN 'Cyber Monday'
+      WHEN date_day BETWEEN DATE_SUB(black_friday, INTERVAL 6 DAY) AND DATE_SUB(black_friday, INTERVAL 1 DAY) THEN 'Black Week'
+      WHEN date_day BETWEEN DATE_ADD(black_friday, INTERVAL 1 DAY) AND DATE_ADD(black_friday, INTERVAL 2 DAY) THEN 'Black Friday weekend'
+      WHEN date_day = dia_das_maes THEN 'Dia das Mães'
+      WHEN date_day BETWEEN DATE_SUB(dia_das_maes, INTERVAL 13 DAY) AND DATE_SUB(dia_das_maes, INTERVAL 1 DAY) THEN 'Dia das Mães (pre)'
+      WHEN date_day = dia_dos_pais THEN 'Dia dos Pais'
+      WHEN date_day BETWEEN DATE_SUB(dia_dos_pais, INTERVAL 13 DAY) AND DATE_SUB(dia_dos_pais, INTERVAL 1 DAY) THEN 'Dia dos Pais (pre)'
+      WHEN FORMAT_DATE('%m-%d', date_day) = '06-12' THEN 'Dia dos Namorados'
+      WHEN FORMAT_DATE('%m-%d', date_day) BETWEEN '06-05' AND '06-11' THEN 'Dia dos Namorados (pre)'
+      WHEN FORMAT_DATE('%m-%d', date_day) = '10-12' THEN 'Dia das Crianças'
+      WHEN FORMAT_DATE('%m-%d', date_day) BETWEEN '10-01' AND '10-11' THEN 'Dia das Crianças (pre)'
+      WHEN FORMAT_DATE('%m-%d', date_day) = '03-15' THEN 'Dia do Consumidor'
+      WHEN FORMAT_DATE('%m-%d', date_day) BETWEEN '03-09' AND '03-14' THEN 'Semana do Consumidor'
+      WHEN FORMAT_DATE('%m-%d', date_day) = '09-15' THEN 'Dia do Cliente'
+      WHEN FORMAT_DATE('%m-%d', date_day) = '11-11' THEN '11.11'
+      WHEN FORMAT_DATE('%m-%d', date_day) BETWEEN '12-01' AND '12-24' THEN 'Natal (compras)'
+      WHEN FORMAT_DATE('%m-%d', date_day) BETWEEN '12-26' AND '12-31' THEN 'Pós Natal'
+      WHEN date_day BETWEEN DATE_SUB(easter, INTERVAL 14 DAY) AND DATE_SUB(easter, INTERVAL 1 DAY) THEN 'Páscoa (pre)'
+      ELSE NULL
+    END AS retail_event,
+    CASE
+      WHEN holiday_name IN ('Carnaval (segunda)', 'Carnaval (terça)', 'Quarta-feira de Cinzas', 'Corpus Christi') THEN 'ponto_facultativo'
+      WHEN holiday_name IS NOT NULL THEN 'national'
+      ELSE NULL
+    END AS holiday_type
+  FROM with_holidays
+),
+
+business_days AS (
+  SELECT
+    *,
+    NOT is_weekend AND (holiday_type IS NULL OR holiday_type = 'ponto_facultativo' AND holiday_name = 'Quarta-feira de Cinzas') AS is_business_day
+  FROM with_retail
+),
+
+count_business_days AS (
+  SELECT
+    *,
+    IF(is_business_day, COUNTIF(is_business_day) OVER (PARTITION BY DATE_TRUNC(date_day, MONTH) ORDER BY date_day), NULL) AS business_day_of_month
+  FROM business_days
+),
+
+fifth_business_day AS (
+  SELECT DATE_TRUNC(date_day, MONTH) AS month_start, MIN(date_day) AS salary_day
+  FROM count_business_days
+  WHERE business_day_of_month = 5
+  GROUP BY 1
+)
+
+SELECT
+  c.date_day,
+  EXTRACT(YEAR FROM c.date_day) AS year_number,
+  EXTRACT(QUARTER FROM c.date_day) AS quarter_number,
+  EXTRACT(MONTH FROM c.date_day) AS month_number,
+  FORMAT_DATE('%Y-%m', c.date_day) AS year_month,
+  EXTRACT(DAY FROM c.date_day) AS day_of_month,
+  EXTRACT(DAYOFYEAR FROM c.date_day) AS day_of_year,
+  MOD(EXTRACT(DAYOFWEEK FROM c.date_day) + 5, 7) + 1 AS iso_weekday,
+  FORMAT_DATE('%A', c.date_day) AS weekday_name,
+  ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'][OFFSET(EXTRACT(DAYOFWEEK FROM c.date_day) - 1)] AS weekday_name_pt,
+  ${ref("iso_year_week")}(c.date_day) AS iso_year_week,
+  DATE_TRUNC(c.date_day, WEEK(MONDAY)) AS week_start,
+  DATE_TRUNC(c.date_day, MONTH) AS month_start,
+  LAST_DAY(c.date_day, MONTH) AS month_end,
+  DATE_TRUNC(c.date_day, QUARTER) AS quarter_start,
+  DATE_TRUNC(c.date_day, YEAR) AS year_start,
+  DATE_SUB(c.date_day, INTERVAL 364 DAY) AS same_weekday_last_year,
+  DATE_SUB(c.date_day, INTERVAL 1 YEAR) AS same_date_last_year,
+  DATE_SUB(c.date_day, INTERVAL 7 DAY) AS same_weekday_last_week,
+  c.is_weekend,
+  c.holiday_name,
+  c.holiday_type,
+  c.holiday_name IS NOT NULL AS is_holiday,
+  c.retail_event,
+  c.is_business_day,
+  c.business_day_of_month,
+  c.date_day BETWEEN f.salary_day AND DATE_ADD(f.salary_day, INTERVAL 3 DAY) AS is_salary_window,
+  -- 13o salario: first installment until nov 30, second until dec 20. people shop with it
+  (EXTRACT(MONTH FROM c.date_day) = 11 AND EXTRACT(DAY FROM c.date_day) >= 25) OR (EXTRACT(MONTH FROM c.date_day) = 12 AND EXTRACT(DAY FROM c.date_day) BETWEEN 15 AND 22) AS is_13th_salary_window,
+  CASE
+    WHEN EXTRACT(MONTH FROM c.date_day) IN (12, 1, 2) THEN 'verao'
+    WHEN EXTRACT(MONTH FROM c.date_day) IN (3, 4, 5) THEN 'outono'
+    WHEN EXTRACT(MONTH FROM c.date_day) IN (6, 7, 8) THEN 'inverno'
+    ELSE 'primavera'
+  END AS season_br,
+  c.black_friday AS black_friday_of_year,
+  DATE_DIFF(c.black_friday, c.date_day, DAY) AS days_to_black_friday,
+  DATE_DIFF(DATE(c.year_number, 12, 25), c.date_day, DAY) AS days_to_christmas,
+  c.holiday_name IS NOT NULL OR c.retail_event IN ('Black Friday', 'Cyber Monday', 'Black Week', 'Black Friday weekend', 'Dia das Mães', 'Dia dos Pais', 'Dia dos Namorados', 'Dia das Crianças', 'Dia do Consumidor', '11.11')
+    OR FORMAT_DATE('%m-%d', c.date_day) BETWEEN '12-18' AND '12-31' AS is_special_day,
+  c.date_day > CURRENT_DATE('${constants.TIMEZONE}') AS is_future
+FROM count_business_days AS c
+LEFT JOIN fifth_business_day AS f ON f.month_start = DATE_TRUNC(c.date_day, MONTH)

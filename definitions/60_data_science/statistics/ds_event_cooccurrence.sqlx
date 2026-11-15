@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_event_cooccurrence",
+  description: "Which events happen together in the same session (last 30 days, top 40 events): co-occurrence count, lift and phi correlation for every pair. Finds hidden behaviours ('who watches the video also uses the size guide') and duplicated / redundant tracking",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics" }
+  },
+  tags: ["data_science", "statistics", "daily"]
+}
+
+WITH
+session_events AS (
+  SELECT DISTINCT session_key, event_name
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND session_key IS NOT NULL
+    AND event_name NOT IN ('session_start', 'user_engagement', 'first_visit')
+    ${helpers.noiseFilter()}
+),
+
+top_events AS (
+  SELECT event_name, COUNT(*) AS sessions_with_event
+  FROM session_events
+  GROUP BY 1
+  ORDER BY 2 DESC
+  LIMIT 40
+),
+
+total AS (SELECT COUNT(DISTINCT session_key) AS sessions FROM session_events),
+
+pairs AS (
+  SELECT a.event_name AS event_a, b.event_name AS event_b, COUNT(*) AS sessions_with_both
+  FROM session_events AS a
+  JOIN session_events AS b ON a.session_key = b.session_key AND a.event_name < b.event_name
+  WHERE a.event_name IN (SELECT event_name FROM top_events)
+    AND b.event_name IN (SELECT event_name FROM top_events)
+  GROUP BY 1, 2
+)
+
+SELECT
+  p.event_a,
+  p.event_b,
+  p.sessions_with_both,
+  ta.sessions_with_event AS sessions_with_a,
+  tb.sessions_with_event AS sessions_with_b,
+  SAFE_DIVIDE(p.sessions_with_both * t.sessions, CAST(ta.sessions_with_event AS FLOAT64) * tb.sessions_with_event) AS lift,
+  SAFE_DIVIDE(
+    CAST(p.sessions_with_both AS FLOAT64) * t.sessions - CAST(ta.sessions_with_event AS FLOAT64) * tb.sessions_with_event,
+    SQRT(CAST(ta.sessions_with_event AS FLOAT64) * tb.sessions_with_event * (t.sessions - ta.sessions_with_event) * (t.sessions - tb.sessions_with_event))
+  ) AS phi,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+CROSS JOIN total AS t
+JOIN top_events AS ta ON ta.event_name = p.event_a
+JOIN top_events AS tb ON tb.event_name = p.event_b

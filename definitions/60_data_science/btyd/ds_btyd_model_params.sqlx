@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_btyd_model_params",
+  description: "BG/NBD (purchase / dropout process) and Gamma-Gamma (spend) fitted INSIDE BigQuery by maximum likelihood with the JS UDFs fit_bg_nbd / fit_gamma_gamma. One row with the parameters, convergence and the frequency x monetary correlation (Gamma-Gamma assumes ~0)",
+  bigquery: {
+    labels: { layer: "data_science", domain: "btyd" }
+  },
+  tags: ["data_science", "btyd", "daily"],
+  columns: {
+    frequency_monetary_correlation: "Should be close to 0 for Gamma-Gamma to be valid. Above 0.3 take the monetary part with care"
+  }
+}
+
+-- grouped by integer weeks: the UDF gets thousands of rows instead of millions of customers
+WITH
+grouped_rfm AS (
+  SELECT
+    CAST(frequency AS FLOAT64) AS x,
+    ROUND(recency) AS t_x,
+    ROUND(customer_age) AS t_cal,
+    CAST(COUNT(*) AS FLOAT64) AS n
+  FROM ${ref("ds_btyd_summary")}
+  WHERE customer_age >= 1
+  GROUP BY 1, 2, 3
+),
+
+grouped_spend AS (
+  SELECT
+    CAST(frequency AS FLOAT64) AS x,
+    ROUND(monetary_value) AS m,
+    CAST(COUNT(*) AS FLOAT64) AS n
+  FROM ${ref("ds_btyd_summary")}
+  WHERE frequency > 0 AND monetary_value > 0
+  GROUP BY 1, 2
+),
+
+fits AS (
+  SELECT
+    ${ref("fit_bg_nbd")}(ARRAY(SELECT AS STRUCT x, t_x, t_cal, n FROM grouped_rfm), ${cfg_ds.btyd.penalizer}) AS bg_nbd,
+    ${ref("fit_gamma_gamma")}(ARRAY(SELECT AS STRUCT x, m, n FROM grouped_spend), ${cfg_ds.btyd.penalizer}) AS gamma_gamma,
+    (SELECT CORR(frequency, monetary_value) FROM ${ref("ds_btyd_summary")} WHERE frequency > 0) AS frequency_monetary_correlation,
+    (SELECT COUNT(*) FROM ${ref("ds_btyd_summary")}) AS customers,
+    (SELECT COUNT(*) FROM grouped_rfm) AS distinct_rfm_rows
+)
+
+SELECT
+  CURRENT_DATE('${constants.TIMEZONE}') AS fitted_on,
+  customers,
+  distinct_rfm_rows,
+  bg_nbd.r AS bg_r,
+  bg_nbd.alpha AS bg_alpha,
+  bg_nbd.a AS bg_a,
+  bg_nbd.b AS bg_b,
+  bg_nbd.log_likelihood AS bg_log_likelihood,
+  bg_nbd.converged AS bg_converged,
+  gamma_gamma.p AS gg_p,
+  gamma_gamma.q AS gg_q,
+  gamma_gamma.v AS gg_v,
+  gamma_gamma.converged AS gg_converged,
+  -- population average spend implied by the model: p * v / (q - 1)
+  SAFE_DIVIDE(gamma_gamma.p * gamma_gamma.v, gamma_gamma.q - 1) AS gg_population_mean_spend,
+  frequency_monetary_correlation,
+  ${cfg_ds.btyd.time_unit_days} AS time_unit_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fits

@@ -1,0 +1,30 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_double_tagging_pages",
+  description: "Pages where page_view fires twice in less than 1 second (last 14 days). Classic causes: gtag in the template + GA4 tag in GTM, SPA sending history change AND the router event, or the consent banner re-triggering the config. Inflates views and kills the engagement metrics",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "tracking"]
+}
+
+SELECT
+  page_path,
+  ANY_VALUE(page_hostname) AS hostname,
+  COUNT(*) AS page_views,
+  COUNTIF(is_reload AND seconds_since_previous_view < 1) AS double_fires,
+  SAFE_DIVIDE(COUNTIF(is_reload AND seconds_since_previous_view < 1), COUNT(*)) AS double_fire_rate,
+  APPROX_QUANTILES(IF(is_reload, seconds_since_previous_view, NULL), 2)[OFFSET(1)] AS median_seconds_between_reloads,
+  CASE
+    WHEN SAFE_DIVIDE(COUNTIF(is_reload AND seconds_since_previous_view < 1), COUNT(*)) > 0.4 THEN 'systematic (almost every view) - check tag setup'
+    WHEN SAFE_DIVIDE(COUNTIF(is_reload AND seconds_since_previous_view < 1), COUNT(*)) > 0.05 THEN 'frequent - check SPA / consent triggers'
+    ELSE 'occasional'
+  END AS diagnosis,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("int_ga4__page_views")}
+WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 14 DAY)
+GROUP BY page_path
+HAVING COUNTIF(is_reload AND seconds_since_previous_view < 1) >= 10

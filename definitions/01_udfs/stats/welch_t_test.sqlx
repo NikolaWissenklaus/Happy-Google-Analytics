@@ -1,0 +1,32 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "welch_t_test",
+  description: "Welch t test for two means (ex: revenue per user in an A/B test). p value with normal approx, ok for n > 30",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- for conversion rate use z_test_proportions. this one is for continuous metrics
+-- (revenue per session, AOV, engagement time...). pass VAR_SAMP as variance.
+CREATE OR REPLACE FUNCTION ${self()}(mean_a FLOAT64, var_a FLOAT64, n_a FLOAT64, mean_b FLOAT64, var_b FLOAT64, n_b FLOAT64)
+RETURNS STRUCT<diff FLOAT64, rel_diff FLOAT64, t FLOAT64, df FLOAT64, p_value FLOAT64> AS ((
+  SELECT
+    STRUCT(
+      mean_b - mean_a AS diff,
+      SAFE_DIVIDE(mean_b - mean_a, ABS(mean_a)) AS rel_diff,
+      t AS t,
+      df AS df,
+      IF(t IS NULL, NULL, 2 * (1 - ${ref("normal_cdf")}(ABS(t)))) AS p_value
+    )
+  FROM (
+    SELECT
+      SAFE_DIVIDE(mean_b - mean_a, SQRT(se2)) AS t,
+      SAFE_DIVIDE(se2 * se2, SAFE_DIVIDE(POW(SAFE_DIVIDE(var_a, n_a), 2), n_a - 1) + SAFE_DIVIDE(POW(SAFE_DIVIDE(var_b, n_b), 2), n_b - 1)) AS df
+    FROM (SELECT SAFE_DIVIDE(var_a, n_a) + SAFE_DIVIDE(var_b, n_b) AS se2)
+  )
+))
+OPTIONS (description = "Welch two sample t test")

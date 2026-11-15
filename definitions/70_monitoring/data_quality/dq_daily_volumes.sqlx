@@ -1,0 +1,44 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_daily_volumes",
+  description: "Raw volumes of the export per day and platform (events, devices, sessions, page views, purchases, cookieless, internal, debug, duplicates) straight from staging, before any business filter. The 'is the tag still firing' table",
+  bigquery: {
+    partitionBy: "event_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+SELECT
+  event_date,
+  platform,
+  stream_id,
+  COUNT(*) AS events,
+  COUNT(DISTINCT user_pseudo_id) AS devices,
+  COUNT(DISTINCT session_key) AS sessions,
+  COUNT(DISTINCT event_name) AS distinct_event_names,
+  COUNTIF(event_name = 'session_start') AS session_starts,
+  COUNTIF(event_name = 'page_view') AS page_views,
+  COUNTIF(event_name = 'purchase') AS purchase_events,
+  COUNTIF(is_cookieless) AS cookieless_events,
+  COUNTIF(is_internal_traffic) AS internal_events,
+  COUNTIF(is_debug) AS debug_events,
+  COUNTIF(is_non_production_host) AS non_production_host_events,
+  SUM(duplicate_count - 1) AS duplicated_rows_removed,
+  COUNTIF(source_table_type = 'intraday') AS intraday_events,
+  COUNTIF(user_id IS NOT NULL) AS events_with_user_id,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_ga4__events")}
+WHERE event_date >= run_from
+GROUP BY 1, 2, 3
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

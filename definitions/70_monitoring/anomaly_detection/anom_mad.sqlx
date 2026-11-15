@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_mad",
+  description: "Method 3 - robust modified z-score (Iglewicz & Hoaglin): median and MAD of the previous 56 days. One crazy day in the history does not blind it like it blinds the mean / std",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"]
+}
+
+WITH
+history AS (
+  SELECT
+    *,
+    ARRAY_AGG(value) OVER (
+      PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date)
+      RANGE BETWEEN ${cfg_anomaly.mad.window_days} PRECEDING AND 1 PRECEDING
+    ) AS hist
+  FROM ${ref("anom_metric_series_daily")}
+),
+
+with_median AS (
+  SELECT
+    * EXCEPT (hist),
+    hist,
+    (SELECT APPROX_QUANTILES(h, 2)[OFFSET(1)] FROM UNNEST(hist) AS h) AS median_value
+  FROM history
+  WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+),
+
+with_mad AS (
+  SELECT
+    * EXCEPT (hist),
+    ARRAY_LENGTH(hist) AS history_points,
+    (SELECT APPROX_QUANTILES(ABS(h - median_value), 2)[OFFSET(1)] FROM UNNEST(hist) AS h) AS mad
+  FROM with_median
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  median_value AS expected,
+  median_value - ${cfg_anomaly.mad.threshold} * mad / 0.6745 AS lower_bound,
+  median_value + ${cfg_anomaly.mad.threshold} * mad / 0.6745 AS upper_bound,
+  SAFE_DIVIDE(0.6745 * (value - median_value), NULLIF(mad, 0)) AS score,
+  history_points >= ${cfg_anomaly.min_history_points}
+    AND ABS(SAFE_DIVIDE(0.6745 * (value - median_value), NULLIF(mad, 0))) > ${cfg_anomaly.mad.threshold} AS is_anomaly,
+  'mad' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_mad

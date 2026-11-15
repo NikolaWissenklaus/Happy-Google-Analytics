@@ -1,0 +1,49 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_page_value",
+  description: "UA 'Page Value' resurrected (last 30 days): revenue of the sessions that saw the page BEFORE the purchase, divided by the unique pageviews of the page. Tells which content and product pages lead to money, the metric GA4 killed and everybody misses",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro", ua_report: "true" }
+  },
+  tags: ["marts", "cro", "daily", "ua_report"],
+  columns: {
+    page_value: "(revenue of sessions where the page was seen before the first purchase) / unique pageviews. Same formula of UA (transactions only, no goal values)"
+  }
+}
+
+WITH
+purchase_moment AS (
+  SELECT session_key, first_purchase_ts
+  FROM ${ref("int_ga4__session_ecommerce_flags")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 31 DAY)
+    AND first_purchase_ts IS NOT NULL
+),
+
+unique_page_sessions AS (
+  SELECT
+    pv.page_path,
+    pv.session_key,
+    ANY_VALUE(pv.page_type) AS page_type,
+    ANY_VALUE(pv.session_revenue) AS session_revenue,
+    LOGICAL_OR(p.first_purchase_ts IS NOT NULL AND pv.event_ts <= p.first_purchase_ts) AS seen_before_purchase
+  FROM ${ref("fct_page_views")} AS pv
+  LEFT JOIN purchase_moment AS p USING (session_key)
+  WHERE pv.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT COALESCE(pv.is_bot_suspect, FALSE)
+  GROUP BY 1, 2
+)
+
+SELECT
+  page_path,
+  ANY_VALUE(page_type) AS page_type,
+  COUNT(*) AS unique_pageviews,
+  COUNTIF(seen_before_purchase) AS sessions_seen_before_purchase,
+  SUM(IF(seen_before_purchase, session_revenue, 0)) AS influenced_revenue,
+  SAFE_DIVIDE(SUM(IF(seen_before_purchase, session_revenue, 0)), COUNT(*)) AS page_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM unique_page_sessions
+GROUP BY page_path
+HAVING COUNT(*) >= 30

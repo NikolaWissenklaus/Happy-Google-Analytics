@@ -1,0 +1,94 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_growth_accounting",
+  description: "Growth accounting per month for users AND customers: new, retained, resurrected (came back after missing a month) and churned (active last month, not this month), plus the Quick Ratio = (new + resurrected) / churned. Below 1 the base is shrinking, no matter what the revenue says",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "retention"],
+  columns: {
+    entity: "users (any session) or customers (any valid purchase)",
+    quick_ratio: "(new + resurrected) / churned. > 1 growing, < 1 shrinking. Healthy consumer products: 1.5+"
+  }
+}
+
+WITH
+monthly_activity AS (
+  SELECT DISTINCT 'users' AS entity, user_key, DATE_TRUNC(activity_date, MONTH) AS month_start
+  FROM ${ref("fct_user_daily")}
+  UNION ALL
+  SELECT DISTINCT 'customers', user_key, DATE_TRUNC(transaction_date, MONTH)
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+),
+
+first_month AS (
+  SELECT entity, user_key, MIN(month_start) AS first_month
+  FROM monthly_activity
+  GROUP BY 1, 2
+),
+
+months AS (
+  SELECT month_start
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE_TRUNC(DATE '${constants.START_DATE}', MONTH), DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 1 MONTH)) AS month_start
+),
+
+-- classify each (entity, user, month) where the user was active this month or last month
+states AS (
+  SELECT
+    e.entity,
+    m.month_start,
+    a.user_key,
+    a.user_key IS NOT NULL AS active_now,
+    prev.user_key IS NOT NULL AS active_previous,
+    f.first_month
+  FROM months AS m
+  CROSS JOIN (SELECT DISTINCT entity FROM monthly_activity) AS e
+  LEFT JOIN monthly_activity AS a ON a.entity = e.entity AND a.month_start = m.month_start
+  LEFT JOIN monthly_activity AS prev ON prev.entity = e.entity AND prev.user_key = a.user_key AND prev.month_start = DATE_SUB(m.month_start, INTERVAL 1 MONTH)
+  LEFT JOIN first_month AS f ON f.entity = e.entity AND f.user_key = a.user_key
+),
+
+churned AS (
+  SELECT
+    p.entity,
+    DATE_ADD(p.month_start, INTERVAL 1 MONTH) AS month_start,
+    COUNT(*) AS churned
+  FROM monthly_activity AS p
+  LEFT JOIN monthly_activity AS n
+    ON n.entity = p.entity AND n.user_key = p.user_key AND n.month_start = DATE_ADD(p.month_start, INTERVAL 1 MONTH)
+  WHERE n.user_key IS NULL
+    AND DATE_ADD(p.month_start, INTERVAL 1 MONTH) <= DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH)
+  GROUP BY 1, 2
+),
+
+counts AS (
+  SELECT
+    entity,
+    month_start,
+    COUNTIF(active_now) AS active,
+    COUNTIF(active_now AND first_month = month_start) AS new,
+    COUNTIF(active_now AND active_previous) AS retained,
+    COUNTIF(active_now AND NOT active_previous AND first_month < month_start) AS resurrected
+  FROM states
+  GROUP BY 1, 2
+)
+
+SELECT
+  c.entity,
+  c.month_start,
+  c.active,
+  c.new,
+  c.retained,
+  c.resurrected,
+  COALESCE(ch.churned, 0) AS churned,
+  SAFE_DIVIDE(c.new + c.resurrected, ch.churned) AS quick_ratio,
+  SAFE_DIVIDE(c.retained, LAG(c.active) OVER (PARTITION BY c.entity ORDER BY c.month_start)) AS month_over_month_retention,
+  c.month_start = DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH) AS is_partial_month,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM counts AS c
+LEFT JOIN churned AS ch USING (entity, month_start)
+WHERE c.active > 0

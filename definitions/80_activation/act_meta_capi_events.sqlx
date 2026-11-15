@@ -1,0 +1,140 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_meta_capi_events",
+  description: "Meta Conversions API events of the last 7 days (Meta refuses events older than 7 days): key events of consented users mapped to the Meta standard names (cfg_key_events meta_event_name), event_id for the dedup with the pixel, fbc rebuilt from the fbclid of the last Meta click (7 days), external_id = SHA256(user_id), contents of the order and, with enable_crm, hashed email and phone. payload_json is the object of the data[] array, ready to POST",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["meta_event_name"],
+    labels: { layer: "activation", destination: "meta" }
+  },
+  tags: ["activation", "daily", "meta"],
+  columns: {
+    event_id: "transaction_id for purchases (send the same as eventID in the pixel and Meta deduplicates), else the key event id",
+    fbc: "fb.1.<ms of the click>.<fbclid>, the format of the _fbc cookie",
+    payload_json: "One CAPI event. IP and user agent are not in the GA4 export, so the match quality is lower than a server side tag"
+  }
+}
+
+WITH
+key_events AS (
+  SELECT
+    k.key_event_id,
+    k.key_event_name,
+    c.meta_event_name,
+    k.event_id AS ga4_event_id,
+    k.event_date,
+    k.event_ts,
+    k.user_key,
+    k.transaction_id,
+    IF(k.transaction_id IS NOT NULL, t.revenue, k.key_event_value) AS value,
+    COALESCE(t.currency, k.currency, '${constants.CURRENCY}') AS currency
+  FROM ${ref("fct_key_events")} AS k
+  JOIN ${ref("seed_key_events")} AS c USING (key_event_name)
+  LEFT JOIN ${ref("fct_transactions")} AS t ON t.transaction_id = k.transaction_id
+  WHERE k.event_date >= ${helpers.daysAgo(7)}
+    AND c.meta_event_name IS NOT NULL
+    AND (k.transaction_id IS NULL OR COALESCE(t.is_valid_for_revenue, FALSE))
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY c.meta_event_name, COALESCE(k.transaction_id, k.key_event_id) ORDER BY k.event_ts) = 1
+),
+
+-- the page where it happened, already masked by staging
+event_pages AS (
+  SELECT event_id, ANY_VALUE(page_location) AS page_location, ANY_VALUE(platform) AS platform
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(8)}
+  GROUP BY event_id
+),
+
+meta_clicks AS (
+  SELECT user_key, session_start_ts AS click_ts, fbclid
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(15)}
+    AND fbclid IS NOT NULL
+),
+
+with_click AS (
+  SELECT
+    e.*,
+    m.fbclid,
+    m.click_ts
+  FROM key_events AS e
+  LEFT JOIN meta_clicks AS m
+    ON m.user_key = e.user_key
+    AND m.click_ts <= e.event_ts
+    AND m.click_ts >= TIMESTAMP_SUB(e.event_ts, INTERVAL 7 DAY)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY e.key_event_id ORDER BY m.click_ts DESC) = 1
+),
+
+order_contents AS (
+  SELECT
+    transaction_id,
+    ARRAY_AGG(STRUCT(item_id AS id, quantity, price AS item_price) ORDER BY item_position) AS contents,
+    SUM(quantity) AS num_items
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= ${helpers.daysAgo(8)}
+    AND item_id IS NOT NULL
+  GROUP BY transaction_id
+)
+
+${constants.ENABLE.crm ? `,
+crm_contacts AS (
+  SELECT CONCAT('uid:', user_id) AS user_key, ANY_VALUE(email_sha256_meta) AS em, ANY_VALUE(phone_sha256_meta) AS ph
+  FROM ${ref("stg_crm__customers")}
+  WHERE user_id IS NOT NULL
+  GROUP BY 1
+)` : ``},
+
+final AS (
+  SELECT
+    w.event_date,
+    w.meta_event_name,
+    w.key_event_name,
+    COALESCE(w.transaction_id, w.key_event_id) AS event_id,
+    UNIX_SECONDS(w.event_ts) AS event_time,
+    IF(p.platform IN ('ANDROID', 'IOS'), 'app', 'website') AS action_source,
+    p.page_location AS event_source_url,
+    IF(w.fbclid IS NULL, NULL, CONCAT('fb.1.', CAST(UNIX_MILLIS(w.click_ts) AS STRING), '.', w.fbclid)) AS fbc,
+    IF(e.user_id IS NULL, NULL, TO_HEX(SHA256(e.user_id))) AS external_id,
+    ${constants.ENABLE.crm ? `cc.em, cc.ph,` : `CAST(NULL AS STRING) AS em, CAST(NULL AS STRING) AS ph,`}
+    ROUND(COALESCE(w.value, 0), 2) AS value,
+    w.currency,
+    w.transaction_id AS order_id,
+    oc.contents,
+    oc.num_items,
+    w.user_key
+  FROM with_click AS w
+  JOIN ${ref("act_consent_eligible_users")} AS e ON e.user_key = w.user_key AND e.can_send_to_ads
+  LEFT JOIN event_pages AS p ON p.event_id = w.ga4_event_id
+  LEFT JOIN order_contents AS oc ON oc.transaction_id = w.transaction_id
+  ${constants.ENABLE.crm ? `LEFT JOIN crm_contacts AS cc ON cc.user_key = w.user_key` : ``}
+)
+
+SELECT
+  *,
+  ${helpers.jsonStripNulls(`TO_JSON_STRING(STRUCT(
+    meta_event_name AS event_name,
+    event_time,
+    event_id,
+    action_source,
+    event_source_url,
+    STRUCT(
+      IF(em IS NULL, NULL, [em]) AS em,
+      IF(ph IS NULL, NULL, [ph]) AS ph,
+      IF(external_id IS NULL, NULL, [external_id]) AS external_id,
+      fbc
+    ) AS user_data,
+    STRUCT(
+      value,
+      currency,
+      order_id,
+      ARRAY(SELECT c.id FROM UNNEST(contents) AS c) AS content_ids,
+      contents,
+      IF(contents IS NULL, NULL, 'product') AS content_type,
+      num_items
+    ) AS custom_data
+  ))`)} AS payload_json,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM final

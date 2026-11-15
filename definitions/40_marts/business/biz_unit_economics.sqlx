@@ -1,0 +1,70 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_unit_economics",
+  description: "Unit economics per month: marketing cost (all cost sources), new customers, blended CAC, revenue of the new customers in 90 days, LTV/CAC with the assumed gross margin and payback in months. Plus MER (revenue / total marketing cost), the metric that does not care about attribution fights",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "costs"],
+  columns: {
+    blended_cac: "Total marketing cost / new customers (all channels, also organic ones in the denominator)",
+    mer: "Marketing efficiency ratio = total revenue / total marketing cost",
+    payback_months: "Months of gross margin of the average new customer to pay the CAC (based on the 90 day revenue)"
+  }
+}
+
+WITH
+costs AS (
+  SELECT DATE_TRUNC(cost_date, MONTH) AS month_start, SUM(cost) AS marketing_cost
+  FROM ${ref("int_costs__unified_daily")}
+  GROUP BY 1
+),
+
+orders AS (
+  SELECT
+    DATE_TRUNC(transaction_date, MONTH) AS month_start,
+    SUM(revenue) AS revenue,
+    COUNTIF(is_first_purchase) AS new_customers
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+  GROUP BY 1
+),
+
+new_customer_value AS (
+  SELECT
+    DATE_TRUNC(f.transaction_date, MONTH) AS month_start,
+    AVG(v.revenue_90d) AS avg_revenue_90d_per_new_customer
+  FROM ${ref("fct_transactions")} AS f
+  JOIN (
+    SELECT a.user_key, SUM(b.revenue) AS revenue_90d
+    FROM ${ref("fct_transactions")} AS a
+    JOIN ${ref("fct_transactions")} AS b
+      ON b.user_key = a.user_key
+      AND b.is_valid_for_revenue
+      AND b.transaction_date BETWEEN a.transaction_date AND DATE_ADD(a.transaction_date, INTERVAL 89 DAY)
+    WHERE a.is_first_purchase AND a.is_valid_for_revenue
+    GROUP BY a.user_key
+  ) AS v USING (user_key)
+  WHERE f.is_first_purchase
+    AND f.transaction_date <= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY 1
+)
+
+SELECT
+  o.month_start,
+  COALESCE(c.marketing_cost, 0) AS marketing_cost,
+  o.revenue,
+  o.new_customers,
+  SAFE_DIVIDE(c.marketing_cost, o.new_customers) AS blended_cac,
+  SAFE_DIVIDE(o.revenue, c.marketing_cost) AS mer,
+  v.avg_revenue_90d_per_new_customer,
+  SAFE_DIVIDE(v.avg_revenue_90d_per_new_customer * ${cfg_project.assumed_gross_margin}, SAFE_DIVIDE(c.marketing_cost, o.new_customers)) AS ltv90_to_cac,
+  SAFE_DIVIDE(SAFE_DIVIDE(c.marketing_cost, o.new_customers), v.avg_revenue_90d_per_new_customer * ${cfg_project.assumed_gross_margin} / 3) AS payback_months,
+  ${cfg_project.assumed_gross_margin} AS assumed_gross_margin,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM orders AS o
+LEFT JOIN costs AS c USING (month_start)
+LEFT JOIN new_customer_value AS v USING (month_start)

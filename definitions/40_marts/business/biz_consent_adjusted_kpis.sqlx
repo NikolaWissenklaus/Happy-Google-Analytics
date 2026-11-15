@@ -1,0 +1,59 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_consent_adjusted_kpis",
+  description: "What the cookie banner hides: daily sessions and revenue we see with consent vs the cookieless pings (consent mode advanced) that arrive without user / session. GA4 UI uses behavioral modeling to fill this, the BigQuery export does NOT. This table estimates it with the cookieless pings",
+  bigquery: {
+    partitionBy: "kpi_date",
+    labels: { layer: "marts", domain: "business", lgpd: "true" }
+  },
+  tags: ["marts", "business", "daily", "lgpd"],
+  columns: {
+    cookieless_session_starts: "session_start pings without user_pseudo_id (analytics_storage denied)",
+    consent_denied_share: "cookieless session starts / (observed sessions + cookieless session starts)",
+    cookieless_revenue: "Revenue of purchase events that came without identifiers (they ARE in the export, just not attached to any session)",
+    estimated_total_sessions: "observed + cookieless session starts"
+  }
+}
+
+WITH
+observed AS (
+  SELECT session_date AS kpi_date, COUNT(*) AS observed_sessions, SUM(revenue) AS observed_session_revenue, SUM(transactions) AS observed_transactions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart()}
+  GROUP BY 1
+),
+
+cookieless AS (
+  SELECT
+    event_date AS kpi_date,
+    COUNTIF(event_name = 'session_start') AS cookieless_session_starts,
+    COUNTIF(event_name = 'page_view') AS cookieless_page_views,
+    COUNTIF(event_name = 'purchase') AS cookieless_purchases,
+    SUM(IF(event_name = 'purchase', COALESCE(purchase_revenue, event_value, 0), 0)) AS cookieless_revenue
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+    AND is_cookieless
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+)
+
+SELECT
+  o.kpi_date,
+  o.observed_sessions,
+  COALESCE(c.cookieless_session_starts, 0) AS cookieless_session_starts,
+  COALESCE(c.cookieless_page_views, 0) AS cookieless_page_views,
+  SAFE_DIVIDE(c.cookieless_session_starts, o.observed_sessions + COALESCE(c.cookieless_session_starts, 0)) AS consent_denied_share,
+  o.observed_sessions + COALESCE(c.cookieless_session_starts, 0) AS estimated_total_sessions,
+  o.observed_transactions,
+  COALESCE(c.cookieless_purchases, 0) AS cookieless_purchases,
+  o.observed_session_revenue,
+  COALESCE(c.cookieless_revenue, 0) AS cookieless_revenue,
+  SAFE_DIVIDE(c.cookieless_revenue, o.observed_session_revenue + COALESCE(c.cookieless_revenue, 0)) AS revenue_without_session_share,
+  SAFE_DIVIDE(o.observed_transactions + COALESCE(c.cookieless_purchases, 0), o.observed_sessions + COALESCE(c.cookieless_session_starts, 0)) AS estimated_true_conversion_rate,
+  SAFE_DIVIDE(o.observed_transactions, o.observed_sessions) AS observed_conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM observed AS o
+LEFT JOIN cookieless AS c USING (kpi_date)

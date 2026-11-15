@@ -1,0 +1,149 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__transactions",
+  description: "One row per transaction, deduplicated across ALL history (the thank you page reloaded tomorrow does not count twice). Revenue fixed when purchase_revenue is missing, test and deferred payment (boleto/pix) flags",
+  bigquery: {
+    partitionBy: "transaction_date",
+    clusterBy: ["transaction_id", "user_pseudo_id"],
+    labels: { layer: "intermediate", domain: "ecommerce" }
+  },
+  tags: ["ga4", "intermediate", "daily", "ecommerce"],
+  columns: Object.assign(docs.pick("transaction_id", "revenue", "session_key", "user_pseudo_id", "user_id", "loaded_at"), {
+    revenue_source: "Where the revenue came from: purchase_revenue | value_param | items_sum | missing",
+    times_sent: "How many purchase events with this transaction_id arrived in the processing window",
+    is_test_transaction: "transaction id matches the test patterns or came from a non production hostname",
+    is_deferred_payment: "boleto / pix: the order exists, the money maybe not (see crm_order_reconciliation)"
+  })
+}
+
+js {
+  const testPattern = cfg_project.test_transaction_patterns.join("|");
+  const deferredPattern = cfg_project.deferred_payment_patterns.join("|");
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "transaction_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+purchase_events AS (
+  SELECT
+    event_id,
+    event_date,
+    event_ts,
+    session_key,
+    user_pseudo_id,
+    user_id,
+    stream_id,
+    platform,
+    hostname,
+    is_non_production_host,
+    COALESCE(transaction_id, CONCAT('missing-', CAST(event_id AS STRING))) AS transaction_id,
+    transaction_id IS NULL AS is_missing_transaction_id,
+    COALESCE(currency, '${constants.CURRENCY}') AS currency,
+    purchase_revenue,
+    purchase_revenue_in_usd,
+    event_value,
+    event_value_in_usd,
+    (SELECT SUM(COALESCE(i.item_revenue, i.price * COALESCE(i.quantity, 1))) FROM UNNEST(items) AS i) AS items_revenue,
+    (SELECT SUM(COALESCE(i.quantity, 1)) FROM UNNEST(items) AS i) AS item_quantity,
+    shipping_value,
+    tax_value,
+    coupon,
+    payment_type,
+    shipping_tier,
+    items_count,
+    unique_items,
+    ARRAY(
+      SELECT AS STRUCT
+        ${ga4.cleanId("i.item_id")} AS item_id,
+        i.item_name,
+        i.item_brand,
+        i.item_variant,
+        i.item_category,
+        i.item_category2,
+        i.item_category3,
+        i.price,
+        COALESCE(i.quantity, 1) AS quantity,
+        COALESCE(i.item_revenue, i.price * COALESCE(i.quantity, 1)) AS item_revenue,
+        NULLIF(UPPER(TRIM(i.coupon)), '') AS item_coupon,
+        i.item_list_name,
+        i.affiliation,
+        ${ga4.itemParam("discount", "number")} AS item_discount
+      FROM UNNEST(items) AS i WITH OFFSET AS pos
+      ORDER BY pos
+    ) AS items
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+    AND event_name = 'purchase'
+    ${helpers.noiseFilter()}
+),
+
+count_repeats AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY transaction_id ORDER BY event_ts, event_id) AS occurrence,
+    COUNT(*) OVER (PARTITION BY transaction_id) AS times_sent
+  FROM purchase_events
+),
+
+-- transactions already loaded on previous days (a reload of the thank you page next week
+-- would create a "new" purchase otherwise)
+already_loaded AS (
+  ${incremental()
+    ? `SELECT DISTINCT transaction_id FROM ${self()} WHERE transaction_date < run_from`
+    : `SELECT CAST(NULL AS STRING) AS transaction_id FROM UNNEST([1]) WHERE FALSE`}
+)
+
+SELECT
+  r.transaction_id,
+  r.event_id,
+  r.event_date AS transaction_date,
+  r.event_ts AS transaction_ts,
+  r.session_key,
+  r.user_pseudo_id,
+  r.user_id,
+  r.stream_id,
+  r.platform,
+  r.hostname,
+  r.currency,
+  COALESCE(r.purchase_revenue, r.event_value, r.items_revenue, 0) AS revenue,
+  CASE
+    WHEN r.purchase_revenue IS NOT NULL THEN 'purchase_revenue'
+    WHEN r.event_value IS NOT NULL THEN 'value_param'
+    WHEN r.items_revenue IS NOT NULL THEN 'items_sum'
+    ELSE 'missing'
+  END AS revenue_source,
+  COALESCE(r.purchase_revenue_in_usd, r.event_value_in_usd) AS revenue_in_usd,
+  r.purchase_revenue AS purchase_revenue_raw,
+  r.event_value AS value_param_raw,
+  r.items_revenue,
+  r.shipping_value,
+  r.tax_value,
+  r.coupon,
+  r.payment_type,
+  r.shipping_tier,
+  r.items_count,
+  r.unique_items,
+  r.item_quantity,
+  r.items,
+  r.times_sent,
+  r.is_missing_transaction_id,
+  COALESCE(REGEXP_CONTAINS(LOWER(r.transaction_id), r'(${testPattern})'), FALSE) OR r.is_non_production_host AS is_test_transaction,
+  COALESCE(REGEXP_CONTAINS(r.payment_type, r'(${deferredPattern})'), FALSE) AS is_deferred_payment,
+  COALESCE(r.purchase_revenue, r.event_value, r.items_revenue, 0) < 0 AS is_negative_revenue,
+  COALESCE(r.purchase_revenue, r.event_value, r.items_revenue, 0) = 0 AS is_zero_revenue,
+  ABS(COALESCE(r.purchase_revenue, r.event_value, 0) - COALESCE(r.items_revenue, 0)) > 1
+    AND r.items_revenue IS NOT NULL AND COALESCE(r.purchase_revenue, r.event_value) IS NOT NULL AS has_items_revenue_mismatch,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM count_repeats AS r
+LEFT JOIN already_loaded AS a USING (transaction_id)
+WHERE r.occurrence = 1
+  AND a.transaction_id IS NULL
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

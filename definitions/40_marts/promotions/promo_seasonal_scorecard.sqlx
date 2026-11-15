@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_seasonal_scorecard",
+  description: "Retail dates scorecard (Black Friday, Black Week, Cyber Monday, Dia das Maes, Dia dos Namorados, Dia dos Pais, Dia das Criancas, Natal, Dia do Consumidor, 11.11...) year by year, with the change vs the same event of the previous year",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily", "business"]
+}
+
+WITH
+event_days AS (
+  SELECT c.retail_event, c.year_number, k.*
+  FROM ${ref("dim_calendar")} AS c
+  JOIN ${ref("ecom_daily_kpis")} AS k ON k.kpi_date = c.date_day
+  WHERE c.retail_event IS NOT NULL
+),
+
+per_event_year AS (
+  SELECT
+    retail_event,
+    year_number,
+    MIN(kpi_date) AS first_day,
+    MAX(kpi_date) AS last_day,
+    COUNT(*) AS days,
+    SUM(sessions) AS sessions,
+    SUM(orders) AS orders,
+    SUM(valid_revenue) AS revenue,
+    SUM(new_customer_orders) AS new_customer_orders,
+    SAFE_DIVIDE(SUM(orders), SUM(sessions)) AS conversion_rate,
+    SAFE_DIVIDE(SUM(valid_revenue), SUM(orders)) AS average_order_value
+  FROM event_days
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  LAG(revenue) OVER (PARTITION BY retail_event ORDER BY year_number) AS revenue_previous_year,
+  ${helpers.pctChange("revenue", "LAG(revenue) OVER (PARTITION BY retail_event ORDER BY year_number)")} AS revenue_yoy,
+  ${helpers.pctChange("orders", "LAG(orders) OVER (PARTITION BY retail_event ORDER BY year_number)")} AS orders_yoy,
+  conversion_rate - LAG(conversion_rate) OVER (PARTITION BY retail_event ORDER BY year_number) AS conversion_rate_change_pp,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_event_year

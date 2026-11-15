@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_landing_pages_by_channel",
+  description: "Landing page x channel (last 30 days): where each channel sends people and how those pages perform for that channel. Paid traffic going to the home page instead of the product page is money burning",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "cro"],
+  columns: {
+    conversion_rate_wilson_low: "Lower bound of the Wilson interval of the conversion rate, use it to rank (small pages dont win by luck)"
+  }
+}
+
+WITH agg AS (
+  SELECT
+    session_custom_channel_group AS channel,
+    landing_page_path,
+    landing_page_type,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  * EXCEPT (users_hll, active_users_hll),
+  ${metrics.sessionRatios()},
+  ${helpers.wilsonLower("sessions_with_purchase", "sessions")} AS conversion_rate_wilson_low,
+  SAFE_DIVIDE(sessions, SUM(sessions) OVER (PARTITION BY channel)) AS share_of_channel_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+WHERE sessions >= 10

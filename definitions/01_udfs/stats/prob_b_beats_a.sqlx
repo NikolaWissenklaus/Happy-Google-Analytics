@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "prob_b_beats_a",
+  description: "Bayesian A/B: P(rate_B > rate_A) with Beta posteriors. Exact sum (Evan Miller) up to 100k conversions, normal approx above",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats"]
+}
+
+-- with a Beta(1, 1) prior: prob_b_beats_a(1 + conv_a, 1 + n_a - conv_a, 1 + conv_b, 1 + n_b - conv_b)
+-- managers understand "93% chance B is better" much better than "p = 0.07"
+CREATE OR REPLACE FUNCTION ${self()}(alpha_a FLOAT64, beta_a FLOAT64, alpha_b FLOAT64, beta_b FLOAT64)
+RETURNS FLOAT64 LANGUAGE js AS r"""
+  if (alpha_a === null || beta_a === null || alpha_b === null || beta_b === null) return null;
+  if (alpha_a <= 0 || beta_a <= 0 || alpha_b <= 0 || beta_b <= 0) return null;
+
+  // log gamma, Lanczos approximation (g = 7)
+  var LANCZOS = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+    -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+  function lgamma(x) {
+    if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgamma(1 - x);
+    x -= 1;
+    var a = LANCZOS[0];
+    var t = x + 7.5;
+    for (var i = 1; i < 9; i++) a += LANCZOS[i] / (x + i);
+    return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+  }
+  function lbeta(a, b) { return lgamma(a) + lgamma(b) - lgamma(a + b); }
+  function normalCdf(z) {
+    var t = 1 / (1 + 0.3275911 * Math.abs(z) / Math.SQRT2);
+    var poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    var erf = 1 - poly * Math.exp(-z * z / 2);
+    return 0.5 * (1 + (z >= 0 ? erf : -erf));
+  }
+
+  var exact = Math.floor(alpha_b) === alpha_b && alpha_b <= 100000;
+  if (exact) {
+    var total = 0;
+    var lbA = lbeta(alpha_a, beta_a);
+    for (var i = 0; i < alpha_b; i++) {
+      total += Math.exp(lbeta(alpha_a + i, beta_a + beta_b) - Math.log(beta_b + i) - lbeta(1 + i, beta_b) - lbA);
+    }
+    if (isFinite(total)) return Math.min(1, Math.max(0, total));
+  }
+
+  var ma = alpha_a / (alpha_a + beta_a);
+  var mb = alpha_b / (alpha_b + beta_b);
+  var va = alpha_a * beta_a / (Math.pow(alpha_a + beta_a, 2) * (alpha_a + beta_a + 1));
+  var vb = alpha_b * beta_b / (Math.pow(alpha_b + beta_b, 2) * (alpha_b + beta_b + 1));
+  return normalCdf((mb - ma) / Math.sqrt(va + vb));
+"""
+OPTIONS (description = "Bayesian probability that B beats A")

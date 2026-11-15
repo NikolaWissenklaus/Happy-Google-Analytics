@@ -1,0 +1,77 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_coupon_performance",
+  description: "Order coupons (UA 'Order Coupon' report, upgraded): orders, revenue, AOV vs orders without coupon, share of new customers, discount when the items send it, and which channels use each coupon (a coupon of the influencer used by Paid Search = leaked coupon)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce", ua_report: "true" }
+  },
+  tags: ["marts", "ecommerce", "daily", "promotions", "ua_report"],
+  columns: {
+    aov_index_vs_no_coupon: "AOV of the coupon / AOV of orders without coupon (same period)",
+    top_channel: "Channel with most orders of the coupon",
+    top_channel_share: "If this is a personal coupon (influencer, partner) and the top channel is not theirs, it leaked to coupon sites"
+  }
+}
+
+WITH
+orders AS (
+  SELECT *
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND is_valid_for_revenue
+),
+
+item_discounts AS (
+  SELECT transaction_id, SUM(COALESCE(item_discount, 0) * COALESCE(quantity, 1)) AS discount_value
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+  GROUP BY 1
+),
+
+baseline AS (
+  SELECT SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS aov_no_coupon
+  FROM orders
+  WHERE coupon IS NULL
+),
+
+per_coupon_channel AS (
+  SELECT coupon, session_default_channel_group, COUNT(*) AS orders
+  FROM orders
+  WHERE coupon IS NOT NULL
+  GROUP BY 1, 2
+),
+
+top_channel AS (
+  SELECT
+    coupon,
+    ARRAY_AGG(session_default_channel_group ORDER BY orders DESC LIMIT 1)[OFFSET(0)] AS top_channel,
+    SAFE_DIVIDE(MAX(orders), SUM(orders)) AS top_channel_share,
+    COUNT(DISTINCT session_default_channel_group) AS channels_using
+  FROM per_coupon_channel
+  GROUP BY coupon
+)
+
+SELECT
+  o.coupon,
+  COUNT(*) AS orders,
+  COUNT(DISTINCT o.user_key) AS customers,
+  SUM(o.revenue) AS revenue,
+  SAFE_DIVIDE(SUM(o.revenue), COUNT(*)) AS average_order_value,
+  SAFE_DIVIDE(SAFE_DIVIDE(SUM(o.revenue), COUNT(*)), ANY_VALUE(b.aov_no_coupon)) AS aov_index_vs_no_coupon,
+  SAFE_DIVIDE(COUNTIF(o.is_first_purchase), COUNT(*)) AS new_customer_share,
+  SUM(d.discount_value) AS discount_value_from_items,
+  MIN(o.transaction_date) AS first_used,
+  MAX(o.transaction_date) AS last_used,
+  ANY_VALUE(t.top_channel) AS top_channel,
+  ANY_VALUE(t.top_channel_share) AS top_channel_share,
+  ANY_VALUE(t.channels_using) AS channels_using,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM orders AS o
+LEFT JOIN item_discounts AS d USING (transaction_id)
+LEFT JOIN top_channel AS t USING (coupon)
+CROSS JOIN baseline AS b
+WHERE o.coupon IS NOT NULL
+GROUP BY o.coupon

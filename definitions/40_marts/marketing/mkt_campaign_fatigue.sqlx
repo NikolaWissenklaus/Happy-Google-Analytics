@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_campaign_fatigue",
+  description: "Creative / campaign fatigue: conversion rate by week of life of each campaign and the trend (slope) of it. Negative slope for weeks = the audience got tired of the ad, time to change the creative",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"],
+  columns: {
+    week_of_life: "0 = first week the campaign showed up in GA4",
+    conversion_trend_per_week: "OLS slope of conversion rate over week_of_life (only campaigns with 4+ weeks)",
+    is_fatigued: "Negative trend and the last 2 weeks below 70% of the first 2 weeks"
+  }
+}
+
+WITH
+campaign_weeks AS (
+  SELECT
+    LOWER(session_campaign) AS campaign,
+    session_source_medium,
+    DATE_TRUNC(session_date, WEEK(MONDAY)) AS week_start,
+    COUNT(*) AS sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart(180)}
+    AND session_campaign IS NOT NULL
+    AND REGEXP_CONTAINS(session_medium, r'${channels.PAID_MEDIUM}')
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3
+),
+
+with_age AS (
+  SELECT
+    *,
+    DATE_DIFF(week_start, MIN(week_start) OVER (PARTITION BY campaign, session_source_medium), WEEK) AS week_of_life,
+    SAFE_DIVIDE(transactions, sessions) AS conversion_rate
+  FROM campaign_weeks
+  WHERE sessions >= 50
+),
+
+with_last_week AS (
+  SELECT
+    *,
+    MAX(week_of_life) OVER (PARTITION BY campaign, session_source_medium) AS last_week_of_life
+  FROM with_age
+),
+
+trend AS (
+  SELECT
+    campaign,
+    session_source_medium,
+    COUNT(*) AS weeks_live,
+    SAFE_DIVIDE(COVAR_SAMP(week_of_life, conversion_rate), VAR_SAMP(week_of_life)) AS conversion_trend_per_week,
+    AVG(IF(week_of_life <= 1, conversion_rate, NULL)) AS first_2_weeks_cr,
+    AVG(IF(week_of_life >= last_week_of_life - 1, conversion_rate, NULL)) AS last_2_weeks_cr
+  FROM with_last_week
+  GROUP BY 1, 2
+)
+
+SELECT
+  w.campaign,
+  w.session_source_medium,
+  w.week_start,
+  w.week_of_life,
+  w.sessions,
+  w.transactions,
+  w.revenue,
+  w.conversion_rate,
+  t.weeks_live,
+  t.conversion_trend_per_week,
+  t.first_2_weeks_cr,
+  t.last_2_weeks_cr,
+  t.weeks_live >= 4 AND t.conversion_trend_per_week < 0 AND t.last_2_weeks_cr < 0.7 * t.first_2_weeks_cr AS is_fatigued,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_age AS w
+JOIN trend AS t USING (campaign, session_source_medium)

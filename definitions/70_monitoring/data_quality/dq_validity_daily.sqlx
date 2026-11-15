@@ -1,0 +1,74 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_validity_daily",
+  description: "Validity checks per day (last 60 days): invalid currency codes, negative or absurd revenue, items with zero price in purchases, crazy quantities, timestamps outside the event date, user_id that looks like PII, test orders in production",
+  bigquery: {
+    partitionBy: "check_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"]
+}
+
+WITH
+events AS (
+  SELECT
+    event_date AS check_date,
+    COUNTIF(currency IS NOT NULL AND NOT REGEXP_CONTAINS(currency, r'^[A-Z]{3}$')) AS invalid_currency,
+    COUNTIF(currency IS NOT NULL) AS with_currency,
+    COUNTIF(event_name = 'purchase' AND COALESCE(purchase_revenue, event_value) < 0) AS negative_revenue,
+    COUNTIF(event_name = 'purchase' AND COALESCE(purchase_revenue, event_value) > ${cfg_project.max_realistic_order_value}) AS absurd_revenue,
+    COUNTIF(event_name = 'purchase') AS purchases,
+    COUNTIF(ABS(DATE_DIFF(DATE(event_ts, '${constants.TIMEZONE}'), event_date, DAY)) > 1) AS timestamp_outside_date,
+    COUNT(*) AS events,
+    COUNTIF(user_id_was_hashed) AS pii_like_user_id,
+    COUNTIF(user_id IS NOT NULL) AS with_user_id
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+),
+
+items AS (
+  SELECT
+    event_date AS check_date,
+    COUNTIF(event_name = 'purchase' AND COALESCE(price, 0) <= 0) AS zero_price_purchase_items,
+    COUNTIF(event_name = 'purchase') AS purchase_items,
+    COUNTIF(quantity > 100) AS crazy_quantity,
+    COUNT(*) AS items
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+transactions AS (
+  SELECT transaction_date AS check_date, COUNTIF(is_test_transaction) AS test_orders, COUNTIF(has_items_revenue_mismatch) AS items_mismatch, COUNT(*) AS orders
+  FROM ${ref("int_ga4__transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+checks AS (
+  SELECT check_date, 'invalid_currency_code' AS check_name, SAFE_DIVIDE(invalid_currency, with_currency) AS value, 0.0001 AS warn_at, 0.01 AS fail_at FROM events
+  UNION ALL SELECT check_date, 'negative_purchase_revenue', SAFE_DIVIDE(negative_revenue, purchases), 0.0001, 0.01 FROM events
+  UNION ALL SELECT check_date, 'absurd_purchase_revenue', SAFE_DIVIDE(absurd_revenue, purchases), 0.0001, 0.005 FROM events
+  UNION ALL SELECT check_date, 'timestamp_outside_event_date', SAFE_DIVIDE(timestamp_outside_date, events), 0.001, 0.01 FROM events
+  UNION ALL SELECT check_date, 'user_id_looks_like_pii', SAFE_DIVIDE(pii_like_user_id, with_user_id), 0.0001, 0.001 FROM events
+  UNION ALL SELECT check_date, 'purchase_items_zero_price', SAFE_DIVIDE(zero_price_purchase_items, purchase_items), 0.005, 0.03 FROM items
+  UNION ALL SELECT check_date, 'items_quantity_above_100', SAFE_DIVIDE(crazy_quantity, items), 0.0001, 0.001 FROM items
+  UNION ALL SELECT check_date, 'test_orders_in_production', SAFE_DIVIDE(test_orders, orders), 0.001, 0.01 FROM transactions
+  UNION ALL SELECT check_date, 'purchase_value_vs_items_mismatch', SAFE_DIVIDE(items_mismatch, orders), 0.02, 0.1 FROM transactions
+)
+
+SELECT
+  check_date,
+  'validity' AS check_group,
+  check_name,
+  value,
+  warn_at,
+  fail_at,
+  CASE WHEN value IS NULL THEN 'no_data' WHEN value >= fail_at THEN 'fail' WHEN value >= warn_at THEN 'warn' ELSE 'pass' END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checks

@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_ewma",
+  description: "Method 5 - EWMA forecast (exponentially weighted moving average, lambda 0.3): recent days weigh more, so it adapts to trends. Anomaly = value outside the EWMA +- L sigma",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"]
+}
+
+-- weight of a past day = lambda * (1 - lambda) ^ (days ago - 1). we keep the dates in the
+-- history array so the weights do not depend on the (undefined) order of the array
+WITH
+history AS (
+  SELECT
+    *,
+    ARRAY_AGG(STRUCT(metric_date AS d, value AS v)) OVER (
+      PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date)
+      RANGE BETWEEN ${cfg_anomaly.ewma.baseline_days} PRECEDING AND 1 PRECEDING
+    ) AS hist
+  FROM ${ref("anom_metric_series_daily")}
+),
+
+forecast AS (
+  SELECT
+    metric_date, metric, breakdown, breakdown_value, value,
+    ARRAY_LENGTH(hist) AS history_points,
+    (SELECT SAFE_DIVIDE(
+        SUM(h.v * POW(1 - ${cfg_anomaly.ewma.lambda}, DATE_DIFF(metric_date, h.d, DAY) - 1)),
+        SUM(POW(1 - ${cfg_anomaly.ewma.lambda}, DATE_DIFF(metric_date, h.d, DAY) - 1)))
+     FROM UNNEST(hist) AS h) AS ewma,
+    (SELECT STDDEV_SAMP(h.v) FROM UNNEST(hist) AS h) AS sd
+  FROM history
+  WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  ewma AS expected,
+  ewma - ${cfg_anomaly.ewma.sigma_limit} * sd AS lower_bound,
+  ewma + ${cfg_anomaly.ewma.sigma_limit} * sd AS upper_bound,
+  SAFE_DIVIDE(value - ewma, sd) AS score,
+  history_points >= ${cfg_anomaly.min_history_points} AND ABS(SAFE_DIVIDE(value - ewma, sd)) > ${cfg_anomaly.ewma.sigma_limit} AS is_anomaly,
+  'ewma' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM forecast

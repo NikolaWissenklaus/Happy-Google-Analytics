@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_category_affinity",
+  description: "Category affinity per user (last 90 days), TF-IDF style: interest in the category (view 1, cart 3, purchase 5 points) divided by the user total, times how rare the category is among all users. 'Likes kids shoes' beats 'likes the home page best seller'. Top 3 per user",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm", "personalization"],
+  columns: {
+    affinity_score: "tf (share of the user interest) x idf (ln(users / users interested in the category))"
+  }
+}
+
+WITH
+interest AS (
+  SELECT
+    id.user_key,
+    COALESCE(d.item_category, i.item_category, '(not set)') AS item_category,
+    SUM(CASE i.event_name WHEN 'view_item' THEN 1 WHEN 'add_to_cart' THEN 3 WHEN 'purchase' THEN 5 ELSE 0 END) AS points
+  FROM ${ref("stg_ga4__event_items")} AS i
+  JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+  WHERE i.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND i.event_name IN ('view_item', 'add_to_cart', 'purchase')
+    AND NOT i.is_internal_traffic
+  GROUP BY 1, 2
+),
+
+idf AS (
+  SELECT
+    item_category,
+    LN(SAFE_DIVIDE((SELECT COUNT(DISTINCT user_key) FROM interest), COUNT(DISTINCT user_key))) AS idf
+  FROM interest
+  GROUP BY 1
+),
+
+scored AS (
+  SELECT
+    i.user_key,
+    i.item_category,
+    i.points,
+    SAFE_DIVIDE(i.points, SUM(i.points) OVER (PARTITION BY i.user_key)) AS tf,
+    f.idf
+  FROM interest AS i
+  JOIN idf AS f USING (item_category)
+)
+
+SELECT
+  user_key,
+  item_category,
+  points,
+  tf,
+  idf,
+  tf * idf AS affinity_score,
+  ROW_NUMBER() OVER (PARTITION BY user_key ORDER BY tf * idf DESC, points DESC) AS affinity_rank,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored
+QUALIFY affinity_rank <= 3

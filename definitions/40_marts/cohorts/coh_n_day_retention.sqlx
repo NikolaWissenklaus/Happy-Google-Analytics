@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_n_day_retention",
+  description: "Classic N-day retention per daily cohort (last 120 days): D1, D3, D7, D14, D30 'exactly on day N' and the unbounded version 'on day N or later' (what product people usually mean), by first device. Only cohorts old enough are filled",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "retention", "product"]
+}
+
+WITH
+users AS (
+  SELECT user_key, first_seen_date, first_device_category
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 120 DAY)
+),
+
+activity AS (
+  SELECT u.user_key, u.first_seen_date, u.first_device_category, d.days_since_first_seen
+  FROM users AS u
+  JOIN ${ref("fct_user_daily")} AS d USING (user_key)
+),
+
+per_user AS (
+  SELECT
+    user_key,
+    first_seen_date,
+    first_device_category,
+    ${[1, 3, 7, 14, 30].map(n => `LOGICAL_OR(days_since_first_seen = ${n}) AS active_d${n},
+    LOGICAL_OR(days_since_first_seen >= ${n}) AS active_d${n}_plus`).join(",\n    ")}
+  FROM activity
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  first_seen_date AS cohort_date,
+  first_device_category,
+  COUNT(*) AS cohort_users,
+  ${[1, 3, 7, 14, 30].map(n => `IF(DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), first_seen_date, DAY) > ${n}, SAFE_DIVIDE(COUNTIF(active_d${n}), COUNT(*)), NULL) AS d${n}_retention,
+  IF(DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), first_seen_date, DAY) > ${n}, SAFE_DIVIDE(COUNTIF(active_d${n}_plus), COUNT(*)), NULL) AS d${n}_unbounded_retention`).join(",\n  ")},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_user
+GROUP BY 1, 2

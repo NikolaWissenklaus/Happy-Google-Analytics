@@ -1,0 +1,34 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_consent_by_channel_daily",
+  description: "Ads consent per channel and day (sessions). Paid media people need this one: a Paid Search with 60% ads consent means Google Ads only sees (and optimizes with) 60% of the conversions, the rest is modeled",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily", "marketing"],
+  columns: {
+    revenue_without_ads_consent: "Revenue of sessions where ads_storage was not granted: what the ad platforms do not see directly"
+  }
+}
+
+SELECT
+  session_date,
+  COALESCE(session_default_channel_group, 'Unassigned') AS channel,
+  COUNT(*) AS sessions,
+  COUNTIF(consent_ads_storage = 'granted') AS ads_granted_sessions,
+  COUNTIF(consent_ads_storage = 'denied') AS ads_denied_sessions,
+  COUNTIF(consent_ads_storage = 'unknown') AS ads_unknown_sessions,
+  COUNTIF(consent_changed_in_session) AS sessions_with_consent_change,
+  SAFE_DIVIDE(COUNTIF(consent_ads_storage = 'granted'), COUNT(*)) AS ads_consent_share,
+  SUM(transactions) AS transactions,
+  SUM(IF(consent_ads_storage = 'granted', transactions, 0)) AS transactions_with_ads_consent,
+  SUM(IF(consent_ads_storage != 'granted', revenue, 0)) AS revenue_without_ads_consent,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_sessions")}
+WHERE session_date >= ${helpers.martWindowStart()}
+  ${helpers.martSessionFilter()}
+GROUP BY 1, 2

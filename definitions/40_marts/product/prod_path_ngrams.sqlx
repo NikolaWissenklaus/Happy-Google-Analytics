@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_path_ngrams",
+  description: "Navigation n-grams (sequences of 2 and 3 page TYPES inside a session, last 30 days) with how often they happen and the conversion of sessions that contain them. 'category > product > category > product' with low conversion = people not finding what they want",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "data_science"]
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    page_number,
+    page_type,
+    session_has_purchase,
+    LEAD(page_type, 1) OVER (PARTITION BY session_key ORDER BY page_number) AS next_1,
+    LEAD(page_type, 2) OVER (PARTITION BY session_key ORDER BY page_number) AS next_2
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+    AND NOT is_reload
+),
+
+grams AS (
+  SELECT 2 AS n, CONCAT(page_type, ' > ', next_1) AS ngram, session_key, session_has_purchase
+  FROM views WHERE next_1 IS NOT NULL
+  UNION ALL
+  SELECT 3, CONCAT(page_type, ' > ', next_1, ' > ', next_2), session_key, session_has_purchase
+  FROM views WHERE next_2 IS NOT NULL
+)
+
+SELECT
+  n,
+  ngram,
+  COUNT(*) AS occurrences,
+  COUNT(DISTINCT session_key) AS sessions,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(session_has_purchase, session_key, NULL)), COUNT(DISTINCT session_key)) AS session_conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM grams
+GROUP BY 1, 2
+HAVING COUNT(DISTINCT session_key) >= 20

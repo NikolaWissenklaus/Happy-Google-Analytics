@@ -1,0 +1,52 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_pages_and_screens_daily",
+  description: "GA4 Reports > Engagement > Pages and screens: page path / screen, title, views, users, views per user, average engagement time per user, event count, entrances and exits per day",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["page_path"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily"],
+  columns: {
+    average_engagement_time: "GA4 definition: page engagement time / active users of the page",
+    users_hll: "HLL sketch to count users of any date range (HLL_COUNT.MERGE)"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["int_ga4__page_views"] })}
+}
+
+WITH agg AS (
+  SELECT
+    event_date,
+    page_path,
+    ARRAY_AGG(page_title IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS page_title,
+    ANY_VALUE(page_hostname) AS hostname,
+    COUNT(*) AS views,
+    COUNT(DISTINCT user_pseudo_id) AS users,
+    HLL_COUNT.INIT(user_pseudo_id) AS users_hll,
+    SUM(page_engagement_msec) / 1000 AS engagement_sec,
+    SUM(events_on_page) AS event_count,
+    COUNTIF(is_entrance) AS entrances,
+    COUNTIF(is_exit) AS exits,
+    COUNTIF(reached_90_percent) AS views_scrolled_90
+  FROM ${ref("int_ga4__page_views")}
+  WHERE event_date >= run_from
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(views, users) AS views_per_user,
+  SAFE_DIVIDE(engagement_sec, users) AS average_engagement_time,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

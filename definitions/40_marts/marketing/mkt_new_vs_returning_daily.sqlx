@@ -1,0 +1,40 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_new_vs_returning_daily",
+  description: "New x returning users by day and channel. Returning users usually convert 2-4x more, a 'great' month that was just returning traffic is not growth",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH agg AS (
+  SELECT
+    session_date,
+    IF(is_new_user, 'new', 'returning') AS user_type,
+    session_default_channel_group,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

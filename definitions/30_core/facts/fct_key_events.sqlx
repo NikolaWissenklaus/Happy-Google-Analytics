@@ -1,0 +1,55 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "fct_key_events",
+  description: "Key events (conversions) with the session context: channel, source/medium/campaign, landing page, device, user_key. Only the counted ones (GA4 counting method applied)",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["key_event_name", "session_default_channel_group"],
+    labels: { layer: "core", domain: "conversions" }
+  },
+  tags: ["ga4", "core", "daily", "conversions"],
+  columns: docs.pick("session_key", "user_key", "session_default_channel_group", "session_source", "session_medium", "session_campaign", "landing_page_path", "device_category")
+}
+
+SELECT
+  k.key_event_id,
+  k.key_event_name,
+  k.key_event_category,
+  k.event_id,
+  k.event_name,
+  k.event_date,
+  k.event_ts,
+  k.session_key,
+  k.user_pseudo_id,
+  COALESCE(s.user_key, id.user_key, CONCAT('dev:', k.user_pseudo_id)) AS user_key,
+  k.transaction_id,
+  k.currency,
+  k.key_event_value,
+  k.counting_method,
+  k.is_primary,
+  s.session_date,
+  s.session_start_ts,
+  TIMESTAMP_DIFF(k.event_ts, s.session_start_ts, SECOND) AS seconds_into_session,
+  s.session_number,
+  s.is_new_user,
+  s.session_source,
+  s.session_medium,
+  s.session_campaign,
+  s.session_source_medium,
+  s.session_default_channel_group,
+  s.session_custom_channel_group,
+  s.landing_page_path,
+  s.landing_page_type,
+  s.device_category,
+  s.geo_country,
+  s.geo_uf,
+  s.consent_ads_storage,
+  COALESCE(s.is_bot_suspect, FALSE) AS is_bot_suspect,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("int_ga4__key_events")} AS k
+LEFT JOIN ${ref("fct_sessions")} AS s ON s.session_key = k.session_key
+LEFT JOIN ${ref("int_ga4__user_stitching")} AS id ON id.user_pseudo_id = k.user_pseudo_id
+WHERE k.is_counted

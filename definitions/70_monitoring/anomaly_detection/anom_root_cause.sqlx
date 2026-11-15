@@ -1,0 +1,124 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_root_cause",
+  description: "Automatic root cause of the alerts of the last 7 days (property level, additive metrics): for every dimension of cfg_anomaly.root_cause_dimensions, which values explain the change vs the same weekday of the 4 previous weeks. 'Revenue -32%: 71% of the drop is device_browser = Safari' arrives together with the alert",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily", "alerts"],
+  columns: {
+    share_of_change: "delta of the value / total delta of the metric that day. 0.7 = this value explains 70% of the change",
+    cause_rank: "1 = biggest explanation inside the dimension"
+  }
+}
+
+js {
+  const dims = cfg_anomaly.root_cause_dimensions;
+  const additive = ["sessions", "users", "new_users", "engaged_sessions", "page_views", "events", "key_events", "transactions", "revenue"];
+}
+
+WITH
+alerts AS (
+  SELECT metric_date, metric, value, expected_same_weekday, severity
+  FROM ${ref("anom_ensemble")}
+  WHERE is_alert
+    AND breakdown = 'all'
+    AND metric IN (${helpers.sqlList(additive)})
+    AND metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 7 DAY)
+),
+
+alert_days AS (
+  SELECT DISTINCT metric_date FROM alerts
+),
+
+-- the alert day + the same weekday of the 4 weeks before
+relevant_days AS (
+  SELECT a.metric_date AS alert_date, d AS day, d = a.metric_date AS is_alert_day
+  FROM alert_days AS a,
+    UNNEST([a.metric_date, DATE_SUB(a.metric_date, INTERVAL 7 DAY), DATE_SUB(a.metric_date, INTERVAL 14 DAY),
+            DATE_SUB(a.metric_date, INTERVAL 21 DAY), DATE_SUB(a.metric_date, INTERVAL 28 DAY)]) AS d
+),
+
+sessions_long AS (
+  SELECT
+    r.alert_date,
+    r.is_alert_day,
+    dim.dimension,
+    dim.value AS dimension_value,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT s.user_pseudo_id) AS users,
+    COUNTIF(s.is_new_user) AS new_users,
+    COUNTIF(s.is_engaged) AS engaged_sessions,
+    SUM(s.page_views + s.screen_views) AS page_views,
+    SUM(s.event_count) AS events,
+    SUM(s.key_events) AS key_events,
+    SUM(s.transactions) AS transactions,
+    SUM(s.revenue) AS revenue
+  FROM ${ref("fct_sessions")} AS s
+  JOIN relevant_days AS r ON r.day = s.session_date
+  CROSS JOIN UNNEST([
+    ${dims.map(d => `STRUCT('${d}' AS dimension, COALESCE(CAST(s.${d} AS STRING), '(not set)') AS value)`).join(",\n    ")}
+  ]) AS dim
+  WHERE s.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 36 DAY)
+  GROUP BY 1, 2, 3, 4
+),
+
+metric_long AS (
+  SELECT
+    alert_date,
+    is_alert_day,
+    dimension,
+    dimension_value,
+    m.metric,
+    m.value
+  FROM sessions_long,
+    UNNEST([
+      STRUCT('sessions' AS metric, CAST(sessions AS FLOAT64) AS value),
+      STRUCT('users', CAST(users AS FLOAT64)),
+      STRUCT('new_users', CAST(new_users AS FLOAT64)),
+      STRUCT('engaged_sessions', CAST(engaged_sessions AS FLOAT64)),
+      STRUCT('page_views', CAST(page_views AS FLOAT64)),
+      STRUCT('events', CAST(events AS FLOAT64)),
+      STRUCT('key_events', CAST(key_events AS FLOAT64)),
+      STRUCT('transactions', CAST(transactions AS FLOAT64)),
+      STRUCT('revenue', CAST(revenue AS FLOAT64))
+    ]) AS m
+),
+
+deltas AS (
+  SELECT
+    alert_date,
+    metric,
+    dimension,
+    dimension_value,
+    SUM(IF(is_alert_day, value, 0)) AS actual,
+    SUM(IF(NOT is_alert_day, value, 0)) / 4 AS baseline
+  FROM metric_long
+  GROUP BY 1, 2, 3, 4
+),
+
+with_share AS (
+  SELECT
+    d.*,
+    d.actual - d.baseline AS delta,
+    SAFE_DIVIDE(d.actual - d.baseline, SUM(d.actual - d.baseline) OVER (PARTITION BY d.alert_date, d.metric, d.dimension)) AS share_of_change
+  FROM deltas AS d
+  JOIN alerts AS a ON a.metric_date = d.alert_date AND a.metric = d.metric
+)
+
+SELECT
+  alert_date,
+  metric,
+  dimension,
+  dimension_value,
+  actual,
+  baseline,
+  delta,
+  share_of_change,
+  ROW_NUMBER() OVER (PARTITION BY alert_date, metric, dimension ORDER BY share_of_change DESC) AS cause_rank,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_share
+QUALIFY cause_rank <= 5

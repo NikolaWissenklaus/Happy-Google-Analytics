@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_cross_device",
+  description: "Cross device behaviour of the logged users (UA had a Cross Device report, GA4 has nothing): device mix per user, where they discover (first session device) and where they buy (device of the purchases). 'Discover on mobile, buy on desktop' sized with numbers",
+  bigquery: {
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "identity"]
+}
+
+WITH
+identified_sessions AS (
+  SELECT user_key, device_category, session_start_ts, has_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE is_identified_user
+    AND session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    ${helpers.martSessionFilter()}
+),
+
+per_user AS (
+  SELECT
+    user_key,
+    ARRAY_TO_STRING(ARRAY_AGG(DISTINCT device_category ORDER BY device_category), ' + ') AS device_mix,
+    ARRAY_AGG(device_category ORDER BY session_start_ts LIMIT 1)[OFFSET(0)] AS discovery_device,
+    ARRAY_AGG(IF(has_purchase, device_category, NULL) IGNORE NULLS ORDER BY session_start_ts LIMIT 1)[SAFE_OFFSET(0)] AS first_purchase_device,
+    COUNT(DISTINCT device_category) AS device_categories,
+    LOGICAL_OR(has_purchase) AS purchased
+  FROM identified_sessions
+  GROUP BY user_key
+)
+
+SELECT
+  device_mix,
+  discovery_device,
+  COALESCE(first_purchase_device, '(no purchase)') AS first_purchase_device,
+  COUNT(*) AS users,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()) AS share_of_identified_users,
+  SAFE_DIVIDE(COUNTIF(purchased), COUNT(*)) AS buyer_rate,
+  COUNTIF(device_categories > 1) > 0 AS is_multi_device_group,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_user
+GROUP BY 1, 2, 3

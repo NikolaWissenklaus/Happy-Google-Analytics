@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_ux_friction_signals",
+  description: "UX friction signals per page (last 30 days) that GA4 does not show anywhere: ping-pong navigation (A > B > A > B, user lost), rage reloads (same page again in < 10s), quick backs (left in < 5s to the page before) and dead ends (exit without any interaction). Ranked by sessions affected",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "cro"],
+  columns: {
+    ping_pong_views: "Views where the user came back to the page he was 2 steps ago, and then went again to the same next page",
+    rage_reloads: "Same page reloaded in less than 10 seconds",
+    quick_backs: "Next page = previous page and less than 5 seconds here",
+    friction_score: "Weighted sum of the signals per 100 views"
+  }
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    page_path,
+    page_type,
+    page_number,
+    previous_page_path,
+    next_page_path,
+    time_on_page_sec,
+    seconds_since_previous_view,
+    is_reload,
+    is_exit,
+    interactions_on_page,
+    session_has_purchase,
+    LAG(page_path, 2) OVER w AS page_two_back,
+    LEAD(page_path, 2) OVER w AS page_two_ahead
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+  WINDOW w AS (PARTITION BY session_key ORDER BY page_number)
+)
+
+SELECT
+  page_path,
+  ANY_VALUE(page_type) AS page_type,
+  COUNT(*) AS views,
+  COUNTIF(page_two_back = page_path AND next_page_path = previous_page_path AND page_two_ahead = page_path) AS ping_pong_views,
+  COUNTIF(is_reload AND seconds_since_previous_view < 10) AS rage_reloads,
+  COUNTIF(next_page_path = previous_page_path AND time_on_page_sec < 5) AS quick_backs,
+  COUNTIF(is_exit AND interactions_on_page = 0 AND page_number > 1) AS dead_end_exits,
+  SAFE_DIVIDE(
+    3 * COUNTIF(page_two_back = page_path AND next_page_path = previous_page_path AND page_two_ahead = page_path)
+    + 2 * COUNTIF(is_reload AND seconds_since_previous_view < 10)
+    + 1 * COUNTIF(next_page_path = previous_page_path AND time_on_page_sec < 5)
+    + 1 * COUNTIF(is_exit AND interactions_on_page = 0 AND page_number > 1),
+    COUNT(*)) * 100 AS friction_score,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(session_has_purchase, session_key, NULL)), COUNT(DISTINCT session_key)) AS session_conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM views
+GROUP BY page_path
+HAVING COUNT(*) >= 100

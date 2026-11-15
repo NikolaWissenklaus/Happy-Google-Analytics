@@ -1,0 +1,56 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.crm,
+  name: "crm_customer_360",
+  disabled: !constants.ENABLE.crm,
+  description: "Backend customer + GA4 behaviour (joined by user_id): opt-ins, backend lifetime orders and value, GA4 sessions, last visit, channels, lifecycle, RFM, personas and scores. Only hashed identifiers here, the clear email/phone never leave the CRM",
+  bigquery: {
+    clusterBy: ["customer_id"],
+    labels: { layer: "marts", domain: "crm", pii: "hashed" }
+  },
+  tags: ["marts", "crm", "daily", "optional", "lgpd"]
+}
+
+WITH
+backend_orders AS (
+  SELECT customer_id, COUNTIF(is_paid) AS paid_orders, SUM(IF(is_paid, order_value, 0)) AS paid_value, MAX(order_date) AS last_order_date
+  FROM ${ref("stg_crm__orders")}
+  GROUP BY customer_id
+)
+
+SELECT
+  c.customer_id,
+  c.user_id,
+  CONCAT('uid:', c.user_id) AS user_key,
+  c.email_sha256_google,
+  c.email_sha256_meta,
+  c.phone_sha256_google,
+  c.phone_sha256_meta,
+  c.email_domain,
+  c.state_uf,
+  c.age_years,
+  c.opt_in_email,
+  c.opt_in_whatsapp,
+  c.opt_in_sms,
+  c.has_marketing_consent,
+  o.paid_orders AS backend_paid_orders,
+  o.paid_value AS backend_paid_value,
+  o.last_order_date AS backend_last_order_date,
+  p.sessions AS ga4_sessions,
+  p.last_seen_date AS ga4_last_seen_date,
+  p.first_channel AS ga4_first_channel,
+  p.main_channel AS ga4_main_channel,
+  p.lifecycle_stage,
+  p.rfm_segment,
+  p.main_persona,
+  p.value_tier,
+  p.top_categories,
+  p.preferred_daypart,
+  p.latest_consent_ads AS ga4_consent_ads,
+  p.user_key IS NOT NULL AS seen_in_ga4,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("stg_crm__customers")} AS c
+LEFT JOIN backend_orders AS o USING (customer_id)
+LEFT JOIN ${ref("seg_user_profile_360")} AS p ON p.user_key = CONCAT('uid:', c.user_id)

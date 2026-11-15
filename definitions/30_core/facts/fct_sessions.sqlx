@@ -1,0 +1,262 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "fct_sessions",
+  description: "THE session table. One row per session with traffic (GA4 style and session only), landing page, device, geo (with UF), engagement, key events, ecommerce, consent, bot score and a data quality score per row. Rebuilt every run from the incremental intermediates, so identity and flags are always retroactive",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_default_channel_group", "device_category", "user_key"],
+    labels: { layer: "core", domain: "sessions" }
+  },
+  tags: ["ga4", "core", "daily", "sessions"],
+  columns: Object.assign(docs.pick("session_key", "session_date", "session_start_ts", "user_pseudo_id", "user_id", "user_key", "session_number",
+    "is_new_user", "is_engaged", "is_bounce_ga4", "is_bounce_ua", "session_source", "session_medium", "session_campaign",
+    "session_default_channel_group", "session_custom_channel_group", "landing_page_path", "device_category", "geo_country", "geo_region", "geo_uf",
+    "consent_analytics_storage", "consent_ads_storage", "transactions", "key_events", "data_quality_score", "loaded_at"), {
+    landing_page_type: "Page type of the landing page (home, product, category, blog...) from cfg_project.page_types",
+    revenue: "Revenue of the transactions of the session (tests excluded)",
+    bot_score: "0-100, see int_ga4__session_bot_signals",
+    data_quality_issues: "Why the data_quality_score is not 100",
+    is_trusted_session: "data_quality_score >= 70 and not a bot. Filter by this when the numbers must be bullet proof"
+  })
+}
+
+WITH
+sessions AS (
+  SELECT * FROM ${ref("int_ga4__sessions_base")}
+),
+
+traffic AS (
+  SELECT * FROM ${ref("int_ga4__session_traffic")}
+),
+
+transactions_per_session AS (
+  SELECT
+    session_key,
+    COUNT(*) AS transactions,
+    SUM(revenue) AS revenue,
+    SUM(revenue_in_usd) AS revenue_in_usd,
+    SUM(item_quantity) AS items_purchased,
+    LOGICAL_OR(coupon IS NOT NULL) AS used_coupon
+  FROM ${ref("int_ga4__transactions")}
+  WHERE NOT is_test_transaction
+    AND session_key IS NOT NULL
+  GROUP BY session_key
+),
+
+key_events_per_session AS (
+  SELECT
+    session_key,
+    COUNTIF(is_counted) AS key_events,
+    SUM(IF(is_counted, key_event_value, 0)) AS key_event_value,
+    COUNTIF(is_counted AND is_primary) AS primary_key_events,
+    ARRAY_AGG(DISTINCT key_event_name) AS key_event_names
+  FROM ${ref("int_ga4__key_events")}
+  WHERE session_key IS NOT NULL
+  GROUP BY session_key
+),
+
+geo_br AS (
+  SELECT uf, macro_region FROM ${ref("seed_br_states")}
+),
+
+join_everything AS (
+  SELECT
+    s.session_key,
+    s.session_date,
+    s.session_start_ts,
+    s.session_end_ts,
+    s.session_start_local,
+    EXTRACT(HOUR FROM s.session_start_local) AS session_hour,
+    MOD(EXTRACT(DAYOFWEEK FROM s.session_date) + 5, 7) + 1 AS session_iso_weekday,
+    DATE_TRUNC(s.session_date, WEEK(MONDAY)) AS session_week,
+    DATE_TRUNC(s.session_date, MONTH) AS session_month,
+
+    s.user_pseudo_id,
+    s.user_id,
+    COALESCE(id.user_key, CONCAT('dev:', s.user_pseudo_id)) AS user_key,
+    COALESCE(id.is_identified, FALSE) AS is_identified_user,
+    COALESCE(s.ga_session_number, ROW_NUMBER() OVER (PARTITION BY s.user_pseudo_id ORDER BY s.session_start_ts)) AS session_number,
+    s.ga_session_number IS NULL AS is_session_number_fixed,
+    s.is_new_user,
+    s.platform,
+    s.stream_id,
+
+    t.session_source,
+    t.session_medium,
+    t.session_campaign,
+    t.session_campaign_id,
+    t.session_term,
+    t.session_content,
+    t.session_source_medium,
+    t.session_default_channel_group,
+    t.session_custom_channel_group,
+    t.session_source_only,
+    t.session_medium_only,
+    t.session_campaign_only,
+    t.session_channel_only,
+    t.session_custom_channel_only,
+    t.is_carried_over,
+    t.carried_days_ago,
+    t.fix_applied AS traffic_fix_applied,
+    t.excluded_referral_source,
+    t.excluded_referral_reason,
+    t.gclid,
+    t.gbraid,
+    t.wbraid,
+    t.fbclid,
+    t.msclkid,
+    t.ttclid,
+    t.srsltid,
+    COALESCE(t.gclid, t.gbraid, t.wbraid, t.fbclid, t.msclkid, t.ttclid) IS NOT NULL AS has_click_id,
+    t.ga4_native_source,
+    t.ga4_native_medium,
+    t.ga4_native_campaign,
+    t.ga4_native_default_channel_group,
+    t.google_ads_campaign_id,
+    t.google_ads_campaign_name,
+    t.google_ads_ad_group_name,
+    s.ga4_first_user_source,
+    s.ga4_first_user_medium,
+    s.ga4_first_user_campaign,
+
+    s.landing_page_path,
+    s.landing_page_path_ga4,
+    s.landing_page_title,
+    s.landing_page_location,
+    s.landing_hostname,
+    ${content.pageTypeCase("s.landing_page_path")} AS landing_page_type,
+    s.is_landing_page_fixed,
+    s.exit_page_path,
+
+    s.device_category,
+    s.device_os,
+    s.device_os_version,
+    s.device_browser,
+    s.device_browser_version,
+    s.device_language,
+    s.device_brand,
+    s.device_model,
+    s.app_version,
+    s.hostname,
+    s.geo_continent,
+    s.geo_sub_continent,
+    s.geo_country,
+    s.geo_region,
+    s.geo_city,
+    ${ref("br_uf_from_region")}(s.geo_country, s.geo_region) AS geo_uf,
+
+    s.event_count,
+    s.page_views,
+    s.screen_views,
+    s.unique_pages,
+    s.interaction_events,
+    s.engagement_time_msec,
+    s.engagement_time_msec / 1000 AS engagement_time_sec,
+    s.session_duration_sec,
+    s.is_engaged,
+    s.is_engaged_ga4,
+    s.is_bounce_ga4,
+    s.is_bounce_ua,
+
+    COALESCE(k.key_events, 0) AS key_events,
+    COALESCE(k.key_event_value, 0) AS key_event_value,
+    COALESCE(k.primary_key_events, 0) AS primary_key_events,
+    COALESCE(k.key_events, 0) > 0 AS has_key_event,
+    COALESCE(k.key_event_names, []) AS key_event_names,
+
+    COALESCE(tx.transactions, 0) AS transactions,
+    COALESCE(tx.revenue, 0) AS revenue,
+    COALESCE(tx.revenue_in_usd, 0) AS revenue_in_usd,
+    COALESCE(tx.items_purchased, 0) AS items_purchased,
+    COALESCE(tx.transactions, 0) > 0 AS has_purchase,
+    COALESCE(tx.used_coupon, FALSE) AS used_coupon,
+    COALESCE(f.has_view_item, FALSE) AS has_view_item,
+    COALESCE(f.has_add_to_cart, FALSE) AS has_add_to_cart,
+    COALESCE(f.has_begin_checkout, FALSE) AS has_begin_checkout,
+    COALESCE(f.has_add_shipping_info, FALSE) AS has_add_shipping_info,
+    COALESCE(f.has_add_payment_info, FALSE) AS has_add_payment_info,
+    COALESCE(f.view_item_events, 0) AS view_item_events,
+    COALESCE(f.add_to_cart_events, 0) AS add_to_cart_events,
+    COALESCE(f.cart_value, 0) AS cart_value,
+    f.checkout_value,
+    COALESCE(f.is_cart_abandoned, FALSE) AND COALESCE(tx.transactions, 0) = 0 AS is_cart_abandoned,
+    COALESCE(f.is_checkout_abandoned, FALSE) AND COALESCE(tx.transactions, 0) = 0 AS is_checkout_abandoned,
+    COALESCE(f.has_payment_retries, FALSE) AS has_payment_retries,
+    COALESCE(f.search_events, 0) > 0 AS has_site_search,
+    COALESCE(f.select_promotion_events, 0) > 0 AS has_promotion_click,
+    f.last_payment_type,
+    f.last_shipping_tier,
+
+    s.consent_analytics_storage,
+    s.consent_ads_storage,
+    s.consent_changed_in_session,
+
+    -- bots: the session alone (int_ga4__session_bot_signals) + the behaviour of the device
+    -- in the last days (int_ga4__device_bot_signals: impossible travel, cron like visits...)
+    GREATEST(COALESCE(b.bot_score, 0), COALESCE(db.device_bot_score, 0)) AS bot_score,
+    ARRAY_CONCAT(COALESCE(b.bot_signals, []), COALESCE(db.device_bot_signals, [])) AS bot_signals,
+    COALESCE(b.is_bot_suspect, FALSE) OR COALESCE(db.is_bot_device, FALSE) AS is_bot_suspect,
+    COALESCE(b.bot_score, 0) AS session_bot_score,
+    COALESCE(db.device_bot_score, 0) AS device_bot_score,
+    COALESCE(db.is_bot_device, FALSE) AS is_bot_device,
+
+    -- raw quality signals (become the score below)
+    s.has_session_start,
+    s.had_duplicate_events,
+    s.has_intraday_events,
+    s.is_non_production_host,
+    s.max_clock_offset_sec,
+    s.web_events_without_page
+  FROM sessions AS s
+  LEFT JOIN traffic AS t ON t.session_key = s.session_key
+  LEFT JOIN transactions_per_session AS tx ON tx.session_key = s.session_key
+  LEFT JOIN key_events_per_session AS k ON k.session_key = s.session_key
+  LEFT JOIN ${ref("int_ga4__session_ecommerce_flags")} AS f ON f.session_key = s.session_key
+  LEFT JOIN ${ref("int_ga4__session_bot_signals")} AS b ON b.session_key = s.session_key
+  LEFT JOIN ${ref("int_ga4__device_bot_signals")} AS db ON db.user_pseudo_id = s.user_pseudo_id
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id ON id.user_pseudo_id = s.user_pseudo_id
+),
+
+-- row level data quality: how much can we trust THIS session?
+score_quality AS (
+  SELECT
+    *,
+    ARRAY_CONCAT(
+      IF(NOT has_session_start, ['no_session_start'], []),
+      IF(platform = 'WEB' AND page_views = 0, ['no_page_view'], []),
+      IF(had_duplicate_events, ['duplicated_events'], []),
+      IF(is_landing_page_fixed, ['landing_page_fixed'], []),
+      IF(traffic_fix_applied IS NOT NULL, ['traffic_source_fixed'], []),
+      IF(is_session_number_fixed, ['session_number_missing'], []),
+      IF(has_intraday_events, ['intraday_not_final'], []),
+      IF(COALESCE(max_clock_offset_sec, 0) > 3600, ['device_clock_skew'], []),
+      IF(web_events_without_page > 0, ['events_without_page_location'], []),
+      IF(is_non_production_host, ['non_production_hostname'], []),
+      IF(is_bot_suspect, ['bot_suspect'], [])
+    ) AS data_quality_issues,
+    GREATEST(0, 100
+      - IF(NOT has_session_start, 15, 0)
+      - IF(platform = 'WEB' AND page_views = 0, 15, 0)
+      - IF(had_duplicate_events, 10, 0)
+      - IF(is_landing_page_fixed, 5, 0)
+      - IF(traffic_fix_applied IS NOT NULL, 5, 0)
+      - IF(is_session_number_fixed, 5, 0)
+      - IF(has_intraday_events, 10, 0)
+      - IF(COALESCE(max_clock_offset_sec, 0) > 3600, 10, 0)
+      - IF(web_events_without_page > 0, 10, 0)
+      - IF(is_non_production_host, 30, 0)
+      - IF(is_bot_suspect, 40, 0)
+    ) AS data_quality_score
+  FROM join_everything
+)
+
+SELECT
+  q.* EXCEPT (had_duplicate_events, has_intraday_events, max_clock_offset_sec, web_events_without_page),
+  g.macro_region AS geo_macro_region,
+  q.data_quality_score >= 70 AND NOT q.is_bot_suspect AS is_trusted_session,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM score_quality AS q
+LEFT JOIN geo_br AS g ON g.uf = q.geo_uf

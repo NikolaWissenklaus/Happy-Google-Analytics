@@ -1,0 +1,91 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.governance,
+  name: "gov_tracking_plan_coverage",
+  description: "Is the tracking plan implemented? One row per planned event x param: event seen in 7 / 28 days, fill rate of the param, type as planned or not, items present when the plan asks for items, and the status of the event (implemented / partial / stale / missing). The 'did the dev team do it' table",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "governance" }
+  },
+  tags: ["monitoring", "governance", "daily"],
+  columns: {
+    event_status: "implemented (seen in 7 days, required params >= 95% filled, items ok) | partial | stale (only in 28 days) | missing",
+    param_type_ok: "Planned type matches what arrives (number accepts int / double / float)"
+  }
+}
+
+WITH
+plan AS (
+  SELECT * FROM ${ref("seed_tracking_plan")}
+),
+
+events_seen AS (
+  SELECT
+    event_name,
+    COUNTIF(event_date >= ${helpers.daysAgo(7)}) AS events_7d,
+    COUNT(*) AS events_28d,
+    COUNTIF(event_date >= ${helpers.daysAgo(7)} AND items_count > 0) AS events_with_items_7d
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(28)}
+    ${helpers.noiseFilter()}
+  GROUP BY event_name
+),
+
+params_seen AS (
+  SELECT
+    event_name,
+    param_key,
+    COUNT(*) AS rows_7d,
+    ARRAY_AGG(DISTINCT value_type) AS types_7d
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+  GROUP BY 1, 2
+),
+
+per_param AS (
+  SELECT
+    p.event_name,
+    p.owner,
+    p.param_name,
+    p.param_type,
+    p.is_required,
+    p.requires_items,
+    COALESCE(e.events_7d, 0) AS events_7d,
+    COALESCE(e.events_28d, 0) AS events_28d,
+    SAFE_DIVIDE(e.events_with_items_7d, e.events_7d) AS items_rate_7d,
+    SAFE_DIVIDE(s.rows_7d, e.events_7d) AS fill_rate_7d,
+    s.types_7d,
+    CASE
+      WHEN p.param_name IS NULL OR s.types_7d IS NULL THEN NULL
+      WHEN p.param_type = 'any' THEN TRUE
+      WHEN p.param_type = 'string' THEN NOT EXISTS (SELECT 1 FROM UNNEST(s.types_7d) AS t WHERE t NOT IN ('string', 'null'))
+      WHEN p.param_type = 'int' THEN NOT EXISTS (SELECT 1 FROM UNNEST(s.types_7d) AS t WHERE t NOT IN ('int', 'null'))
+      WHEN p.param_type = 'number' THEN NOT EXISTS (SELECT 1 FROM UNNEST(s.types_7d) AS t WHERE t NOT IN ('int', 'double', 'float', 'null'))
+    END AS param_type_ok
+  FROM plan AS p
+  LEFT JOIN events_seen AS e USING (event_name)
+  LEFT JOIN params_seen AS s ON s.event_name = p.event_name AND s.param_key = p.param_name
+),
+
+per_event AS (
+  SELECT
+    event_name,
+    LOGICAL_AND(NOT is_required OR COALESCE(fill_rate_7d, 0) >= 0.95) AS required_params_ok,
+    LOGICAL_AND(COALESCE(param_type_ok, TRUE)) AS types_ok,
+    LOGICAL_AND(NOT requires_items OR COALESCE(items_rate_7d, 0) >= 0.95) AS items_ok
+  FROM per_param
+  GROUP BY event_name
+)
+
+SELECT
+  p.*,
+  CASE
+    WHEN p.events_28d = 0 THEN 'missing'
+    WHEN p.events_7d = 0 THEN 'stale'
+    WHEN e.required_params_ok AND e.types_ok AND e.items_ok THEN 'implemented'
+    ELSE 'partial'
+  END AS event_status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_param AS p
+JOIN per_event AS e USING (event_name)

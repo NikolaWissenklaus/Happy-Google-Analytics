@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_tracking_integrity",
+  description: "Tracking integrity per day (last 30 days): logic of the ecommerce funnel (purchase without begin_checkout, add_to_cart without view_item, checkout without cart), device clock skew and Measurement Protocol / server side looking events (no page, no engagement). When these move, a deploy broke something",
+  bigquery: {
+    partitionBy: "check_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "tracking"]
+}
+
+WITH
+funnel AS (
+  SELECT
+    session_date AS check_date,
+    COUNTIF(has_purchase AND NOT has_begin_checkout) AS purchase_without_checkout,
+    COUNTIF(has_purchase) AS purchase_sessions,
+    COUNTIF(has_add_to_cart AND NOT has_view_item) AS cart_without_view,
+    COUNTIF(has_add_to_cart) AS cart_sessions,
+    COUNTIF(has_begin_checkout AND NOT has_add_to_cart) AS checkout_without_cart,
+    COUNTIF(has_begin_checkout) AS checkout_sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  GROUP BY 1
+),
+
+events AS (
+  SELECT
+    event_date AS check_date,
+    COUNTIF(ABS(event_server_timestamp_offset) > 3600 * 1e6) AS clock_skew_events,
+    COUNTIF(platform = 'WEB' AND page_location IS NULL AND engagement_time_msec IS NULL
+            AND event_name NOT IN ('session_start', 'first_visit', 'user_engagement')) AS mp_like_events,
+    COUNT(*) AS events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+),
+
+checks AS (
+  SELECT check_date, 'purchase_without_begin_checkout' AS check_name, SAFE_DIVIDE(purchase_without_checkout, purchase_sessions) AS value, 0.05 AS warn_at, 0.2 AS fail_at FROM funnel
+  UNION ALL SELECT check_date, 'add_to_cart_without_view_item', SAFE_DIVIDE(cart_without_view, cart_sessions), 0.2, 0.5 FROM funnel
+  UNION ALL SELECT check_date, 'begin_checkout_without_add_to_cart', SAFE_DIVIDE(checkout_without_cart, checkout_sessions), 0.1, 0.3 FROM funnel
+  UNION ALL SELECT check_date, 'device_clock_skew_over_1h', SAFE_DIVIDE(clock_skew_events, events), 0.01, 0.05 FROM events
+  UNION ALL SELECT check_date, 'measurement_protocol_like_events', SAFE_DIVIDE(mp_like_events, events), 0.02, 0.1 FROM events
+)
+
+SELECT
+  check_date,
+  'integrity' AS check_group,
+  check_name,
+  value,
+  warn_at,
+  fail_at,
+  CASE WHEN value IS NULL THEN 'no_data' WHEN value >= fail_at THEN 'fail' WHEN value >= warn_at THEN 'warn' ELSE 'pass' END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checks

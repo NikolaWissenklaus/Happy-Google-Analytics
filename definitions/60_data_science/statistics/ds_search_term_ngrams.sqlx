@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_search_term_ngrams",
+  description: "Text mining of the site search (last 90 days): unigrams and bigrams of the normalized terms (no accents, portuguese stopwords removed), with searches and the conversion of the sessions. 'tenis' x 'tenis infantil' x 'tenis feminino 37' says what the catalog needs",
+  bigquery: {
+    labels: { layer: "data_science", domain: "text" }
+  },
+  tags: ["data_science", "statistics", "daily", "product"]
+}
+
+WITH
+terms AS (
+  SELECT search_term_normalized AS term, searches, session_conversion_rate
+  FROM ${ref("prod_site_search_terms")}
+),
+
+tokens AS (
+  SELECT
+    t.term,
+    t.searches,
+    t.session_conversion_rate,
+    ARRAY(
+      SELECT w FROM UNNEST(SPLIT(t.term, ' ')) AS w WITH OFFSET AS pos
+      WHERE LENGTH(w) >= 2 AND w NOT IN (SELECT word FROM ${ref("seed_pt_stopwords")})
+      ORDER BY pos
+    ) AS words
+  FROM terms AS t
+),
+
+ngrams AS (
+  SELECT 1 AS n, w AS ngram, searches, session_conversion_rate
+  FROM tokens, UNNEST(words) AS w
+  UNION ALL
+  SELECT 2, CONCAT(words[OFFSET(pos)], ' ', words[OFFSET(pos + 1)]), searches, session_conversion_rate
+  FROM tokens, UNNEST(GENERATE_ARRAY(0, ARRAY_LENGTH(words) - 2)) AS pos
+  WHERE ARRAY_LENGTH(words) >= 2
+)
+
+SELECT
+  n,
+  ngram,
+  SUM(searches) AS searches,
+  COUNT(*) AS distinct_terms,
+  SAFE_DIVIDE(SUM(searches * session_conversion_rate), SUM(searches)) AS weighted_conversion_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ngrams
+GROUP BY 1, 2
+HAVING SUM(searches) >= 5

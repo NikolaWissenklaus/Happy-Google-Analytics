@@ -1,0 +1,127 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.governance,
+  name: "gov_tracking_plan_violations",
+  description: "Daily violations of the tracking plan (last 30 days): unplanned events (when allow_unplanned_events = false), required params missing or empty, params with the wrong type, ecommerce events without items and event names out of the naming rules. GA4 collection limits are in dq_ga4_limits_violations and near duplicate names in dq_event_naming_hygiene",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["violation_type", "event_name"],
+    labels: { layer: "monitoring", domain: "governance" }
+  },
+  tags: ["monitoring", "governance", "daily", "data_quality"],
+  columns: {
+    violation_type: "unplanned_event | missing_required_param | wrong_param_type | missing_items | event_name_rule",
+    share_affected: "events_affected / events of the event that day",
+    severity: "high (key event or ecommerce money stuff) | medium | low"
+  }
+}
+
+js {
+  const naming = cfg_tracking_plan.naming;
+  const reserved = naming.reserved_prefixes.map(p => `STARTS_WITH(e.event_name, ${helpers.sqlString(p)})`).join(" OR ") || "FALSE";
+}
+
+WITH
+events_daily AS (
+  SELECT event_date, event_name, COUNT(*) AS events, COUNTIF(items_count > 0) AS events_with_items
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(30)}
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2
+),
+
+params_daily AS (
+  SELECT
+    event_date,
+    event_name,
+    param_key,
+    COUNTIF(value_type != 'null') AS rows_filled,
+    COUNTIF(value_type = 'string') AS string_rows,
+    COUNTIF(value_type IN ('int', 'double', 'float')) AS number_rows,
+    COUNTIF(value_type = 'int') AS int_rows
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= ${helpers.daysAgo(30)}
+  GROUP BY 1, 2, 3
+),
+
+plan_events AS (
+  SELECT event_name, LOGICAL_OR(requires_items) AS requires_items
+  FROM ${ref("seed_tracking_plan")}
+  GROUP BY event_name
+),
+
+plan_params AS (
+  SELECT event_name, param_name, param_type, is_required
+  FROM ${ref("seed_tracking_plan")}
+  WHERE param_name IS NOT NULL
+),
+
+automatic AS (SELECT DISTINCT event_name FROM ${ref("seed_automatic_events")}),
+key_events AS (SELECT DISTINCT event_name FROM ${ref("seed_key_events")}),
+
+all_violations AS (
+  ${cfg_tracking_plan.allow_unplanned_events ? `` : `
+  SELECT e.event_date, 'unplanned_event' AS violation_type, e.event_name, CAST(NULL AS STRING) AS param_name, e.events AS events_affected, e.events AS events_total
+  FROM events_daily AS e
+  LEFT JOIN plan_events AS p USING (event_name)
+  LEFT JOIN automatic AS a USING (event_name)
+  WHERE p.event_name IS NULL
+    AND a.event_name IS NULL
+  UNION ALL`}
+
+  -- aliases here too: with allow_unplanned_events = true this is the first SELECT of the union
+  SELECT e.event_date, 'missing_required_param' AS violation_type, e.event_name, pp.param_name,
+    e.events - COALESCE(pd.rows_filled, 0) AS events_affected, e.events AS events_total
+  FROM events_daily AS e
+  JOIN plan_params AS pp ON pp.event_name = e.event_name AND pp.is_required
+  LEFT JOIN params_daily AS pd ON pd.event_date = e.event_date AND pd.event_name = e.event_name AND pd.param_key = pp.param_name
+  WHERE e.events - COALESCE(pd.rows_filled, 0) > 0
+
+  UNION ALL
+  SELECT pd.event_date, 'wrong_param_type', pd.event_name, pd.param_key,
+    CASE pp.param_type
+      WHEN 'string' THEN pd.number_rows
+      WHEN 'number' THEN pd.string_rows
+      WHEN 'int' THEN pd.rows_filled - pd.int_rows
+      ELSE 0
+    END,
+    e.events
+  FROM params_daily AS pd
+  JOIN plan_params AS pp ON pp.event_name = pd.event_name AND pp.param_name = pd.param_key
+  JOIN events_daily AS e ON e.event_date = pd.event_date AND e.event_name = pd.event_name
+  WHERE pp.param_type IN ('string', 'number', 'int')
+
+  UNION ALL
+  SELECT e.event_date, 'missing_items', e.event_name, CAST(NULL AS STRING), e.events - e.events_with_items, e.events
+  FROM events_daily AS e
+  JOIN plan_events AS p USING (event_name)
+  WHERE p.requires_items
+    AND e.events - e.events_with_items > 0
+
+  UNION ALL
+  SELECT e.event_date, 'event_name_rule', e.event_name, CAST(NULL AS STRING), e.events, e.events
+  FROM events_daily AS e
+  WHERE NOT REGEXP_CONTAINS(e.event_name, r'${naming.event_name_regex}')
+    OR LENGTH(e.event_name) > ${naming.max_event_name_length}
+    OR ${reserved}
+)
+
+SELECT
+  v.event_date,
+  v.violation_type,
+  v.event_name,
+  v.param_name,
+  v.events_affected,
+  SAFE_DIVIDE(v.events_affected, v.events_total) AS share_affected,
+  CASE
+    WHEN k.event_name IS NOT NULL AND v.violation_type IN ('missing_required_param', 'wrong_param_type', 'missing_items') THEN 'high'
+    WHEN v.violation_type IN ('missing_items', 'missing_required_param') THEN 'medium'
+    WHEN v.violation_type IN ('unplanned_event', 'wrong_param_type') THEN 'medium'
+    ELSE 'low'
+  END AS severity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_violations AS v
+LEFT JOIN key_events AS k USING (event_name)
+WHERE v.events_affected > 0

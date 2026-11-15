@@ -1,0 +1,29 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_kpi_forecast_anomalies",
+  disabled: !constants.ENABLE.bqml,
+  description: "ML.DETECT_ANOMALIES of the ARIMA_PLUS model over the history (holiday aware). Same shape of the other anomaly methods, it enters anom_ensemble as one more vote when enable_bqml is on",
+  bigquery: {
+    labels: { layer: "data_science", domain: "anomaly" }
+  },
+  tags: ["data_science", "bqml", "daily", "optional", "anomaly"]
+}
+
+SELECT
+  DATE(metric_ts) AS metric_date,
+  metric,
+  value,
+  (lower_bound + upper_bound) / 2 AS expected,
+  lower_bound,
+  upper_bound,
+  anomaly_probability,
+  is_anomaly,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ML.DETECT_ANOMALIES(
+  MODEL ${ref("ds_model_kpi_forecast")},
+  STRUCT(0.95 AS anomaly_prob_threshold)
+)
+WHERE DATE(metric_ts) >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)

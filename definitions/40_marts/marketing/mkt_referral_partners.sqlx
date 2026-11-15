@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_referral_partners",
+  description: "Referral domains (partners, blogs, press, cashback, coupons, marketplaces) last 90 days vs previous 90: sessions, quality and revenue, plus the category of the source. New partners and partners that died are easy to spot",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"]
+}
+
+WITH
+referral_sessions AS (
+  SELECT
+    session_source_only AS referral_source,
+    session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY) AS is_current_period,
+    is_engaged,
+    is_new_user,
+    transactions,
+    revenue,
+    session_date
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 180 DAY)
+    AND session_medium_only = 'referral'
+    ${helpers.martSessionFilter()}
+),
+
+per_source AS (
+  SELECT
+    referral_source,
+    COUNTIF(is_current_period) AS sessions_90d,
+    COUNTIF(NOT is_current_period) AS sessions_prev_90d,
+    COUNTIF(is_current_period AND is_engaged) AS engaged_sessions_90d,
+    COUNTIF(is_current_period AND is_new_user) AS new_users_90d,
+    SUM(IF(is_current_period, transactions, 0)) AS transactions_90d,
+    SUM(IF(is_current_period, revenue, 0)) AS revenue_90d,
+    SUM(IF(NOT is_current_period, revenue, 0)) AS revenue_prev_90d,
+    MIN(session_date) AS first_seen_in_180d,
+    MAX(session_date) AS last_seen
+  FROM referral_sessions
+  GROUP BY referral_source
+)
+
+SELECT
+  p.*,
+  COALESCE(c.category, 'referral') AS source_category,
+  SAFE_DIVIDE(p.engaged_sessions_90d, p.sessions_90d) AS engagement_rate_90d,
+  SAFE_DIVIDE(p.transactions_90d, p.sessions_90d) AS conversion_rate_90d,
+  ${helpers.pctChange("p.sessions_90d", "p.sessions_prev_90d")} AS sessions_change,
+  CASE
+    WHEN p.sessions_prev_90d = 0 AND p.sessions_90d > 0 THEN 'new_partner'
+    WHEN p.sessions_90d = 0 AND p.sessions_prev_90d > 0 THEN 'lost_partner'
+    WHEN p.sessions_90d > p.sessions_prev_90d * 1.5 THEN 'growing'
+    WHEN p.sessions_90d < p.sessions_prev_90d * 0.5 THEN 'declining'
+    ELSE 'stable'
+  END AS partner_trend,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_source AS p
+LEFT JOIN ${ref("seed_source_categories")} AS c ON c.source = p.referral_source

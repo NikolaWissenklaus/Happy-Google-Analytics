@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_model_comparison",
+  description: "The GA4 'Model comparison' (and the old UA Model Comparison Tool) for the last 90 days: conversions of each channel in every model, plus data driven (Markov and Shapley), and the % difference vs last non-direct click",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily"],
+  columns: {
+    diff_linear_vs_lnd: "(linear - last non-direct) / last non-direct. Positive = channel is undervalued by last click"
+  }
+}
+
+WITH
+rule_based AS (
+  SELECT
+    key_event_name,
+    channel,
+    SUM(credit_first_click) AS first_click,
+    SUM(credit_last_click) AS last_click,
+    SUM(credit_last_non_direct) AS last_non_direct,
+    SUM(credit_linear) AS linear,
+    SUM(credit_time_decay) AS time_decay,
+    SUM(credit_position_based) AS position_based,
+    SUM(credit_w_shaped) AS w_shaped,
+    SUM(credit_last_non_direct * conversion_value) AS value_last_non_direct,
+    SUM(credit_linear * conversion_value) AS value_linear
+  FROM ${ref("attr_credits_rule_based")}
+  WHERE conversion_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY 1, 2
+),
+
+data_driven AS (
+  SELECT
+    key_event_name,
+    channel,
+    m.attributed_conversions AS markov,
+    s.attributed_conversions AS shapley
+  FROM ${ref("attr_markov_removal_effects")} AS m
+  FULL OUTER JOIN ${ref("attr_shapley_values")} AS s USING (key_event_name, channel)
+)
+
+SELECT
+  r.*,
+  d.markov,
+  d.shapley,
+  ${helpers.pctChange("r.first_click", "r.last_non_direct")} AS diff_first_click_vs_lnd,
+  ${helpers.pctChange("r.linear", "r.last_non_direct")} AS diff_linear_vs_lnd,
+  ${helpers.pctChange("r.time_decay", "r.last_non_direct")} AS diff_time_decay_vs_lnd,
+  ${helpers.pctChange("r.position_based", "r.last_non_direct")} AS diff_position_based_vs_lnd,
+  ${helpers.pctChange("d.markov", "r.last_non_direct")} AS diff_markov_vs_lnd,
+  ${helpers.pctChange("d.shapley", "r.last_non_direct")} AS diff_shapley_vs_lnd,
+  CASE
+    WHEN ${helpers.pctChange("r.first_click", "r.last_non_direct")} > 0.2 THEN 'introducer (undervalued by last click)'
+    WHEN ${helpers.pctChange("r.first_click", "r.last_non_direct")} < -0.2 THEN 'closer (overvalued by last click)'
+    ELSE 'balanced'
+  END AS channel_profile,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rule_based AS r
+LEFT JOIN data_driven AS d USING (key_event_name, channel)

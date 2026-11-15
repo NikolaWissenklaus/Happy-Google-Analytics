@@ -1,0 +1,95 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_funnel_segment_gaps",
+  description: "Step by step conversion (view -> cart -> checkout -> purchase) for each segment (device, channel, new/returning, browser) vs the whole site, last 30 days, with z-test of each step. Shows WHERE in the funnel each segment breaks, not only that it converts less",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "stats"],
+  columns: {
+    worst_step: "Step with the most negative significant gap vs the site"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT *
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+),
+
+segments AS (
+  SELECT d.segment_type, d.segment_value, s.has_view_item, s.has_add_to_cart, s.has_begin_checkout, s.has_purchase
+  FROM sessions AS s,
+    UNNEST([
+      STRUCT('device' AS segment_type, s.device_category AS segment_value),
+      STRUCT('channel', s.session_default_channel_group),
+      STRUCT('user_type', IF(s.is_new_user, 'new', 'returning')),
+      STRUCT('browser', s.device_browser)
+    ]) AS d
+),
+
+per_segment AS (
+  SELECT
+    segment_type,
+    segment_value,
+    COUNTIF(has_view_item) AS viewed,
+    COUNTIF(has_view_item AND has_add_to_cart) AS carted,
+    COUNTIF(has_add_to_cart AND has_begin_checkout) AS checked_out,
+    COUNTIF(has_add_to_cart) AS carted_any,
+    COUNTIF(has_begin_checkout) AS checkout_any,
+    COUNTIF(has_begin_checkout AND has_purchase) AS purchased
+  FROM segments
+  GROUP BY 1, 2
+),
+
+site AS (
+  SELECT
+    COUNTIF(has_view_item) AS viewed,
+    COUNTIF(has_view_item AND has_add_to_cart) AS carted,
+    COUNTIF(has_add_to_cart) AS carted_any,
+    COUNTIF(has_add_to_cart AND has_begin_checkout) AS checked_out,
+    COUNTIF(has_begin_checkout) AS checkout_any,
+    COUNTIF(has_begin_checkout AND has_purchase) AS purchased
+  FROM sessions
+),
+
+tests AS (
+  SELECT
+    p.*,
+    ${ref("z_test_proportions")}(st.carted, st.viewed, p.carted, p.viewed) AS view_to_cart,
+    ${ref("z_test_proportions")}(st.checked_out, st.carted_any, p.checked_out, p.carted_any) AS cart_to_checkout,
+    ${ref("z_test_proportions")}(st.purchased, st.checkout_any, p.purchased, p.checkout_any) AS checkout_to_purchase
+  FROM per_segment AS p
+  CROSS JOIN site AS st
+  WHERE p.viewed >= 200
+)
+
+SELECT
+  segment_type,
+  segment_value,
+  viewed,
+  view_to_cart.rate_b AS view_to_cart_rate,
+  view_to_cart.rate_a AS site_view_to_cart_rate,
+  view_to_cart.p_value AS view_to_cart_p_value,
+  cart_to_checkout.rate_b AS cart_to_checkout_rate,
+  cart_to_checkout.rate_a AS site_cart_to_checkout_rate,
+  cart_to_checkout.p_value AS cart_to_checkout_p_value,
+  checkout_to_purchase.rate_b AS checkout_to_purchase_rate,
+  checkout_to_purchase.rate_a AS site_checkout_to_purchase_rate,
+  checkout_to_purchase.p_value AS checkout_to_purchase_p_value,
+  CASE
+    WHEN LEAST(
+      IF(view_to_cart.p_value < 0.05, view_to_cart.rel_uplift, 0),
+      IF(cart_to_checkout.p_value < 0.05, cart_to_checkout.rel_uplift, 0),
+      IF(checkout_to_purchase.p_value < 0.05, checkout_to_purchase.rel_uplift, 0)) >= 0 THEN 'none'
+    WHEN IF(view_to_cart.p_value < 0.05, view_to_cart.rel_uplift, 0) <= LEAST(IF(cart_to_checkout.p_value < 0.05, cart_to_checkout.rel_uplift, 0), IF(checkout_to_purchase.p_value < 0.05, checkout_to_purchase.rel_uplift, 0)) THEN 'view_to_cart'
+    WHEN IF(cart_to_checkout.p_value < 0.05, cart_to_checkout.rel_uplift, 0) <= IF(checkout_to_purchase.p_value < 0.05, checkout_to_purchase.rel_uplift, 0) THEN 'cart_to_checkout'
+    ELSE 'checkout_to_purchase'
+  END AS worst_step,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM tests

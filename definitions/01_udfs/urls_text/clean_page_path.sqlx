@@ -1,0 +1,18 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "clean_page_path",
+  description: "Normalized page path: lower case, no query string/fragment, no trailing slash, '/' for home. Same rule as the pipeline",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- "/Produto/Tenis-X/?utm_source=x#reviews" -> "/produto/tenis-x"
+-- accepts a full url or only the path
+CREATE OR REPLACE FUNCTION ${self()}(url STRING) RETURNS STRING AS (
+  ${ga4.urlPath("url")}
+)
+OPTIONS (description = "Normalized page path, same logic used in stg_ga4__events.page_path")

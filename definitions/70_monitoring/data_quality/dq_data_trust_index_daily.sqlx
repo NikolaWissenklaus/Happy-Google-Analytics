@@ -1,0 +1,33 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_data_trust_index_daily",
+  description: "Data Trust Index: one number (0-100) per day that says how much the data of that day can be trusted. Weighted share of passing checks (warn counts half). Put it in the corner of every dashboard, it ends a lot of meetings",
+  bigquery: {
+    partitionBy: "check_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"],
+  columns: {
+    data_trust_index: "100 = all checks pass. Below 80 = read the failing_checks before deciding anything",
+    failing_checks: "Names of the checks in fail"
+  }
+}
+
+SELECT
+  check_date,
+  ROUND(100 * SAFE_DIVIDE(
+    SUM(weight * CASE status WHEN 'pass' THEN 1 WHEN 'warn' THEN 0.5 ELSE 0 END),
+    SUM(weight)
+  ), 1) AS data_trust_index,
+  COUNTIF(status = 'pass') AS checks_pass,
+  COUNTIF(status = 'warn') AS checks_warn,
+  COUNTIF(status = 'fail') AS checks_fail,
+  ARRAY_AGG(IF(status = 'fail', check_name, NULL) IGNORE NULLS) AS failing_checks,
+  ARRAY_AGG(IF(status = 'warn', check_name, NULL) IGNORE NULLS) AS warning_checks,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("dq_scorecard_daily")}
+WHERE status != 'no_data'
+GROUP BY check_date

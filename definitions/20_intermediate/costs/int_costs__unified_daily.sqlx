@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_costs__unified_daily",
+  description: "All marketing costs in one shape (date x platform x campaign): Google Ads, Meta Ads and manual costs. Only the enabled sources are unioned",
+  bigquery: {
+    partitionBy: "cost_date",
+    clusterBy: ["platform", "campaign"],
+    labels: { layer: "intermediate", domain: "costs" }
+  },
+  tags: ["intermediate", "daily", "costs"],
+  columns: {
+    platform: "google_ads | meta_ads | manual",
+    campaign: "Campaign name in lower case. This is the join key with GA4 utm_campaign, so keep the naming convention!"
+  }
+}
+
+WITH
+manual_costs AS (
+  SELECT
+    cost_date,
+    'manual' AS platform,
+    platform AS sub_platform,
+    source,
+    medium,
+    campaign,
+    CAST(NULL AS STRING) AS campaign_id,
+    cost,
+    CAST(NULL AS INT64) AS clicks,
+    CAST(NULL AS INT64) AS impressions
+  FROM ${ref("stg_costs__manual_daily")}
+)
+
+${constants.ENABLE.google_ads ? `,
+google_ads_costs AS (
+  SELECT
+    cost_date,
+    'google_ads' AS platform,
+    LOWER(channel_type) AS sub_platform,
+    'google' AS source,
+    'cpc' AS medium,
+    campaign_name_lower AS campaign,
+    campaign_id,
+    cost,
+    clicks,
+    impressions
+  FROM ${ref("stg_google_ads__campaign_daily")}
+)` : ``}
+
+${constants.ENABLE.meta_ads ? `,
+meta_ads_costs AS (
+  SELECT
+    cost_date,
+    'meta_ads' AS platform,
+    'facebook_instagram' AS sub_platform,
+    'facebook' AS source,
+    'paid_social' AS medium,
+    campaign_name_lower AS campaign,
+    campaign_id,
+    SUM(cost) AS cost,
+    SUM(link_clicks) AS clicks,
+    SUM(impressions) AS impressions
+  FROM ${ref("stg_meta_ads__insights")}
+  GROUP BY cost_date, campaign_name_lower, campaign_id
+)` : ``}
+
+SELECT *, CURRENT_TIMESTAMP() AS loaded_at FROM manual_costs
+${constants.ENABLE.google_ads ? `UNION ALL SELECT *, CURRENT_TIMESTAMP() AS loaded_at FROM google_ads_costs` : ``}
+${constants.ENABLE.meta_ads ? `UNION ALL SELECT *, CURRENT_TIMESTAMP() AS loaded_at FROM meta_ads_costs` : ``}

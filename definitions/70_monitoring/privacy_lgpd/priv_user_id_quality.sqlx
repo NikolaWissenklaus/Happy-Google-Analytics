@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_user_id_quality",
+  description: "user_id quality per day (raw export, last pii_scan_days): ids that are email / CPF / phone in clear text (LGPD), too long, placeholders ('undefined', 'null', '0', 'guest'... a classic dataLayer bug that merges thousands of people into one user) and ids used on too many devices",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily", "data_quality"],
+  columns: {
+    placeholder_user_ids: "user_id values like 'undefined', 'null', '0', 'guest'. GA4 stitches everyone with this id together",
+    user_ids_on_many_devices: "user_id seen on more than 20 devices in the period: shared account, test account or a placeholder we did not know",
+    hashed_in_staging: "Rows where staging replaced the user_id by its SHA256 because it looked like email/CPF (when mask_pii_in_urls = true)"
+  }
+}
+
+js {
+  const rules = cfg_privacy.user_id_rules;
+  // same list the stitching uses to ignore them (cfg_identity.js)
+  const placeholders = cfg_identity.user_id_placeholders;
+}
+
+WITH
+raw_ids AS (
+  SELECT
+    PARSE_DATE('%Y%m%d', event_date) AS event_date,
+    user_id,
+    user_pseudo_id
+  FROM ${ref("events_*")}
+  WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', ${helpers.daysAgo(constants.PRIVACY.pii_scan_days)}) AND FORMAT_DATE('%Y%m%d', ${helpers.today()})
+    AND user_id IS NOT NULL
+),
+
+per_id AS (
+  SELECT
+    event_date,
+    user_id,
+    COUNT(DISTINCT user_pseudo_id) AS devices,
+    ${rules.forbid_email ? `REGEXP_CONTAINS(user_id, r'${privacy.PATTERNS.email}')` : `FALSE`} AS is_email,
+    ${rules.forbid_cpf ? `${ref("is_valid_cpf")}(user_id)` : `FALSE`} AS is_cpf,
+    ${rules.forbid_phone ? `REGEXP_CONTAINS(user_id, r'${privacy.PATTERNS.phone_br}') OR REGEXP_CONTAINS(user_id, r'^\\+?55\\d{10,11}$')` : `FALSE`} AS is_phone,
+    LENGTH(user_id) > ${rules.max_length} AS is_too_long,
+    LOWER(TRIM(user_id)) IN (${helpers.sqlList(placeholders)}) OR TRIM(user_id) = '' AS is_placeholder,
+    user_id != TRIM(user_id) AS has_extra_spaces
+  FROM raw_ids
+  GROUP BY event_date, user_id
+),
+
+hashed AS (
+  SELECT event_date, COUNTIF(user_id_was_hashed) AS hashed_in_staging
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(constants.PRIVACY.pii_scan_days)}
+  GROUP BY event_date
+)
+
+SELECT
+  p.event_date,
+  COUNT(*) AS distinct_user_ids,
+  COUNTIF(p.is_email) AS email_user_ids,
+  COUNTIF(p.is_cpf) AS cpf_user_ids,
+  COUNTIF(p.is_phone) AS phone_user_ids,
+  COUNTIF(p.is_too_long) AS too_long_user_ids,
+  COUNTIF(p.is_placeholder) AS placeholder_user_ids,
+  COUNTIF(p.has_extra_spaces) AS user_ids_with_spaces,
+  COUNTIF(p.devices > 20) AS user_ids_on_many_devices,
+  MAX(p.devices) AS max_devices_on_one_user_id,
+  ARRAY_AGG(IF(p.is_placeholder, p.user_id, NULL) IGNORE NULLS LIMIT 5) AS placeholder_examples,
+  ANY_VALUE(h.hashed_in_staging) AS hashed_in_staging,
+  COUNTIF(p.is_email OR p.is_cpf OR p.is_phone) = 0 AS is_lgpd_ok,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_id AS p
+LEFT JOIN hashed AS h USING (event_date)
+GROUP BY p.event_date

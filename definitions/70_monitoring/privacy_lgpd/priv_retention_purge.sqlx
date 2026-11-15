@@ -1,0 +1,41 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_retention_purge",
+  disabled: !constants.ENABLE.retention_purge,
+  description: "Retention purge (LGPD art. 15 and 16: personal data cannot live forever): deletes rows older than data_retention_months from every user level table of the project. Aggregated tables (no identifiers) keep their history. Raw export shards are dropped only with retention_include_raw_export. OFF by default (enable_retention_purge)",
+  dependencies: ["priv_retention_preview", "priv_retention_log"],
+  tags: ["monitoring", "lgpd", "daily"]
+}
+
+-- with this on, staging also stops loading anything older than the cutoff (see stg_ga4__events),
+-- so a full refresh does not bring the old data back. aggregated incremental reports keep
+-- the history they already have, but a full refresh of them will start at the cutoff too.
+DECLARE cutoff DATE DEFAULT DATE_SUB(${helpers.today()}, INTERVAL ${constants.PRIVACY.retention_months} MONTH);
+DECLARE run_id STRING DEFAULT GENERATE_UUID();
+
+FOR t IN (${privacy.partitionedUserTablesSql()}) DO
+  EXECUTE IMMEDIATE FORMAT(
+    "DELETE FROM `${constants.PROJECT}.%s.%s` WHERE %s < @cutoff",
+    t.table_schema, t.table_name, t.partition_column
+  ) USING cutoff AS cutoff;
+  INSERT INTO ${ref("priv_retention_log")} (run_id, target_table, action, cutoff_date, rows_affected, purged_at)
+  VALUES (run_id, CONCAT(t.table_schema, '.', t.table_name), 'delete_rows', cutoff, @@row_count, CURRENT_TIMESTAMP());
+END FOR;
+
+${constants.PRIVACY.retention_include_raw_export ? `
+-- raw export: one table per day, so old days are simply dropped
+FOR s IN (
+  SELECT table_name
+  FROM \`${constants.GA4_PROJECT}.${constants.GA4_DATASET}.INFORMATION_SCHEMA.TABLES\`
+  WHERE REGEXP_CONTAINS(table_name, r'^(events|pseudonymous_users|users)_\\d{8}$')
+    AND PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(table_name, r'(\\d{8})$')) < cutoff
+) DO
+  EXECUTE IMMEDIATE FORMAT("DROP TABLE \`${constants.GA4_PROJECT}.${constants.GA4_DATASET}.%s\`", s.table_name);
+  INSERT INTO ${ref("priv_retention_log")} (run_id, target_table, action, cutoff_date, rows_affected, purged_at)
+  VALUES (run_id, CONCAT('${constants.GA4_DATASET}.', s.table_name), 'drop_shard', cutoff, NULL, CURRENT_TIMESTAMP());
+END FOR;` : `
+-- raw export shards kept (retention_include_raw_export = false). Set the table expiration
+-- of the GA4 dataset if you prefer BigQuery to do it`}

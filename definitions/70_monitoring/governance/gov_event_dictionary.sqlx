@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.governance,
+  name: "gov_event_dictionary",
+  description: "The living event dictionary: every event that really arrives (not the one in the confluence page from 2021), with description, owner, key event config, status, volume, devices and every param it carries (type, fill rate, planned or not, required or not). Analysts start here before asking 'what does this event mean?'",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "governance" }
+  },
+  tags: ["monitoring", "governance", "daily"],
+  columns: {
+    params: "Params seen in the last 120 days: name, types, fill rate in 7 days, in the plan, required by the plan"
+  }
+}
+
+js {
+  const descriptions = cfg_tracking_plan.descriptions || {};
+  const descriptionCase = Object.keys(descriptions).length
+    ? `CASE r.event_name ${Object.entries(descriptions).map(([k, v]) => `WHEN ${helpers.sqlString(k)} THEN ${helpers.sqlString(v)}`).join(" ")} END`
+    : `CAST(NULL AS STRING)`;
+}
+
+WITH
+devices_7d AS (
+  SELECT event_name, COUNT(DISTINCT user_pseudo_id) AS devices_last_7d
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+    ${helpers.noiseFilter()}
+  GROUP BY event_name
+),
+
+planned_params AS (
+  SELECT event_name, param_name, ANY_VALUE(param_type) AS param_type, LOGICAL_OR(is_required) AS is_required
+  FROM ${ref("seed_tracking_plan")}
+  WHERE param_name IS NOT NULL
+  GROUP BY 1, 2
+),
+
+params_of_event AS (
+  SELECT
+    p.event_name,
+    ARRAY_AGG(STRUCT(
+      p.param_key,
+      ARRAY(SELECT t.value_type FROM UNNEST(p.value_types) AS t) AS types,
+      p.fill_rate_7d,
+      pp.param_name IS NOT NULL AS in_plan,
+      COALESCE(pp.is_required, FALSE) AS required_by_plan
+    ) ORDER BY p.events_with_param_7d DESC) AS params
+  FROM ${ref("watch_param_registry")} AS p
+  LEFT JOIN planned_params AS pp ON pp.event_name = p.event_name AND pp.param_name = p.param_key
+  GROUP BY p.event_name
+),
+
+key_events AS (
+  SELECT event_name, ARRAY_AGG(STRUCT(key_event_name, label, category, counting, value_rule, is_primary)) AS key_event_config
+  FROM ${ref("seed_key_events")}
+  GROUP BY event_name
+)
+
+SELECT
+  r.event_name,
+  COALESCE(${descriptionCase}, 'TODO: describe (cfg_tracking_plan.descriptions)') AS description,
+  r.plan_owner AS owner,
+  r.in_tracking_plan,
+  r.is_automatic,
+  r.is_key_event,
+  k.key_event_config,
+  r.status,
+  r.first_seen_date,
+  r.last_seen_date,
+  r.events_last_7d,
+  d.devices_last_7d,
+  r.total_events,
+  p.params,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("watch_event_registry")} AS r
+LEFT JOIN devices_7d AS d USING (event_name)
+LEFT JOIN params_of_event AS p USING (event_name)
+LEFT JOIN key_events AS k USING (event_name)

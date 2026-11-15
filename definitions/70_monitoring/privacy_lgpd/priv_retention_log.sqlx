@@ -1,0 +1,21 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_retention_log",
+  description: "Audit log of the retention purge (data_retention_months): what was deleted / dropped, with which cutoff and when",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["monitoring", "lgpd", "daily", "bootstrap"]
+}
+
+CREATE TABLE IF NOT EXISTS ${self()} (
+  run_id STRING OPTIONS (description = "One id per execution of priv_retention_purge"),
+  target_table STRING OPTIONS (description = "dataset.table"),
+  action STRING OPTIONS (description = "delete_rows | drop_shard"),
+  cutoff_date DATE OPTIONS (description = "Everything before this date was removed"),
+  rows_affected INT64 OPTIONS (description = "Rows deleted (NULL for drop_shard)"),
+  purged_at TIMESTAMP
+)
+OPTIONS (description = "LGPD retention purge audit log")

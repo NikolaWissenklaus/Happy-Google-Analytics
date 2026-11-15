@@ -1,0 +1,132 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__session_tagging_checks",
+  description: "Campaign tagging checks per session: the utms the urls had, structural problems of the urls (includes/tagging.js), internal utms, utms that arrived only after the first page, and the attribution loss: the url had utms but NO event of the session got the source / medium params, or GA4 itself says (direct) / (not set). Base of the media quality marts",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["is_tagged", "is_attribution_lost"],
+    labels: { layer: "intermediate", domain: "marketing" }
+  },
+  tags: ["ga4", "intermediate", "daily", "marketing"],
+  columns: {
+    is_tagged: "Some page_location of the session had utm_source or utm_medium",
+    has_source_medium_param: "Some event of the session has the event params source AND medium (GA4 adds them when it processes the utms)",
+    url_issues: "Structural problems found in the urls of the session (tagging.ISSUE_FIX explains each one)",
+    has_internal_utm: "A page view after the first one had utms and the referrer was our own site",
+    has_utm_not_on_first_page: "The utms showed up only after the first page view (redirect / SPA) and not from our own site",
+    is_utm_ignored_by_ga4: "Tagged session that GA4 attributed to (direct) / (not set). NULL when the export does not have session_traffic_source_last_click yet",
+    is_attribution_lost: "Tagged and (no source / medium event param or ignored by GA4)"
+  }
+}
+
+js {
+  const own = constants.SITE_HOSTNAMES.length > 0
+    ? `IN (${helpers.sqlList(constants.SITE_HOSTNAMES)})`
+    : `= '__no_hostnames_configured__'`;
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+events AS (
+  SELECT
+    session_key,
+    event_date,
+    event_ts,
+    event_name,
+    page_location,
+    ${ga4.urlHost("page_referrer")} AS referrer_host,
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    ${ga4.paramStr("source")} AS source_param,
+    ${ga4.paramStr("medium")} AS medium_param,
+    ga4_session_source
+  FROM ${ref("stg_ga4__events")}
+  -- one day before, so a session that crossed midnight is seen whole (and then cut below)
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+page_views AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY event_ts) AS page_number
+  FROM events
+  WHERE event_name = 'page_view'
+    AND page_location IS NOT NULL
+),
+
+-- the regexes only run on urls that can have a problem
+url_checks AS (
+  SELECT
+    session_key,
+    page_number,
+    referrer_host,
+    REGEXP_CONTAINS(LOWER(page_location), r'[?&#;]utm_[a-z_]+=') AS has_utm,
+    ${tagging.urlIssues("page_location")} AS issues
+  FROM page_views
+  WHERE REGEXP_CONTAINS(LOWER(page_location), r'utm|umt|utn|clid=|braid=|&amp;|%3f|%26')
+),
+
+per_session AS (
+  SELECT
+    session_key,
+    MIN(event_date) AS session_date,
+    ARRAY_AGG(
+      IF(utm_source IS NOT NULL OR utm_medium IS NOT NULL, STRUCT(utm_source, utm_medium, utm_campaign), NULL)
+      IGNORE NULLS ORDER BY event_ts LIMIT 1
+    )[SAFE_OFFSET(0)] AS first_utm,
+    LOGICAL_OR(source_param IS NOT NULL AND medium_param IS NOT NULL) AS has_source_medium_param,
+    ARRAY_AGG(ga4_session_source IGNORE NULLS LIMIT 1)[SAFE_OFFSET(0)] AS ga4_session_source,
+    ARRAY_AGG(IF(event_name = 'page_view', page_location, NULL) IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS landing_url
+  FROM events
+  GROUP BY session_key
+),
+
+per_session_urls AS (
+  SELECT
+    session_key,
+    ARRAY_CONCAT_AGG(issues) AS all_issues,
+    LOGICAL_OR(has_utm AND page_number > 1 AND COALESCE(referrer_host ${own}, FALSE)) AS has_internal_utm,
+    LOGICAL_OR(has_utm AND page_number > 1 AND NOT COALESCE(referrer_host ${own}, FALSE)) AS has_utm_not_on_first_page
+  FROM url_checks
+  GROUP BY session_key
+),
+
+checks AS (
+  SELECT
+    p.session_key,
+    p.session_date,
+    p.landing_url,
+    p.first_utm IS NOT NULL AS is_tagged,
+    p.first_utm.utm_source,
+    p.first_utm.utm_medium,
+    p.first_utm.utm_campaign,
+    p.has_source_medium_param,
+    p.ga4_session_source,
+    ARRAY(SELECT DISTINCT i FROM UNNEST(COALESCE(u.all_issues, [])) AS i ORDER BY i) AS url_issues,
+    COALESCE(u.has_internal_utm, FALSE) AS has_internal_utm,
+    COALESCE(u.has_utm_not_on_first_page, FALSE) AS has_utm_not_on_first_page,
+    p.first_utm IS NOT NULL AND NOT p.has_source_medium_param AS is_utm_without_source_medium_param,
+    IF(p.first_utm IS NULL OR p.ga4_session_source IS NULL, NULL, p.ga4_session_source IN ('(direct)', '(not set)')) AS is_utm_ignored_by_ga4
+  FROM per_session AS p
+  LEFT JOIN per_session_urls AS u USING (session_key)
+)
+
+SELECT
+  *,
+  is_tagged AND (is_utm_without_source_medium_param OR COALESCE(is_utm_ignored_by_ga4, FALSE)) AS is_attribution_lost,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checks
+WHERE session_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

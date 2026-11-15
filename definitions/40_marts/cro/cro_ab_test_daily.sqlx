@@ -1,0 +1,91 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_ab_test_daily",
+  description: "Cumulative A/B test curves per day and variant (users, conversions, conversion rate, uplift and p value up to that day). The chart that shows the 'peeking problem': p values jumping below 0.05 and back. Decide with the sample size, not with the first green day",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "stats", "experiments"]
+}
+
+js {
+  const exp = cfg_experiments.exposure;
+}
+
+WITH
+tests AS (SELECT * FROM ${ref("seed_ab_tests")}),
+
+-- params first, aggregation after (BigQuery does not like subqueries inside GROUP BY / ARRAY_AGG)
+exposures AS (
+  SELECT
+    ${ga4.paramAny(exp.experiment_param)} AS experiment_id,
+    ${ga4.paramAny(exp.variant_param)} AS variant_id,
+    e.user_pseudo_id,
+    e.event_ts
+  FROM ${ref("stg_ga4__events")} AS e
+  WHERE e.event_date >= (SELECT MIN(start_date) FROM tests)
+    AND e.event_name = '${exp.event_name}'
+    ${helpers.noiseFilter("e")}
+),
+
+assignments AS (
+  SELECT
+    x.experiment_id,
+    COALESCE(id.user_key, CONCAT('dev:', x.user_pseudo_id)) AS user_key,
+    ARRAY_AGG(x.variant_id IGNORE NULLS ORDER BY x.event_ts LIMIT 1)[SAFE_OFFSET(0)] AS variant_id,
+    MIN(x.event_ts) AS first_exposure_ts
+  FROM exposures AS x
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  GROUP BY 1, 2
+),
+
+first_conversion AS (
+  SELECT
+    a.experiment_id,
+    a.user_key,
+    a.variant_id,
+    DATE(a.first_exposure_ts, '${constants.TIMEZONE}') AS exposure_date,
+    MIN(k.event_date) AS conversion_date
+  FROM assignments AS a
+  JOIN tests AS t USING (experiment_id)
+  LEFT JOIN ${ref("fct_key_events")} AS k
+    ON k.user_key = a.user_key AND k.key_event_name = t.goal_key_event AND k.event_ts >= a.first_exposure_ts
+  WHERE a.variant_id IS NOT NULL
+  GROUP BY 1, 2, 3, 4
+),
+
+days AS (
+  SELECT t.experiment_id, t.control_variant, d AS day
+  FROM tests AS t,
+    UNNEST(GENERATE_DATE_ARRAY(t.start_date, LEAST(COALESCE(t.end_date, CURRENT_DATE('${constants.TIMEZONE}')), CURRENT_DATE('${constants.TIMEZONE}')))) AS d
+),
+
+cumulative AS (
+  SELECT
+    d.experiment_id,
+    d.control_variant,
+    d.day,
+    f.variant_id,
+    COUNTIF(f.exposure_date <= d.day) AS users,
+    COUNTIF(f.exposure_date <= d.day AND f.conversion_date <= d.day) AS conversions
+  FROM days AS d
+  JOIN first_conversion AS f ON f.experiment_id = d.experiment_id
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  v.experiment_id,
+  v.day,
+  v.variant_id,
+  v.users,
+  v.conversions,
+  SAFE_DIVIDE(v.conversions, v.users) AS conversion_rate,
+  IF(v.variant_id = v.control_variant, NULL, ${ref("z_test_proportions")}(c.conversions, c.users, v.conversions, v.users).rel_uplift) AS cumulative_uplift,
+  IF(v.variant_id = v.control_variant, NULL, ${ref("z_test_proportions")}(c.conversions, c.users, v.conversions, v.users).p_value) AS cumulative_p_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM cumulative AS v
+LEFT JOIN cumulative AS c
+  ON c.experiment_id = v.experiment_id AND c.day = v.day AND c.variant_id = v.control_variant

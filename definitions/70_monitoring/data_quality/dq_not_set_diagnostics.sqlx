@@ -1,0 +1,54 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_not_set_diagnostics",
+  description: "Why sessions end up as 'Unassigned' or with landing page '(not set)' (last 30 days), with the most common raw source / medium behind each reason. Unassigned is never a channel, it is always a tagging problem with a name",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "attribution"],
+  columns: {
+    reason: "medium_missing | medium_not_in_ga4_rules | source_missing | landing_without_page_view | ..."
+  }
+}
+
+WITH sessions AS (
+  SELECT *
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+)
+
+SELECT
+  'unassigned_channel' AS problem,
+  CASE
+    WHEN session_medium IS NULL OR session_medium = '(not set)' THEN 'medium_missing'
+    WHEN session_source IS NULL OR session_source = '(not set)' THEN 'source_missing'
+    ELSE 'medium_not_in_ga4_rules'
+  END AS reason,
+  session_source_medium AS example_source_medium,
+  COUNT(*) AS sessions,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()) AS share_of_problem,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions
+WHERE session_default_channel_group = 'Unassigned'
+GROUP BY 2, 3
+
+UNION ALL
+
+SELECT
+  'landing_page_not_set',
+  CASE
+    WHEN NOT has_session_start THEN 'no_session_start_and_no_page_view'
+    WHEN platform != 'WEB' THEN 'app_session_without_screen_view'
+    WHEN is_landing_page_fixed THEN 'no_page_view_but_fixed_by_us'
+    ELSE 'no_page_view_at_all'
+  END,
+  session_source_medium,
+  COUNT(*),
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER ()),
+  CURRENT_TIMESTAMP()
+FROM sessions
+WHERE landing_page_path_ga4 IS NULL
+GROUP BY 2, 3

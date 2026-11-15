@@ -1,0 +1,50 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_coupon_codes_usage",
+  description: "Coupons of the promotion calendar: orders inside the promo window and OUTSIDE it (coupon that keeps working after the end = margin leak), plus coupons used that are not in the calendar at all",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily"],
+  columns: {
+    usage_window: "inside_promo | before_promo | after_promo | not_in_calendar"
+  }
+}
+
+WITH
+calendar_codes AS (
+  SELECT p.promo_id, p.promo_name, p.start_date, p.end_date, code
+  FROM ${ref("seed_promotions")} AS p, UNNEST(p.coupon_codes) AS code
+),
+
+coupon_orders AS (
+  SELECT transaction_id, transaction_date, UPPER(coupon) AS coupon, revenue, is_first_purchase, session_default_channel_group
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND coupon IS NOT NULL
+    AND transaction_date >= ${helpers.martWindowStart()}
+)
+
+SELECT
+  o.coupon,
+  c.promo_id,
+  c.promo_name,
+  CASE
+    WHEN c.promo_id IS NULL THEN 'not_in_calendar'
+    WHEN o.transaction_date < c.start_date THEN 'before_promo'
+    WHEN o.transaction_date > c.end_date THEN 'after_promo'
+    ELSE 'inside_promo'
+  END AS usage_window,
+  COUNT(*) AS orders,
+  SUM(o.revenue) AS revenue,
+  COUNTIF(o.is_first_purchase) AS new_customer_orders,
+  MIN(o.transaction_date) AS first_use,
+  MAX(o.transaction_date) AS last_use,
+  APPROX_TOP_COUNT(o.session_default_channel_group, 3) AS top_channels,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM coupon_orders AS o
+LEFT JOIN calendar_codes AS c ON c.code = o.coupon
+GROUP BY 1, 2, 3, 4

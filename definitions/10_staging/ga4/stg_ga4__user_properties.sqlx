@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_ga4__user_properties",
+  description: "User properties, one row per day x user_pseudo_id x property with the last value of the day",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["user_pseudo_id", "property_key"],
+    labels: { layer: "staging", source: "ga4" }
+  },
+  tags: ["ga4", "staging", "daily"],
+  columns: Object.assign(docs.pick("event_date", "user_pseudo_id", "user_id", "loaded_at"), {
+    property_key: "User property name",
+    property_value: "Last value of the day, as string",
+    set_ts: "When the property was set (set_timestamp_micros)"
+  })
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH all_props AS (
+  SELECT
+    e.event_date,
+    e.user_pseudo_id,
+    e.user_id,
+    e.event_ts,
+    up.key AS property_key,
+    COALESCE(up.value.string_value, CAST(up.value.int_value AS STRING), CAST(up.value.double_value AS STRING), CAST(up.value.float_value AS STRING)) AS property_value,
+    CASE
+      WHEN up.value.string_value IS NOT NULL THEN 'string'
+      WHEN up.value.int_value IS NOT NULL THEN 'int'
+      WHEN up.value.double_value IS NOT NULL THEN 'double'
+      WHEN up.value.float_value IS NOT NULL THEN 'float'
+      ELSE 'null'
+    END AS value_type,
+    TIMESTAMP_MICROS(up.value.set_timestamp_micros) AS set_ts
+  FROM ${ref("stg_ga4__events")} AS e,
+    UNNEST(e.user_properties) AS up
+  WHERE e.event_date >= run_from
+    AND e.user_pseudo_id IS NOT NULL
+)
+
+SELECT
+  event_date,
+  user_pseudo_id,
+  user_id,
+  property_key,
+  property_value,
+  value_type,
+  set_ts,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_props
+QUALIFY ROW_NUMBER() OVER (PARTITION BY event_date, user_pseudo_id, property_key ORDER BY COALESCE(set_ts, event_ts) DESC, event_ts DESC) = 1
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

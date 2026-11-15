@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_realtime",
+  disabled: !constants.INCLUDE_INTRADAY,
+  description: "GA4 Realtime (needs include_intraday): last 30 minutes straight from the streaming export, per minute, with country, page, event, source and platform. View over the raw intraday table on purpose: it must be real time, not 'last pipeline run' time",
+  tags: ["reports", "ga4_report", "hourly", "optional"]
+}
+
+WITH last_30_min AS (
+  SELECT
+    TIMESTAMP_TRUNC(TIMESTAMP_MICROS(event_timestamp), MINUTE) AS minute_ts,
+    user_pseudo_id,
+    event_name,
+    geo.country AS country,
+    platform,
+    ${ga4.paramStr("page_title")} AS page_title,
+    COALESCE(collected_traffic_source.manual_source, '(direct)') AS source
+  FROM ${ref("events_intraday_*")}
+  WHERE _TABLE_SUFFIX = FORMAT_DATE('%Y%m%d', CURRENT_DATE('${constants.TIMEZONE}'))
+    AND TIMESTAMP_MICROS(event_timestamp) >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 MINUTE)
+)
+
+SELECT
+  minute_ts,
+  country,
+  platform,
+  page_title,
+  event_name,
+  source,
+  COUNT(*) AS events,
+  COUNT(DISTINCT user_pseudo_id) AS active_users,
+  COUNTIF(event_name = 'purchase') AS purchases
+FROM last_30_min
+GROUP BY 1, 2, 3, 4, 5, 6

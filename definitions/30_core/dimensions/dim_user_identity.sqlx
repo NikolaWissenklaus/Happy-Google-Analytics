@@ -1,0 +1,25 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.core,
+  name: "dim_user_identity",
+  description: "Device -> user_key map (login + identity graph). Join any table that has user_pseudo_id with this one to get the stitched user. identity_method tells how the device was linked",
+  tags: ["ga4", "core", "daily", "identity"]
+}
+
+SELECT
+  user_pseudo_id,
+  user_key,
+  resolved_user_id AS user_id,
+  identity_method,
+  is_identified,
+  is_identified_by_login,
+  is_shared_device,
+  user_ids_on_device,
+  devices_of_user,
+  had_ignored_user_id,
+  first_seen_ts,
+  last_seen_ts,
+  first_login_ts
+FROM ${ref("int_ga4__user_stitching")}

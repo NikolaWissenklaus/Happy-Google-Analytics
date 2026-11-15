@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_event_naming_hygiene",
+  description: "Event naming problems of the last 90 days: names out of snake_case, case variants of the same event ('Add_To_Cart' x 'add_to_cart', GA4 treats as 2 events) and NEAR duplicates by edit distance ('add_to_card', 'addtocart', 'purchase_' ...). Each pair says which one is probably the right one (the bigger)",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "governance"],
+  columns: {
+    edit_distance: "Levenshtein distance between the two names (after lower case)"
+  }
+}
+
+WITH
+names AS (
+  SELECT event_name, COUNT(*) AS events, MIN(event_date) AS first_seen, MAX(event_date) AS last_seen
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY event_name
+),
+
+pairs AS (
+  SELECT
+    a.event_name AS event_name,
+    b.event_name AS similar_to,
+    a.events,
+    b.events AS similar_events,
+    EDIT_DISTANCE(LOWER(a.event_name), LOWER(b.event_name)) AS edit_distance,
+    LOWER(a.event_name) = LOWER(b.event_name) AS same_ignoring_case,
+    REGEXP_REPLACE(LOWER(a.event_name), r'[^a-z0-9]', '') = REGEXP_REPLACE(LOWER(b.event_name), r'[^a-z0-9]', '') AS same_ignoring_separators
+  FROM names AS a
+  JOIN names AS b ON a.event_name != b.event_name AND a.events <= b.events
+)
+
+SELECT
+  'not_snake_case' AS problem,
+  event_name,
+  CAST(NULL AS STRING) AS similar_to,
+  events,
+  CAST(NULL AS INT64) AS similar_events,
+  CAST(NULL AS INT64) AS edit_distance,
+  'rename to lower snake_case' AS suggestion,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM names
+WHERE NOT REGEXP_CONTAINS(event_name, r'${cfg_tracking_plan.naming.event_name_regex}')
+
+UNION ALL
+
+SELECT
+  CASE
+    WHEN same_ignoring_case THEN 'case_variant'
+    WHEN same_ignoring_separators THEN 'separator_variant'
+    ELSE 'near_duplicate'
+  END,
+  event_name,
+  similar_to,
+  events,
+  similar_events,
+  edit_distance,
+  CONCAT('probably should be "', similar_to, '"'),
+  CURRENT_TIMESTAMP()
+FROM pairs
+WHERE same_ignoring_case
+   OR same_ignoring_separators
+   OR (edit_distance <= 2 AND LENGTH(event_name) >= 6 AND similar_events >= 10 * events)

@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_shapley_values",
+  description: "Data driven attribution with exact Shapley values (cooperative game theory, the idea behind the first Google DDA) over the channel sets of the converting paths, last 90 days, for every key event",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science"],
+  columns: {
+    attributed_conversions: "Shapley value with conversions as the worth (sums to the total conversions)",
+    attributed_value: "Shapley value with the conversion value as the worth"
+  }
+}
+
+WITH
+coalitions AS (
+  SELECT
+    key_event_name,
+    ARRAY_TO_STRING(ARRAY(SELECT DISTINCT channel FROM UNNEST(SPLIT(channel_path, ' > ')) AS channel ORDER BY channel), '|') AS channel_set,
+    COUNT(*) AS conversions,
+    SUM(conversion_value) AS conversion_value
+  FROM ${ref("attr_conversion_paths")}
+  WHERE conversion_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+  GROUP BY 1, 2
+),
+
+run_shapley AS (
+  SELECT
+    key_event_name,
+    ${ref("shapley_values")}(ARRAY_AGG(STRUCT(SPLIT(channel_set, '|') AS channels, CAST(conversions AS FLOAT64) AS conversions)), 14) AS by_conversions,
+    ${ref("shapley_values")}(ARRAY_AGG(STRUCT(SPLIT(channel_set, '|') AS channels, CAST(conversion_value AS FLOAT64) AS conversions)), 14) AS by_value
+  FROM coalitions
+  GROUP BY key_event_name
+),
+
+conv AS (
+  SELECT r.key_event_name, s.channel, s.shapley_value AS attributed_conversions
+  FROM run_shapley AS r, UNNEST(r.by_conversions) AS s
+),
+
+val AS (
+  SELECT r.key_event_name, s.channel, s.shapley_value AS attributed_value
+  FROM run_shapley AS r, UNNEST(r.by_value) AS s
+)
+
+SELECT
+  key_event_name,
+  channel,
+  conv.attributed_conversions,
+  val.attributed_value,
+  SAFE_DIVIDE(conv.attributed_conversions, SUM(conv.attributed_conversions) OVER (PARTITION BY key_event_name)) AS share_of_conversions,
+  CURRENT_DATE('${constants.TIMEZONE}') AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM conv
+FULL OUTER JOIN val USING (key_event_name, channel)

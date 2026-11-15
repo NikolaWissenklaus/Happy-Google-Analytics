@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_events_daily",
+  description: "GA4 Reports > Engagement > Events: event count, total users, event count per user and value per event name and platform, per day",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH agg AS (
+  SELECT
+    event_date,
+    event_name,
+    platform,
+    COUNT(*) AS event_count,
+    COUNT(DISTINCT user_pseudo_id) AS total_users,
+    HLL_COUNT.INIT(user_pseudo_id) AS total_users_hll,
+    COUNTIF(is_cookieless) AS cookieless_events,
+    SUM(COALESCE(event_value, 0)) AS event_value,
+    SUM(IF(event_name = 'purchase', COALESCE(purchase_revenue, event_value, 0), 0)) AS purchase_revenue
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(event_count, total_users) AS event_count_per_user,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

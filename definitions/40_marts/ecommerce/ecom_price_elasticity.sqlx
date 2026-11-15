@@ -1,0 +1,66 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_price_elasticity",
+  description: "Price elasticity per item estimated with a log-log regression of daily demand (add to carts and units) on the price users saw, last 365 days. Elasticity -2 = 1% more expensive, 2% less demand. Only items with real price variation",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "pricing", "data_science"],
+  columns: {
+    cart_elasticity: "slope of ln(add_to_carts) on ln(price). Uses carts because sales are too sparse for most items",
+    r2_carts: "R squared of that regression (how much the price explains). < 0.1 = dont trust",
+    elasticity_class: "elastic (< -1) / inelastic (-1..0) / weird_positive (> 0, probably confounded: promos with media, seasonality)"
+  }
+}
+
+-- caveat for the people reading this: this is observational data. Price changes come with
+-- campaigns, seasonality and stock. Use it as a hint, test it with an A/B or a geo test.
+WITH daily AS (
+  SELECT
+    item_id,
+    event_date,
+    median_price,
+    views,
+    add_to_carts,
+    units_sold
+  FROM ${ref("int_ga4__item_prices_daily")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND median_price > 0
+    AND views > 0
+),
+
+per_item AS (
+  SELECT
+    item_id,
+    COUNT(*) AS days_observed,
+    COUNT(DISTINCT ROUND(median_price, 1)) AS distinct_prices,
+    MIN(median_price) AS min_price,
+    MAX(median_price) AS max_price,
+    SAFE_DIVIDE(COVAR_SAMP(LN(median_price), LN(add_to_carts + 1)), VAR_SAMP(LN(median_price))) AS cart_elasticity,
+    POW(CORR(LN(median_price), LN(add_to_carts + 1)), 2) AS r2_carts,
+    SAFE_DIVIDE(COVAR_SAMP(LN(median_price), LN(units_sold + 1)), VAR_SAMP(LN(median_price))) AS unit_elasticity,
+    POW(CORR(LN(median_price), LN(units_sold + 1)), 2) AS r2_units,
+    SAFE_DIVIDE(COVAR_SAMP(LN(median_price), LN(SAFE_DIVIDE(add_to_carts + 1, views + 1))), VAR_SAMP(LN(median_price))) AS cart_rate_elasticity
+  FROM daily
+  GROUP BY item_id
+  HAVING COUNT(*) >= 30 AND COUNT(DISTINCT ROUND(median_price, 1)) >= 3 AND SAFE_DIVIDE(MAX(median_price), MIN(median_price)) >= 1.05
+)
+
+SELECT
+  p.*,
+  d.item_name,
+  d.item_category,
+  d.item_brand,
+  d.current_price,
+  CASE
+    WHEN p.cart_elasticity < -1 THEN 'elastic'
+    WHEN p.cart_elasticity <= 0 THEN 'inelastic'
+    ELSE 'weird_positive'
+  END AS elasticity_class,
+  p.r2_carts >= 0.1 AS is_reliable,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_item AS p
+LEFT JOIN ${ref("dim_items")} AS d USING (item_id)

@@ -1,0 +1,125 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_markov_removal_effects",
+  description: "Data driven attribution with Markov chains (removal effect), last 90 days, for the primary key event. Uses converting AND non converting journeys, like the R package ChannelAttribution. Runs inside BigQuery (JS UDF), no python needed",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science"],
+  columns: {
+    removal_effect: "How much the conversion probability drops if this channel disappears (0.3 = -30%)",
+    attributed_conversions: "share of removal effect x total conversions",
+    attributed_value: "share of removal effect x total conversion value"
+  }
+}
+
+js {
+  const maxPathLength = 10;
+  const maxDistinctPaths = 50000;
+}
+
+WITH
+primary_key_event AS (
+  SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1
+),
+
+-- converting journeys (dedup of consecutive channels, keep the last N touches)
+converting AS (
+  SELECT
+    p.key_event_name,
+    ARRAY_TO_STRING(ARRAY(
+      SELECT channel FROM (
+        SELECT channel, pos FROM UNNEST(SPLIT(p.channel_path_dedup, ' > ')) AS channel WITH OFFSET AS pos
+      )
+      WHERE pos >= ARRAY_LENGTH(SPLIT(p.channel_path_dedup, ' > ')) - ${maxPathLength}
+      ORDER BY pos
+    ), ' > ') AS path,
+    1 AS conversions,
+    0 AS non_conversions,
+    p.conversion_value
+  FROM ${ref("attr_conversion_paths")} AS p
+  WHERE p.conversion_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND p.key_event_name IN (SELECT key_event_name FROM primary_key_event)
+    AND NOT p.is_unattributed
+),
+
+converters AS (
+  SELECT DISTINCT c.user_key
+  FROM ${ref("fct_key_events")} AS c
+  WHERE c.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND c.key_event_name IN (SELECT key_event_name FROM primary_key_event)
+),
+
+-- journeys that never converted in the window: last N touches of each non converter
+non_converter_recent_touches AS (
+  SELECT
+    t.user_key,
+    ARRAY_AGG(t.channel ORDER BY t.session_start_ts DESC LIMIT ${maxPathLength}) AS channels_newest_first
+  FROM ${ref("attr_touchpoints")} AS t
+  LEFT JOIN converters AS c USING (user_key)
+  WHERE t.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND c.user_key IS NULL
+  GROUP BY t.user_key
+),
+
+non_converting AS (
+  SELECT
+    (SELECT key_event_name FROM primary_key_event) AS key_event_name,
+    ARRAY_TO_STRING(ARRAY(
+      SELECT channel FROM (
+        SELECT channel, pos, LEAD(channel) OVER (ORDER BY pos) AS older_channel
+        FROM UNNEST(channels_newest_first) AS channel WITH OFFSET AS pos
+      )
+      -- newest first, so the "previous" touch in time is the next one in the array
+      WHERE older_channel IS NULL OR older_channel != channel
+      ORDER BY pos DESC
+    ), ' > ') AS path,
+    0 AS conversions,
+    1 AS non_conversions,
+    0.0 AS conversion_value
+  FROM non_converter_recent_touches
+),
+
+all_paths AS (
+  SELECT key_event_name, path, SUM(conversions) AS conversions, SUM(non_conversions) AS non_conversions, SUM(conversion_value) AS conversion_value
+  FROM (SELECT * FROM converting UNION ALL SELECT * FROM non_converting)
+  WHERE path IS NOT NULL AND path != ''
+  GROUP BY 1, 2
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY key_event_name ORDER BY conversions + non_conversions DESC) <= ${maxDistinctPaths}
+),
+
+totals AS (
+  SELECT key_event_name, SUM(conversions) AS total_conversions, SUM(conversion_value) AS total_value
+  FROM all_paths
+  GROUP BY 1
+),
+
+run_markov AS (
+  SELECT
+    key_event_name,
+    ${ref("markov_removal_effects")}(ARRAY_AGG(STRUCT(
+      SPLIT(path, ' > ') AS path,
+      CAST(conversions AS FLOAT64) AS conversions,
+      CAST(non_conversions AS FLOAT64) AS non_conversions
+    ))) AS effects
+  FROM all_paths
+  GROUP BY key_event_name
+)
+
+SELECT
+  r.key_event_name,
+  e.channel,
+  e.removal_effect,
+  e.share,
+  e.base_conversion_probability,
+  e.share * t.total_conversions AS attributed_conversions,
+  e.share * t.total_value AS attributed_value,
+  t.total_conversions,
+  CURRENT_DATE('${constants.TIMEZONE}') AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM run_markov AS r
+CROSS JOIN UNNEST(r.effects) AS e
+JOIN totals AS t ON t.key_event_name = r.key_event_name

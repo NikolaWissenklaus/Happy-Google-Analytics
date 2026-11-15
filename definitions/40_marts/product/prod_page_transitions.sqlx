@@ -1,0 +1,29 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_page_transitions",
+  description: "From page -> to page transitions of the last 30 days (next page in the same session, '(exit)' when it was the last one). Feeds Sankey charts and the UA 'Navigation Summary' replica",
+  bigquery: {
+    clusterBy: ["from_page"],
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"]
+}
+
+SELECT
+  page_path AS from_page,
+  page_type AS from_page_type,
+  COALESCE(next_page_path, '(exit)') AS to_page,
+  COUNT(*) AS transitions,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY page_path)) AS share_of_from_page,
+  AVG(time_on_page_sec) AS avg_seconds_before_moving,
+  COUNTIF(session_has_purchase) AS transitions_in_buying_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("fct_page_views")}
+WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  AND NOT COALESCE(is_bot_suspect, FALSE)
+  AND NOT is_reload
+GROUP BY 1, 2, 3
+HAVING COUNT(*) >= 5

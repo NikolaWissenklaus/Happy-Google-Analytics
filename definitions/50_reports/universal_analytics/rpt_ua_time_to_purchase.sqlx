@@ -1,0 +1,99 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_time_to_purchase",
+  description: "UA Conversions > Ecommerce > Time to Purchase (transactions of the last 90 days): days to transaction (from the first visit of the user) and sessions to transaction (ga_session_number of the purchase session), in the same buckets UA used",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily", "ecommerce"],
+  columns: {
+    bucket_type: "days_to_transaction | sessions_to_transaction",
+    bucket_order: "Use this to sort, the bucket label is text"
+  }
+}
+
+WITH
+purchases AS (
+  SELECT
+    t.transaction_id,
+    t.revenue,
+    t.is_valid_for_revenue,
+    DATE_DIFF(t.transaction_date, u.first_seen_date, DAY) AS days_to_transaction,
+    t.session_number AS sessions_to_transaction
+  FROM ${ref("fct_transactions")} AS t
+  LEFT JOIN ${ref("dim_users")} AS u USING (user_key)
+  WHERE t.transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND NOT t.is_test_transaction
+),
+
+put_buckets AS (
+  SELECT
+    transaction_id,
+    revenue,
+    is_valid_for_revenue,
+    'days_to_transaction' AS bucket_type,
+    CASE
+      WHEN days_to_transaction IS NULL THEN '(unknown)'
+      WHEN days_to_transaction <= 6 THEN CAST(GREATEST(days_to_transaction, 0) AS STRING)
+      WHEN days_to_transaction <= 13 THEN '7-13'
+      WHEN days_to_transaction <= 29 THEN '14-29'
+      WHEN days_to_transaction <= 59 THEN '30-59'
+      WHEN days_to_transaction <= 89 THEN '60-89'
+      ELSE '90+'
+    END AS bucket,
+    CASE
+      WHEN days_to_transaction IS NULL THEN 99
+      WHEN days_to_transaction <= 6 THEN GREATEST(days_to_transaction, 0)
+      WHEN days_to_transaction <= 13 THEN 7
+      WHEN days_to_transaction <= 29 THEN 8
+      WHEN days_to_transaction <= 59 THEN 9
+      WHEN days_to_transaction <= 89 THEN 10
+      ELSE 11
+    END AS bucket_order
+  FROM purchases
+
+  UNION ALL
+
+  SELECT
+    transaction_id,
+    revenue,
+    is_valid_for_revenue,
+    'sessions_to_transaction',
+    CASE
+      WHEN sessions_to_transaction IS NULL THEN '(unknown)'
+      WHEN sessions_to_transaction <= 8 THEN CAST(sessions_to_transaction AS STRING)
+      WHEN sessions_to_transaction <= 14 THEN '9-14'
+      WHEN sessions_to_transaction <= 25 THEN '15-25'
+      WHEN sessions_to_transaction <= 50 THEN '26-50'
+      WHEN sessions_to_transaction <= 100 THEN '51-100'
+      WHEN sessions_to_transaction <= 200 THEN '101-200'
+      ELSE '201+'
+    END,
+    CASE
+      WHEN sessions_to_transaction IS NULL THEN 99
+      WHEN sessions_to_transaction <= 8 THEN sessions_to_transaction
+      WHEN sessions_to_transaction <= 14 THEN 9
+      WHEN sessions_to_transaction <= 25 THEN 10
+      WHEN sessions_to_transaction <= 50 THEN 11
+      WHEN sessions_to_transaction <= 100 THEN 12
+      WHEN sessions_to_transaction <= 200 THEN 13
+      ELSE 14
+    END
+  FROM purchases
+)
+
+SELECT
+  bucket_type,
+  bucket,
+  bucket_order,
+  COUNT(*) AS transactions,
+  SUM(IF(is_valid_for_revenue, revenue, 0)) AS revenue,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY bucket_type)) AS pct_of_total,
+  SUM(COUNT(*)) OVER (PARTITION BY bucket_type ORDER BY bucket_order)
+    / SUM(COUNT(*)) OVER (PARTITION BY bucket_type) AS cumulative_pct,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM put_buckets
+GROUP BY bucket_type, bucket, bucket_order

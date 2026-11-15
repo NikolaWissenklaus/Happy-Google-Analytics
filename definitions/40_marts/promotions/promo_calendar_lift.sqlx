@@ -1,0 +1,94 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.promotions,
+  name: "promo_calendar_lift",
+  description: "For each promotion of the calendar (cfg_promotions.js): daily averages before (baseline), during and after, the lift during the promo and the 'pull forward' dip after it. A promo that sells +40% and then -30% for two weeks did not create demand, it moved it",
+  bigquery: {
+    labels: { layer: "marts", domain: "promotions" }
+  },
+  tags: ["marts", "promotions", "daily"],
+  columns: {
+    revenue_lift: "revenue per day during / baseline revenue per day - 1",
+    post_promo_dip: "revenue per day after / baseline - 1. Negative = pull forward",
+    net_incremental_revenue: "(during - baseline) * days + (post - baseline) * post days. The real gain of the promo, more or less",
+    yoy_revenue_change: "Same window 364 days before (same weekdays)"
+  }
+}
+
+WITH
+promos AS (
+  SELECT * FROM ${ref("seed_promotions")}
+),
+
+daily AS (
+  SELECT kpi_date, sessions, orders, valid_revenue, new_customer_orders
+  FROM ${ref("ecom_daily_kpis")}
+),
+
+windows AS (
+  SELECT
+    p.promo_id,
+    p.promo_name,
+    p.promo_type,
+    p.start_date,
+    p.end_date,
+    DATE_DIFF(p.end_date, p.start_date, DAY) + 1 AS promo_days,
+    d.kpi_date,
+    CASE
+      WHEN d.kpi_date BETWEEN p.start_date AND p.end_date THEN 'during'
+      WHEN d.kpi_date BETWEEN DATE_SUB(p.start_date, INTERVAL ${cfg_promotions.baseline_days} DAY) AND DATE_SUB(p.start_date, INTERVAL 1 DAY) THEN 'baseline'
+      WHEN d.kpi_date BETWEEN DATE_ADD(p.end_date, INTERVAL 1 DAY) AND DATE_ADD(p.end_date, INTERVAL ${cfg_promotions.post_period_days} DAY) THEN 'post'
+      WHEN d.kpi_date BETWEEN DATE_SUB(p.start_date, INTERVAL 364 DAY) AND DATE_SUB(p.end_date, INTERVAL 364 DAY) THEN 'last_year'
+    END AS period,
+    d.sessions,
+    d.orders,
+    d.valid_revenue,
+    d.new_customer_orders
+  FROM promos AS p
+  JOIN daily AS d
+    ON d.kpi_date BETWEEN DATE_SUB(p.start_date, INTERVAL 364 DAY) AND DATE_ADD(p.end_date, INTERVAL ${cfg_promotions.post_period_days} DAY)
+),
+
+per_period AS (
+  SELECT
+    promo_id,
+    ANY_VALUE(promo_name) AS promo_name,
+    ANY_VALUE(promo_type) AS promo_type,
+    ANY_VALUE(start_date) AS start_date,
+    ANY_VALUE(end_date) AS end_date,
+    ANY_VALUE(promo_days) AS promo_days,
+    AVG(IF(period = 'baseline', valid_revenue, NULL)) AS baseline_revenue_per_day,
+    AVG(IF(period = 'during', valid_revenue, NULL)) AS during_revenue_per_day,
+    AVG(IF(period = 'post', valid_revenue, NULL)) AS post_revenue_per_day,
+    COUNTIF(period = 'post') AS post_days_available,
+    SUM(IF(period = 'during', valid_revenue, 0)) AS during_revenue,
+    SUM(IF(period = 'last_year', valid_revenue, 0)) AS last_year_revenue,
+    AVG(IF(period = 'baseline', orders, NULL)) AS baseline_orders_per_day,
+    AVG(IF(period = 'during', orders, NULL)) AS during_orders_per_day,
+    SAFE_DIVIDE(SUM(IF(period = 'baseline', orders, 0)), SUM(IF(period = 'baseline', sessions, 0))) AS baseline_conversion_rate,
+    SAFE_DIVIDE(SUM(IF(period = 'during', orders, 0)), SUM(IF(period = 'during', sessions, 0))) AS during_conversion_rate,
+    SAFE_DIVIDE(SUM(IF(period = 'baseline', valid_revenue, 0)), SUM(IF(period = 'baseline', orders, 0))) AS baseline_aov,
+    SAFE_DIVIDE(SUM(IF(period = 'during', valid_revenue, 0)), SUM(IF(period = 'during', orders, 0))) AS during_aov,
+    SAFE_DIVIDE(SUM(IF(period = 'during', new_customer_orders, 0)), SUM(IF(period = 'during', orders, 0))) AS during_new_customer_share
+  FROM windows
+  WHERE period IS NOT NULL
+  GROUP BY promo_id
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(during_revenue_per_day, baseline_revenue_per_day) - 1 AS revenue_lift,
+  SAFE_DIVIDE(during_orders_per_day, baseline_orders_per_day) - 1 AS orders_lift,
+  IF(post_days_available > 0, SAFE_DIVIDE(post_revenue_per_day, baseline_revenue_per_day) - 1, NULL) AS post_promo_dip,
+  (during_revenue_per_day - baseline_revenue_per_day) * promo_days
+    + COALESCE((post_revenue_per_day - baseline_revenue_per_day) * post_days_available, 0) AS net_incremental_revenue,
+  ${helpers.pctChange("during_revenue", "last_year_revenue")} AS yoy_revenue_change,
+  CASE
+    WHEN end_date >= CURRENT_DATE('${constants.TIMEZONE}') THEN 'running_or_future'
+    WHEN post_days_available < ${cfg_promotions.post_period_days} THEN 'post_period_incomplete'
+    ELSE 'final'
+  END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_period

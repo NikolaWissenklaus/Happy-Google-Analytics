@@ -1,0 +1,67 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_identifiers",
+  description: "Every identifier of each data subject request: the user_id (raw and the SHA256 form staging uses when the id looked like email/CPF), every device (user_pseudo_id) that ever logged in with it, and the user_key of core. Access, deletion and the preview all start here",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    id_type: "user_id | user_pseudo_id | user_key",
+    value: "The identifier. Restricted dataset, do not copy this table anywhere"
+  }
+}
+
+WITH
+requests AS (
+  SELECT
+    CAST(request_id AS STRING) AS request_id,
+    LOWER(TRIM(request_type)) AS request_type,
+    LOWER(TRIM(status)) AS status,
+    NULLIF(TRIM(CAST(user_id AS STRING)), '') AS user_id,
+    NULLIF(TRIM(CAST(user_pseudo_id AS STRING)), '') AS user_pseudo_id
+  FROM ${ref(privacy.dsrSourceName())}
+),
+
+-- staging hashes the user_id when it looks like email/CPF, so we look for both forms
+user_ids AS (
+  SELECT request_id, user_id AS value FROM requests WHERE user_id IS NOT NULL
+  UNION DISTINCT
+  SELECT request_id, TO_HEX(SHA256(LOWER(user_id))) FROM requests WHERE user_id IS NOT NULL
+),
+
+-- every device that logged in with the user_id, at any time
+devices AS (
+  SELECT request_id, user_pseudo_id AS value FROM requests WHERE user_pseudo_id IS NOT NULL
+  UNION DISTINCT
+  SELECT u.request_id, p.user_pseudo_id
+  FROM user_ids AS u
+  JOIN ${ref("int_ga4__user_id_pairs_daily")} AS p ON p.user_id = u.value
+),
+
+user_keys AS (
+  SELECT DISTINCT d.request_id, s.user_key AS value
+  FROM devices AS d
+  JOIN ${ref("int_ga4__user_stitching")} AS s ON s.user_pseudo_id = d.value
+),
+
+all_ids AS (
+  SELECT request_id, 'user_id' AS id_type, value FROM user_ids
+  UNION ALL
+  SELECT request_id, 'user_pseudo_id', value FROM devices
+  UNION ALL
+  SELECT request_id, 'user_key', value FROM user_keys
+)
+
+SELECT
+  r.request_id,
+  r.request_type,
+  r.status,
+  a.id_type,
+  a.value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_ids AS a
+JOIN requests AS r USING (request_id)

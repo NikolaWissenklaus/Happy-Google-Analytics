@@ -1,0 +1,32 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_gsc__site_impressions",
+  disabled: !constants.ENABLE.search_console,
+  description: "Search Console bulk export at property level (queries), used for brand x non-brand organic demand",
+  bigquery: {
+    partitionBy: "data_date",
+    clusterBy: ["query"],
+    labels: { layer: "staging", source: "search_console" }
+  },
+  tags: ["staging", "daily", "search_console", "optional"]
+}
+
+SELECT
+  data_date,
+  site_url,
+  query,
+  is_anonymized_query,
+  REGEXP_CONTAINS(LOWER(COALESCE(query, '')), r'(?i)${helpers.regexFromList(cfg_project.brand_terms, false)}') AS is_brand_query,
+  country,
+  search_type,
+  device,
+  impressions,
+  clicks,
+  SAFE_DIVIDE(sum_top_position, impressions) + 1 AS avg_position,
+  SAFE_DIVIDE(clicks, impressions) AS ctr,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("searchdata_site_impression")}
+WHERE data_date >= ${helpers.martWindowStart()}

@@ -1,0 +1,142 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "fct_transactions",
+  description: "One row per transaction with session context (channel, device, landing), refunds, net revenue, order sequence of the customer, robust outlier detection and (with the CRM module) the real payment status",
+  bigquery: {
+    partitionBy: "transaction_date",
+    clusterBy: ["user_key", "transaction_id"],
+    labels: { layer: "core", domain: "ecommerce" }
+  },
+  tags: ["ga4", "core", "daily", "ecommerce"],
+  columns: Object.assign(docs.pick("transaction_id", "revenue", "session_key", "user_key", "loaded_at"), {
+    net_revenue: "revenue - GA4 refunds",
+    order_number: "1 = first purchase of the customer (user_key), 2 = second... tests excluded",
+    is_first_purchase: "order_number = 1. new customer revenue",
+    days_since_previous_order: "Days since the previous order of the same customer",
+    revenue_robust_z: "Robust z score of the revenue (median / MAD of the currency). |z| > 6 is very weird",
+    is_revenue_outlier: "Outlier by robust z or above cfg_project.max_realistic_order_value",
+    crm_status: "Only with enable_crm: paid / pending / cancelled / refunded / not_found_in_crm",
+    is_valid_for_revenue: "Not test, not outlier, and (with CRM) not cancelled. Use this for the official revenue"
+  })
+}
+
+WITH
+transactions AS (
+  SELECT * FROM ${ref("int_ga4__transactions")}
+),
+
+refunds_per_transaction AS (
+  SELECT
+    transaction_id,
+    SUM(refund_value) AS refunded_value,
+    MIN(refund_date) AS first_refund_date,
+    COUNT(*) AS refund_events,
+    LOGICAL_OR(NOT is_partial_refund) AS has_full_refund
+  FROM ${ref("int_ga4__refunds")}
+  GROUP BY transaction_id
+),
+
+-- robust statistics (median + MAD) per currency. mean and stddev get destroyed by 1 test order of R$ 999.999
+revenue_stats AS (
+  SELECT
+    currency,
+    APPROX_QUANTILES(revenue, 100)[OFFSET(50)] AS median_revenue
+  FROM transactions
+  WHERE NOT is_test_transaction AND revenue > 0
+    AND transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+  GROUP BY currency
+),
+
+revenue_mad AS (
+  SELECT
+    t.currency,
+    s.median_revenue,
+    APPROX_QUANTILES(ABS(t.revenue - s.median_revenue), 100)[OFFSET(50)] AS mad_revenue
+  FROM transactions AS t
+  JOIN revenue_stats AS s USING (currency)
+  WHERE NOT t.is_test_transaction AND t.revenue > 0
+    AND t.transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+  GROUP BY t.currency, s.median_revenue
+),
+
+${constants.ENABLE.crm ? `
+crm_orders AS (
+  SELECT
+    ga4_transaction_id AS transaction_id,
+    ANY_VALUE(order_status_group) AS crm_status,
+    ANY_VALUE(order_value) AS crm_order_value,
+    ANY_VALUE(payment_method_group) AS crm_payment_method,
+    ANY_VALUE(paid_ts) AS crm_paid_ts
+  FROM ${ref("stg_crm__orders")}
+  GROUP BY 1
+),` : ``}
+
+session_context AS (
+  SELECT
+    session_key,
+    user_key,
+    session_source,
+    session_medium,
+    session_campaign,
+    session_default_channel_group,
+    session_custom_channel_group,
+    landing_page_path,
+    landing_page_type,
+    device_category,
+    device_browser,
+    geo_country,
+    geo_region,
+    geo_uf,
+    geo_city,
+    is_new_user,
+    session_number,
+    consent_ads_storage,
+    is_bot_suspect
+  FROM ${ref("fct_sessions")}
+),
+
+put_context AS (
+  SELECT
+    t.* EXCEPT (loaded_at),
+    COALESCE(sc.user_key, id.user_key, CONCAT('dev:', t.user_pseudo_id)) AS user_key,
+    sc.* EXCEPT (session_key, user_key),
+    COALESCE(r.refunded_value, 0) AS refunded_value,
+    r.first_refund_date,
+    COALESCE(r.has_full_refund, FALSE) AS has_full_refund,
+    t.revenue - COALESCE(r.refunded_value, 0) AS net_revenue,
+    SAFE_DIVIDE(0.6745 * (t.revenue - m.median_revenue), NULLIF(m.mad_revenue, 0)) AS revenue_robust_z
+    ${constants.ENABLE.crm ? `,
+    COALESCE(c.crm_status, 'not_found_in_crm') AS crm_status,
+    c.crm_order_value,
+    c.crm_payment_method,
+    c.crm_paid_ts` : ``}
+  FROM transactions AS t
+  LEFT JOIN session_context AS sc ON sc.session_key = t.session_key
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id ON id.user_pseudo_id = t.user_pseudo_id
+  LEFT JOIN refunds_per_transaction AS r ON r.transaction_id = t.transaction_id
+  LEFT JOIN revenue_mad AS m ON m.currency = t.currency
+  ${constants.ENABLE.crm ? `LEFT JOIN crm_orders AS c ON c.transaction_id = t.transaction_id` : ``}
+),
+
+order_sequence AS (
+  SELECT
+    *,
+    IF(is_test_transaction, NULL, ROW_NUMBER() OVER (PARTITION BY user_key, is_test_transaction ORDER BY transaction_ts)) AS order_number_raw,
+    IF(is_test_transaction, NULL, LAG(transaction_ts) OVER (PARTITION BY user_key, is_test_transaction ORDER BY transaction_ts)) AS previous_order_ts
+  FROM put_context
+)
+
+SELECT
+  * EXCEPT (order_number_raw, previous_order_ts),
+  order_number_raw AS order_number,
+  order_number_raw = 1 AS is_first_purchase,
+  DATE_DIFF(DATE(transaction_ts), DATE(previous_order_ts), DAY) AS days_since_previous_order,
+  COALESCE(ABS(revenue_robust_z) > 6, FALSE) OR revenue > ${cfg_project.max_realistic_order_value} AS is_revenue_outlier,
+  NOT is_test_transaction
+    AND NOT (COALESCE(ABS(revenue_robust_z) > 6, FALSE) OR revenue > ${cfg_project.max_realistic_order_value})
+    ${constants.ENABLE.crm ? `AND crm_status NOT IN ('cancelled')` : ``} AS is_valid_for_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM order_sequence

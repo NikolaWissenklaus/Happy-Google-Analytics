@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "mask_pii",
+  description: "Redacts sensitive query string values and emails / CPF / CNPJ / phones in a text. Same masking used in staging",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+-- mask_pii('https://x.com/?email=joao@x.com&utm_source=a') = 'https://x.com/?email=[redacted]&utm_source=a'
+CREATE OR REPLACE FUNCTION ${self()}(text STRING) RETURNS STRING AS (
+  ${privacy.maskText("text")}
+)
+OPTIONS (description = "PII masking (LGPD)")

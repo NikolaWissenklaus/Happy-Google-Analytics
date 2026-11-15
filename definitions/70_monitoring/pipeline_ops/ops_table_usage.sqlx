@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ops,
+  name: "ops_table_usage",
+  description: "Who really uses what: for every table / view of the project, how many queries read it in the last days (outside the pipeline), how many different people, last read and the tables nobody touches anymore (candidates to switch off and save money). Counts only, no e-mails are stored",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ops" }
+  },
+  tags: ["ops", "daily", "governance"],
+  columns: {
+    reader_queries: "Queries that read the table and did not write into our datasets (analysts, dashboards, notebooks)",
+    distinct_readers: "Different principals (people / service accounts) that read it",
+    is_unused: "No reader query in cfg_project.bigquery.unused_after_days (or in the whole jobs history, if shorter)"
+  }
+}
+
+js {
+  const bq = cfg_project.bigquery;
+  const days = Math.max(bq.jobs_history_days, bq.unused_after_days);
+}
+
+WITH
+reads AS (
+  SELECT
+    t.dataset_id,
+    t.table_id,
+    j.creation_time,
+    j.user_email,
+    j.total_bytes_billed,
+    -- the pipeline itself writes into our datasets, the readers do not
+    COALESCE(STARTS_WITH(j.destination_table.dataset_id, '${constants.SCHEMA_PREFIX}_'), FALSE) AS is_pipeline
+  FROM ${constants.regionTable("JOBS_BY_PROJECT")} AS j,
+    UNNEST(j.referenced_tables) AS t
+  WHERE j.creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${days} DAY)
+    AND j.job_type = 'QUERY'
+    AND j.error_result IS NULL
+    AND STARTS_WITH(t.dataset_id, '${constants.SCHEMA_PREFIX}_')
+),
+
+per_table AS (
+  SELECT
+    dataset_id,
+    table_id,
+    COUNTIF(NOT is_pipeline) AS reader_queries,
+    COUNT(DISTINCT IF(NOT is_pipeline, user_email, NULL)) AS distinct_readers,
+    COUNTIF(is_pipeline) AS pipeline_queries,
+    MAX(IF(NOT is_pipeline, creation_time, NULL)) AS last_read_at,
+    SUM(IF(NOT is_pipeline, total_bytes_billed, 0)) AS reader_bytes_billed
+  FROM reads
+  GROUP BY dataset_id, table_id
+)
+
+SELECT
+  i.dataset,
+  i.table_name,
+  i.table_type,
+  i.logical_gb,
+  COALESCE(u.reader_queries, 0) AS reader_queries,
+  COALESCE(u.distinct_readers, 0) AS distinct_readers,
+  COALESCE(u.pipeline_queries, 0) AS pipeline_queries,
+  u.last_read_at,
+  ROUND(COALESCE(u.reader_bytes_billed, 0) / POW(1024, 4) * ${bq.on_demand_usd_per_tib}, 4) AS reader_estimated_usd,
+  u.last_read_at IS NULL OR u.last_read_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${bq.unused_after_days} DAY) AS is_unused,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref("ops_table_inventory")} AS i
+LEFT JOIN per_table AS u ON u.dataset_id = i.dataset AND u.table_id = i.table_name

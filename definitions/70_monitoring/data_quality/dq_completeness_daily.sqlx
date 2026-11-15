@@ -1,0 +1,85 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_completeness_daily",
+  description: "Completeness checks per day (last 60 days), long format: share of events / sessions / purchases missing something important (session id, page_location, session_start, transaction_id, revenue, items, item_id, currency, traffic source). Each check has a threshold and a status",
+  bigquery: {
+    partitionBy: "check_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily"],
+  columns: {
+    value: "Share (0-1) of rows with the problem",
+    status: "pass | warn (above the warn threshold) | fail (above the fail threshold)"
+  }
+}
+
+WITH
+events AS (
+  SELECT
+    event_date AS check_date,
+    COUNTIF(NOT is_cookieless AND ga_session_id IS NULL) AS no_session_id,
+    COUNTIF(NOT is_cookieless) AS identified_events,
+    COUNTIF(event_name = 'page_view' AND page_location IS NULL) AS page_view_no_location,
+    COUNTIF(event_name = 'page_view') AS page_views,
+    COUNTIF(event_name = 'purchase' AND transaction_id IS NULL) AS purchase_no_transaction_id,
+    COUNTIF(event_name = 'purchase' AND COALESCE(purchase_revenue, event_value, 0) = 0) AS purchase_no_revenue,
+    COUNTIF(event_name = 'purchase' AND COALESCE(items_count, 0) = 0) AS purchase_no_items,
+    COUNTIF(event_name = 'purchase') AS purchases,
+    COUNTIF(event_name IN ('add_to_cart', 'begin_checkout', 'purchase', 'view_item') AND currency IS NULL) AS ecommerce_no_currency,
+    COUNTIF(event_name IN ('add_to_cart', 'begin_checkout', 'purchase', 'view_item')) AS ecommerce_events,
+    COUNTIF(event_name IN ('view_item', 'add_to_cart', 'begin_checkout', 'purchase') AND COALESCE(items_count, 0) = 0) AS ecommerce_no_items
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+),
+
+items AS (
+  SELECT event_date AS check_date, COUNTIF(item_id IS NULL) AS items_no_id, COUNTIF(item_name IS NULL) AS items_no_name, COUNT(*) AS items
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+sessions AS (
+  SELECT
+    session_date AS check_date,
+    COUNTIF(NOT has_session_start) AS no_session_start,
+    COUNTIF(platform = 'WEB' AND page_views = 0) AS web_no_page_view,
+    COUNTIF(landing_page_path_ga4 IS NULL) AS landing_not_set,
+    COUNTIF(session_default_channel_group = 'Unassigned') AS unassigned,
+    COUNT(*) AS sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 60 DAY)
+  GROUP BY 1
+),
+
+checks AS (
+  SELECT check_date, 'events_without_session_id' AS check_name, SAFE_DIVIDE(no_session_id, identified_events) AS value, 0.01 AS warn_at, 0.05 AS fail_at FROM events
+  UNION ALL SELECT check_date, 'page_view_without_page_location', SAFE_DIVIDE(page_view_no_location, page_views), 0.001, 0.01 FROM events
+  UNION ALL SELECT check_date, 'purchase_without_transaction_id', SAFE_DIVIDE(purchase_no_transaction_id, purchases), 0.001, 0.02 FROM events
+  UNION ALL SELECT check_date, 'purchase_without_revenue', SAFE_DIVIDE(purchase_no_revenue, purchases), 0.005, 0.03 FROM events
+  UNION ALL SELECT check_date, 'purchase_without_items', SAFE_DIVIDE(purchase_no_items, purchases), 0.01, 0.05 FROM events
+  UNION ALL SELECT check_date, 'ecommerce_without_currency', SAFE_DIVIDE(ecommerce_no_currency, ecommerce_events), 0.01, 0.05 FROM events
+  UNION ALL SELECT check_date, 'ecommerce_without_items', SAFE_DIVIDE(ecommerce_no_items, ecommerce_events), 0.01, 0.05 FROM events
+  UNION ALL SELECT check_date, 'items_without_item_id', SAFE_DIVIDE(items_no_id, items), 0.005, 0.02 FROM items
+  UNION ALL SELECT check_date, 'items_without_item_name', SAFE_DIVIDE(items_no_name, items), 0.01, 0.05 FROM items
+  UNION ALL SELECT check_date, 'sessions_without_session_start', SAFE_DIVIDE(no_session_start, sessions), 0.05, 0.15 FROM sessions
+  UNION ALL SELECT check_date, 'web_sessions_without_page_view', SAFE_DIVIDE(web_no_page_view, sessions), 0.05, 0.15 FROM sessions
+  UNION ALL SELECT check_date, 'landing_page_not_set', SAFE_DIVIDE(landing_not_set, sessions), 0.05, 0.15 FROM sessions
+  UNION ALL SELECT check_date, 'unassigned_channel_share', SAFE_DIVIDE(unassigned, sessions), 0.02, 0.08 FROM sessions
+)
+
+SELECT
+  check_date,
+  'completeness' AS check_group,
+  check_name,
+  value,
+  warn_at,
+  fail_at,
+  CASE WHEN value IS NULL THEN 'no_data' WHEN value >= fail_at THEN 'fail' WHEN value >= warn_at THEN 'warn' ELSE 'pass' END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checks

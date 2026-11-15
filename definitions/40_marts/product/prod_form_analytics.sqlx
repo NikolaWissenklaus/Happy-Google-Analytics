@@ -1,0 +1,53 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_form_analytics",
+  description: "Form analytics from enhanced measurement (form_start / form_submit), last 90 days: starts, submits, completion rate and time to submit per form and page. Forms that people start and give up are the cheapest CRO wins",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "cro"]
+}
+
+WITH
+form_events AS (
+  SELECT
+    session_key,
+    event_name,
+    event_ts,
+    COALESCE(form_id, form_name, '(no id)') AS form_key,
+    form_name,
+    page_path
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND event_name IN ('form_start', 'form_submit')
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+per_session_form AS (
+  SELECT
+    session_key,
+    form_key,
+    ANY_VALUE(form_name) AS form_name,
+    ANY_VALUE(page_path) AS page_path,
+    MIN(IF(event_name = 'form_start', event_ts, NULL)) AS start_ts,
+    MIN(IF(event_name = 'form_submit', event_ts, NULL)) AS submit_ts
+  FROM form_events
+  GROUP BY 1, 2
+)
+
+SELECT
+  form_key,
+  ANY_VALUE(form_name) AS form_name,
+  APPROX_TOP_COUNT(page_path, 3) AS top_pages,
+  COUNTIF(start_ts IS NOT NULL) AS sessions_started,
+  COUNTIF(submit_ts IS NOT NULL) AS sessions_submitted,
+  COUNTIF(start_ts IS NOT NULL AND submit_ts IS NULL) AS sessions_abandoned,
+  SAFE_DIVIDE(COUNTIF(start_ts IS NOT NULL AND submit_ts IS NOT NULL), COUNTIF(start_ts IS NOT NULL)) AS completion_rate,
+  APPROX_QUANTILES(IF(start_ts IS NOT NULL AND submit_ts >= start_ts, TIMESTAMP_DIFF(submit_ts, start_ts, SECOND), NULL), 2)[OFFSET(1)] AS median_seconds_to_submit,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_session_form
+GROUP BY form_key

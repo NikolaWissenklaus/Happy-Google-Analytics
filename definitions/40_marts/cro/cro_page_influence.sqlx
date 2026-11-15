@@ -1,0 +1,79 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_page_influence",
+  description: "Does seeing this page change the conversion? For each page (last 30 days, 200+ sessions): conversion of sessions that saw it vs sessions with the same landing page type that did not, the lift and a two proportions z-test. Pages with big positive lift deserve more internal links, negative lift pages need a redesign",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "stats"],
+  columns: {
+    p_value: "Two proportions z-test. < 0.05 = the difference is probably not luck (still correlation, not causation)"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT session_key, landing_page_type, has_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+),
+
+page_sessions AS (
+  SELECT DISTINCT page_path, session_key
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+),
+
+landing_totals AS (
+  SELECT landing_page_type, COUNT(*) AS sessions, COUNTIF(has_purchase) AS conversions
+  FROM sessions
+  GROUP BY 1
+),
+
+with_page AS (
+  SELECT
+    p.page_path,
+    s.landing_page_type,
+    COUNT(*) AS sessions_with_page,
+    COUNTIF(s.has_purchase) AS conversions_with_page
+  FROM page_sessions AS p
+  JOIN sessions AS s USING (session_key)
+  GROUP BY 1, 2
+),
+
+per_page AS (
+  SELECT
+    w.page_path,
+    SUM(w.sessions_with_page) AS sessions_with_page,
+    SUM(w.conversions_with_page) AS conversions_with_page,
+    SUM(t.sessions - w.sessions_with_page) AS sessions_without_page,
+    SUM(t.conversions - w.conversions_with_page) AS conversions_without_page
+  FROM with_page AS w
+  JOIN landing_totals AS t USING (landing_page_type)
+  GROUP BY w.page_path
+  HAVING SUM(w.sessions_with_page) >= 200
+)
+
+SELECT
+  page_path,
+  sessions_with_page,
+  conversions_with_page,
+  sessions_without_page,
+  conversions_without_page,
+  test.rate_b AS conversion_with_page,
+  test.rate_a AS conversion_without_page,
+  test.rel_uplift AS conversion_lift,
+  test.z,
+  test.p_value,
+  test.p_value < 0.05 AS is_significant,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM (
+  SELECT
+    *,
+    ${ref("z_test_proportions")}(conversions_without_page, sessions_without_page, conversions_with_page, sessions_with_page) AS test
+  FROM per_page
+)

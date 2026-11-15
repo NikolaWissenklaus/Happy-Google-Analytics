@@ -1,0 +1,124 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__page_views",
+  description: "One row per page_view / screen_view with the position in the session, previous and next page, UA style time on page and the GA4 engagement time spent on that page (events are attached to the page view they happened in)",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["page_path", "session_key"],
+    labels: { layer: "intermediate", domain: "pages" }
+  },
+  tags: ["ga4", "intermediate", "daily", "pages"],
+  columns: Object.assign(docs.pick("event_id", "event_date", "event_ts", "session_key", "user_pseudo_id", "loaded_at"), {
+    page_number: "Order of this view inside the session (1 = landing page)",
+    time_on_page_sec: "UA style: seconds until the next page view. NULL for the exit page (yes, like UA did)",
+    page_engagement_msec: "GA4 engagement time of the events that happened while this page was the current one",
+    is_reload: "Same page as the previous view (refresh, or double tagging when seconds_since_previous_view is ~0)",
+    seconds_since_previous_view: "Seconds since the previous page view of the session"
+  })
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+session_stream AS (
+  SELECT
+    event_id,
+    event_date,
+    event_ts,
+    event_name,
+    session_key,
+    user_pseudo_id,
+    page_location,
+    COALESCE(page_path, IF(screen_name IS NULL, NULL, CONCAT('screen://', screen_name))) AS page_path,
+    page_title,
+    page_hostname,
+    page_referrer,
+    content_group,
+    engagement_time_msec,
+    percent_scrolled,
+    batch_ordering_id,
+    event_name IN ('page_view', 'screen_view') AS is_view
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+-- every event belongs to the last page view before it (or at the same time)
+attach_events_to_page AS (
+  SELECT
+    *,
+    LAST_VALUE(IF(is_view, event_id, NULL) IGNORE NULLS) OVER (
+      PARTITION BY session_key
+      ORDER BY event_ts, IF(is_view, 0, 1), batch_ordering_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS owner_view_id
+  FROM session_stream
+),
+
+what_happened_on_each_page AS (
+  SELECT
+    owner_view_id,
+    SUM(COALESCE(engagement_time_msec, 0)) AS page_engagement_msec,
+    MAX(IF(event_name = 'scroll', COALESCE(percent_scrolled, 90), 0)) AS max_percent_scrolled,
+    COUNTIF(NOT is_view AND event_name NOT IN ('user_engagement', 'session_start', 'first_visit', 'scroll')) AS interactions_on_page,
+    COUNT(*) AS events_on_page
+  FROM attach_events_to_page
+  WHERE owner_view_id IS NOT NULL
+  GROUP BY owner_view_id
+),
+
+only_views AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER w AS page_number,
+    COUNT(*) OVER (PARTITION BY session_key) AS session_view_count,
+    LAG(page_path) OVER w AS previous_page_path,
+    LEAD(page_path) OVER w AS next_page_path,
+    LEAD(event_ts) OVER w AS next_view_ts,
+    LAG(event_ts) OVER w AS previous_view_ts
+  FROM attach_events_to_page
+  WHERE is_view
+  WINDOW w AS (PARTITION BY session_key ORDER BY event_ts, batch_ordering_id, event_id)
+)
+
+SELECT
+  v.event_id,
+  v.event_date,
+  v.event_ts,
+  v.event_name,
+  v.session_key,
+  v.user_pseudo_id,
+  v.page_location,
+  v.page_path,
+  v.page_title,
+  v.page_hostname,
+  v.page_referrer,
+  v.content_group,
+  v.page_number,
+  v.session_view_count,
+  v.page_number = 1 AS is_entrance,
+  v.page_number = v.session_view_count AS is_exit,
+  v.previous_page_path,
+  v.next_page_path,
+  TIMESTAMP_DIFF(v.next_view_ts, v.event_ts, SECOND) AS time_on_page_sec,
+  TIMESTAMP_DIFF(v.event_ts, v.previous_view_ts, MILLISECOND) / 1000 AS seconds_since_previous_view,
+  COALESCE(v.previous_page_path = v.page_path, FALSE) AS is_reload,
+  COALESCE(p.page_engagement_msec, 0) AS page_engagement_msec,
+  COALESCE(p.max_percent_scrolled, 0) AS max_percent_scrolled,
+  COALESCE(p.max_percent_scrolled, 0) >= 90 AS reached_90_percent,
+  COALESCE(p.interactions_on_page, 0) AS interactions_on_page,
+  COALESCE(p.events_on_page, 1) AS events_on_page,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM only_views AS v
+LEFT JOIN what_happened_on_each_page AS p ON p.owner_view_id = v.event_id
+WHERE v.event_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

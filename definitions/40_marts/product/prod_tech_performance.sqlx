@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_tech_performance",
+  description: "Browser x OS x device combos (last 30 days) with engagement and conversion compared to the device average. A combo with volume and conversion 50% below its device = something broken for it (Safari old version, Samsung Internet, in-app browser of Instagram...)",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "cro", "alerts"],
+  columns: {
+    conversion_index_vs_device: "conversion of the combo / conversion of the device category",
+    is_suspect: "1000+ sessions and index < 0.5 (and not explained by being a bot)"
+  }
+}
+
+WITH combos AS (
+  SELECT
+    device_category,
+    device_browser,
+    REGEXP_EXTRACT(device_browser_version, r'^(\d+)') AS browser_major_version,
+    device_os,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    COUNTIF(has_add_to_cart) AS cart_sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+  SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+  SAFE_DIVIDE(cart_sessions, sessions) AS cart_rate,
+  SAFE_DIVIDE(SAFE_DIVIDE(transactions, sessions), SAFE_DIVIDE(SUM(transactions) OVER (PARTITION BY device_category), SUM(sessions) OVER (PARTITION BY device_category))) AS conversion_index_vs_device,
+  sessions >= 1000
+    AND SAFE_DIVIDE(SAFE_DIVIDE(transactions, sessions), SAFE_DIVIDE(SUM(transactions) OVER (PARTITION BY device_category), SUM(sessions) OVER (PARTITION BY device_category))) < 0.5 AS is_suspect,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM combos
+WHERE sessions >= 50

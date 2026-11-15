@@ -1,0 +1,62 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_rfm",
+  description: "RFM of every customer (valid purchases, last 2 years): recency, frequency, monetary, quintile scores and the classic named segments (Champions, Loyal, Potential Loyalist, New, Promising, Need Attention, About to Sleep, At Risk, Cannot Lose Them, Hibernating, Lost)",
+  bigquery: {
+    clusterBy: ["rfm_segment"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"],
+  columns: {
+    r_score: "5 = bought very recently ... 1 = long time ago",
+    rfm_code: "R F M scores together, ex '545'",
+    rfm_segment: "Named segment from R and F (M breaks ties for Cannot Lose Them)"
+  }
+}
+
+WITH
+customers AS (
+  SELECT
+    user_key,
+    DATE_DIFF(CURRENT_DATE('${constants.TIMEZONE}'), MAX(transaction_date), DAY) AS recency_days,
+    COUNT(*) AS frequency,
+    SUM(revenue) AS monetary,
+    MIN(transaction_date) AS first_order_date,
+    MAX(transaction_date) AS last_order_date
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 730 DAY)
+  GROUP BY user_key
+),
+
+scores AS (
+  SELECT
+    *,
+    6 - NTILE(5) OVER (ORDER BY recency_days) AS r_score,
+    -- frequency has a lot of ties (most people buy once), rank first then quintile
+    NTILE(5) OVER (ORDER BY frequency, monetary) AS f_score,
+    NTILE(5) OVER (ORDER BY monetary) AS m_score
+  FROM customers
+)
+
+SELECT
+  *,
+  CONCAT(CAST(r_score AS STRING), CAST(f_score AS STRING), CAST(m_score AS STRING)) AS rfm_code,
+  CASE
+    WHEN r_score >= 4 AND f_score >= 4 AND m_score >= 4 THEN 'Champions'
+    WHEN r_score <= 2 AND f_score >= 4 AND m_score >= 4 THEN 'Cannot Lose Them'
+    WHEN r_score <= 2 AND f_score >= 3 THEN 'At Risk'
+    WHEN r_score >= 3 AND f_score >= 4 THEN 'Loyal'
+    WHEN r_score >= 4 AND f_score BETWEEN 2 AND 3 THEN 'Potential Loyalist'
+    WHEN r_score = 5 AND f_score = 1 THEN 'New Customers'
+    WHEN r_score = 4 AND f_score = 1 THEN 'Promising'
+    WHEN r_score = 3 AND f_score = 3 THEN 'Need Attention'
+    WHEN r_score = 3 AND f_score <= 2 THEN 'About to Sleep'
+    WHEN r_score = 1 AND f_score <= 1 THEN 'Lost'
+    ELSE 'Hibernating'
+  END AS rfm_segment,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scores

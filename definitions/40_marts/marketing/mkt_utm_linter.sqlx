@@ -1,0 +1,123 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_utm_linter",
+  description: "UTM hygiene report: upper case, spaces, unknown mediums, source with url, typos ('facebok' -> did you mean 'facebook'?), paid without campaign... with sessions affected and a suggested fix. Send it to the agency every monday",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "data_quality"],
+  columns: {
+    issue: "What is wrong with the utm",
+    suggestion: "What it should probably be",
+    sessions_affected: "Landing sessions with this exact raw utm combination in the last 90 days"
+  }
+}
+
+js {
+  const knownMediums = ["cpc", "ppc", "paid", "paid_social", "paidsocial", "paid_search", "cpm", "cpv", "display", "banner", "retargeting", "remarketing",
+    "email", "e-mail", "newsletter", "sms", "push", "social", "organic", "referral", "affiliate", "affiliates", "afiliado", "influencer",
+    "influenciador", "video", "audio", "qrcode", "qr", "offline", "print", "crm", "whatsapp", "app", "link", "partner", "parceiro", "cashback", "cupom", "ugc"]
+    .concat(cfg_channels.custom_mediums.affiliates, cfg_channels.custom_mediums.influencers, cfg_channels.custom_mediums.crm);
+  const knownSources = Array.from(new Set(cfg_channels.source_aliases.map(a => a.canonical).concat(["google", "facebook", "instagram", "tiktok", "youtube", "linkedin", "bing", "rdstation", "mailchimp", "hubspot", "whatsapp", "criteo", "taboola", "outbrain", "awin", "rakuten", "lomadee", "afilio"])));
+}
+
+WITH
+landing_events AS (
+  SELECT
+    session_key,
+    event_date,
+    REGEXP_EXTRACT(page_location, r'[?&]utm_source=([^&#]*)') AS raw_source,
+    REGEXP_EXTRACT(page_location, r'[?&]utm_medium=([^&#]*)') AS raw_medium,
+    REGEXP_EXTRACT(page_location, r'[?&]utm_campaign=([^&#]*)') AS raw_campaign
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND REGEXP_CONTAINS(page_location, r'[?&]utm_')
+    AND event_name IN ('page_view', 'session_start')
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY event_ts) = 1
+),
+
+combos AS (
+  SELECT
+    raw_source,
+    raw_medium,
+    raw_campaign,
+    COUNT(*) AS sessions_affected,
+    MIN(event_date) AS first_seen,
+    MAX(event_date) AS last_seen
+  FROM landing_events
+  GROUP BY 1, 2, 3
+),
+
+known_sources AS (
+  SELECT source FROM UNNEST([${helpers.sqlList(knownSources)}]) AS source
+),
+
+closest_source AS (
+  SELECT
+    c.raw_source,
+    ARRAY_AGG(STRUCT(k.source, EDIT_DISTANCE(LOWER(c.raw_source), k.source) AS distance) ORDER BY EDIT_DISTANCE(LOWER(c.raw_source), k.source) LIMIT 1)[OFFSET(0)] AS best
+  FROM (SELECT DISTINCT raw_source FROM combos WHERE raw_source IS NOT NULL) AS c
+  CROSS JOIN known_sources AS k
+  GROUP BY c.raw_source
+),
+
+all_issues AS (
+  SELECT c.*, 'source_with_upper_case' AS issue, LOWER(c.raw_source) AS suggestion
+  FROM combos AS c WHERE c.raw_source != LOWER(c.raw_source)
+  UNION ALL
+  SELECT c.*, 'medium_with_upper_case', LOWER(c.raw_medium)
+  FROM combos AS c WHERE c.raw_medium != LOWER(c.raw_medium)
+  UNION ALL
+  SELECT c.*, 'campaign_with_upper_case', LOWER(c.raw_campaign)
+  FROM combos AS c WHERE c.raw_campaign != LOWER(c.raw_campaign)
+  UNION ALL
+  SELECT c.*, 'spaces_in_utm', 'use _ or - instead of spaces'
+  FROM combos AS c WHERE REGEXP_CONTAINS(CONCAT(COALESCE(c.raw_source, ''), COALESCE(c.raw_medium, ''), COALESCE(c.raw_campaign, '')), r'(\+|%20| )')
+  UNION ALL
+  SELECT c.*, 'source_without_medium', 'add utm_medium (GA4 will show (not set) and the channel becomes Unassigned)'
+  FROM combos AS c WHERE c.raw_source IS NOT NULL AND c.raw_medium IS NULL
+  UNION ALL
+  SELECT c.*, 'medium_without_source', 'add utm_source'
+  FROM combos AS c WHERE c.raw_source IS NULL AND c.raw_medium IS NOT NULL
+  UNION ALL
+  SELECT c.*, 'unknown_medium', CONCAT('use one of: ', ${helpers.sqlString(knownMediums.slice(0, 12).join(", "))}, '...')
+  FROM combos AS c WHERE c.raw_medium IS NOT NULL AND LOWER(c.raw_medium) NOT IN (${helpers.sqlList(knownMediums)})
+  UNION ALL
+  SELECT c.*, 'source_is_an_url', REGEXP_REPLACE(LOWER(c.raw_source), r'^(https?(%3a|:)(%2f|/)+)?(www\.)?', '')
+  FROM combos AS c WHERE REGEXP_CONTAINS(LOWER(c.raw_source), r'^(https?|www\.)|\.com|%2f')
+  UNION ALL
+  SELECT c.*, 'source_equals_medium', 'source = who sent (facebook), medium = how (paid_social)'
+  FROM combos AS c WHERE LOWER(c.raw_source) = LOWER(c.raw_medium)
+  UNION ALL
+  SELECT c.*, 'paid_without_campaign', 'paid traffic without utm_campaign cannot be joined with costs'
+  FROM combos AS c WHERE REGEXP_CONTAINS(LOWER(c.raw_medium), r'${channels.PAID_MEDIUM}') AND c.raw_campaign IS NULL
+  UNION ALL
+  SELECT c.*, 'probable_typo_in_source', CONCAT('did you mean "', s.best.source, '"?')
+  FROM combos AS c
+  JOIN closest_source AS s USING (raw_source)
+  WHERE s.best.distance BETWEEN 1 AND 2 AND LENGTH(c.raw_source) >= 4
+  UNION ALL
+  SELECT c.*, 'placeholder_not_replaced', 'dynamic parameter was not replaced by the platform ({{campaign.name}}, {campaignid}...)'
+  FROM combos AS c WHERE REGEXP_CONTAINS(CONCAT(COALESCE(c.raw_source, ''), COALESCE(c.raw_medium, ''), COALESCE(c.raw_campaign, '')), r'(?i)(\{|%7b|\[|%5b)')
+)
+
+SELECT
+  issue,
+  raw_source,
+  raw_medium,
+  raw_campaign,
+  suggestion,
+  sessions_affected,
+  first_seen,
+  last_seen,
+  CASE
+    WHEN issue IN ('source_without_medium', 'paid_without_campaign', 'placeholder_not_replaced') THEN 'high'
+    WHEN issue IN ('probable_typo_in_source', 'unknown_medium', 'source_is_an_url') THEN 'medium'
+    ELSE 'low'
+  END AS severity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_issues
+ORDER BY sessions_affected DESC

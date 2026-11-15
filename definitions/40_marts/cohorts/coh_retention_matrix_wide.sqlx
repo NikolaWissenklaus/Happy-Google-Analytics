@@ -1,0 +1,21 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_retention_matrix_wide",
+  description: "The cohort triangle in wide format (one column per week 0..12), ready for a conditional formatting heatmap in Looker Studio / Sheets without any pivot",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "retention"]
+}
+
+SELECT *
+FROM (
+  SELECT cohort_week, cohort_users, CONCAT('w', LPAD(CAST(weeks_since_first_visit AS STRING), 2, '0')) AS week_label, retention
+  FROM ${ref("coh_retention_weekly")}
+)
+PIVOT (
+  ANY_VALUE(retention) FOR week_label IN (${[...Array(13).keys()].map(i => `'w${String(i).padStart(2, "0")}'`).join(", ")})
+)

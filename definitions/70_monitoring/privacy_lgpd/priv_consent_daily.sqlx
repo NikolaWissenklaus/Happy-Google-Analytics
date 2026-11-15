@@ -1,0 +1,78 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_consent_daily",
+  description: "Consent Mode health per day, platform, hostname and device: analytics_storage / ads_storage granted vs denied vs unknown, cookieless pings, the CMP params (ad_user_data, ad_personalization) and the events that came with a client id even with consent denied (consent_mismatch_events, the one the DPO wants to see at zero)",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["platform", "hostname"],
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    analytics_consent_rate: "granted / (granted + denied). unknown is out, it means the tag has no consent mode at all",
+    unknown_consent_share: "Events without privacy_info. High here = consent mode not implemented in some tag / page",
+    cookieless_events: "Events without user_pseudo_id (consent mode advanced pings). GA4 models them, the export does not",
+    consent_mismatch_events: "analytics_storage denied but the event still has a user_pseudo_id. Usually the CMP updates the consent after the tag already fired, or a hardcoded gtag outside the consent mode",
+    ad_user_data_denied_events: "From the CMP param in cfg_privacy.consent_params. GA4 does NOT export ad_user_data, so it only shows up if the site sends it as param"
+  }
+}
+
+js {
+  const cp = cfg_privacy.consent_params;
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH events AS (
+  SELECT
+    event_date,
+    platform,
+    COALESCE(page_hostname, IF(platform = 'WEB', '(not set)', '(app)')) AS hostname,
+    COALESCE(device_category, '(not set)') AS device_category,
+    session_key,
+    user_pseudo_id,
+    consent_analytics_storage,
+    consent_ads_storage,
+    is_cookieless,
+    ${ga4.consentState(ga4.paramStr(cp.ad_user_data))} AS consent_ad_user_data,
+    ${ga4.consentState(ga4.paramStr(cp.ad_personalization))} AS consent_ad_personalization
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+    ${helpers.noiseFilter()}
+)
+
+SELECT
+  event_date,
+  platform,
+  hostname,
+  device_category,
+  COUNT(*) AS events,
+  COUNT(DISTINCT session_key) AS sessions,
+  COUNTIF(consent_analytics_storage = 'granted') AS analytics_granted_events,
+  COUNTIF(consent_analytics_storage = 'denied') AS analytics_denied_events,
+  COUNTIF(consent_analytics_storage = 'unknown') AS analytics_unknown_events,
+  COUNTIF(consent_ads_storage = 'granted') AS ads_granted_events,
+  COUNTIF(consent_ads_storage = 'denied') AS ads_denied_events,
+  COUNTIF(consent_ads_storage = 'unknown') AS ads_unknown_events,
+  COUNTIF(is_cookieless) AS cookieless_events,
+  COUNTIF(consent_analytics_storage = 'denied' AND user_pseudo_id IS NOT NULL) AS consent_mismatch_events,
+  COUNTIF(consent_ad_user_data = 'granted') AS ad_user_data_granted_events,
+  COUNTIF(consent_ad_user_data = 'denied') AS ad_user_data_denied_events,
+  COUNTIF(consent_ad_personalization = 'granted') AS ad_personalization_granted_events,
+  COUNTIF(consent_ad_personalization = 'denied') AS ad_personalization_denied_events,
+  SAFE_DIVIDE(COUNTIF(consent_analytics_storage = 'granted'), COUNTIF(consent_analytics_storage IN ('granted', 'denied'))) AS analytics_consent_rate,
+  SAFE_DIVIDE(COUNTIF(consent_ads_storage = 'granted'), COUNTIF(consent_ads_storage IN ('granted', 'denied'))) AS ads_consent_rate,
+  SAFE_DIVIDE(COUNTIF(consent_analytics_storage = 'unknown'), COUNT(*)) AS unknown_consent_share,
+  SAFE_DIVIDE(COUNTIF(is_cookieless), COUNT(*)) AS cookieless_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM events
+GROUP BY 1, 2, 3, 4
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

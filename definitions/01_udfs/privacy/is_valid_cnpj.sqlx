@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "is_valid_cnpj",
+  description: "Validates a CNPJ, including the new alphanumeric CNPJ (Receita Federal, from jul/2026)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "lgpd"]
+}
+
+-- alphanumeric CNPJ: first 12 chars can be A-Z, the 2 check digits stay numeric.
+-- each char value = ascii code - 48 ('0'..'9' -> 0..9, 'A' -> 17 ... 'Z' -> 42),
+-- then the same mod 11 as always. example from the RFB note: 12.ABC.345/01DE-35
+CREATE OR REPLACE FUNCTION ${self()}(value STRING) RETURNS BOOL LANGUAGE js AS r"""
+  if (value === null || value === undefined) return null;
+  var s = String(value).toUpperCase().replace(/[^0-9A-Z]/g, '');
+  if (s.length !== 14) return false;
+  if (!/^[0-9A-Z]{12}[0-9]{2}$/.test(s)) return false;
+  if (/^(\d)\1{13}$/.test(s)) return false;
+  function charValue(ch) { return ch.charCodeAt(0) - 48; }
+  function checkDigit(base, weights) {
+    var sum = 0;
+    for (var i = 0; i < weights.length; i++) sum += charValue(base.charAt(i)) * weights[i];
+    var r = sum % 11;
+    return r < 2 ? 0 : 11 - r;
+  }
+  var w1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+  var w2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
+  var d1 = checkDigit(s.substring(0, 12), w1);
+  var d2 = checkDigit(s.substring(0, 12) + String(d1), w2);
+  return d1 === Number(s.charAt(12)) && d2 === Number(s.charAt(13));
+"""
+OPTIONS (description = "CNPJ (numeric and alphanumeric) check digits validation")

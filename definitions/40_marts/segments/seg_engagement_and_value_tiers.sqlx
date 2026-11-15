@@ -1,0 +1,68 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_engagement_and_value_tiers",
+  description: "Two tiers per user: engagement tier (last 30 days: active days, engaged time and views, percentile based) and value tier (lifetime revenue: top_1_pct, top_5_pct, top_10_pct, top_25_pct, rest, non_customer)",
+  bigquery: {
+    clusterBy: ["value_tier", "engagement_tier"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "crm"],
+  columns: {
+    engagement_score: "0-100, average of the percentiles of active days, engaged time and views",
+    engagement_tier: "power (80+) | regular (50-79) | casual (20-49) | dormant (< 20 or no activity in 30 days)"
+  }
+}
+
+WITH
+last_30 AS (
+  SELECT user_key, COUNT(*) AS active_days, SUM(engagement_time_sec) AS engagement_time_sec, SUM(views) AS views
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  GROUP BY user_key
+),
+
+engagement AS (
+  SELECT
+    user_key,
+    active_days,
+    engagement_time_sec,
+    views,
+    100 * (PERCENT_RANK() OVER (ORDER BY active_days) + PERCENT_RANK() OVER (ORDER BY engagement_time_sec) + PERCENT_RANK() OVER (ORDER BY views)) / 3 AS engagement_score
+  FROM last_30
+),
+
+value AS (
+  SELECT
+    user_key,
+    lifetime_revenue,
+    IF(lifetime_revenue > 0, PERCENT_RANK() OVER (PARTITION BY lifetime_revenue > 0 ORDER BY lifetime_revenue DESC), NULL) AS revenue_rank_pct
+  FROM ${ref("dim_users")}
+)
+
+SELECT
+  v.user_key,
+  COALESCE(e.active_days, 0) AS active_days_30d,
+  COALESCE(e.engagement_time_sec, 0) AS engagement_time_sec_30d,
+  COALESCE(e.views, 0) AS views_30d,
+  COALESCE(e.engagement_score, 0) AS engagement_score,
+  CASE
+    WHEN e.engagement_score >= 80 THEN 'power'
+    WHEN e.engagement_score >= 50 THEN 'regular'
+    WHEN e.engagement_score >= 20 THEN 'casual'
+    ELSE 'dormant'
+  END AS engagement_tier,
+  v.lifetime_revenue,
+  CASE
+    WHEN v.lifetime_revenue IS NULL OR v.lifetime_revenue <= 0 THEN 'non_customer'
+    WHEN v.revenue_rank_pct <= 0.01 THEN 'top_1_pct'
+    WHEN v.revenue_rank_pct <= 0.05 THEN 'top_5_pct'
+    WHEN v.revenue_rank_pct <= 0.10 THEN 'top_10_pct'
+    WHEN v.revenue_rank_pct <= 0.25 THEN 'top_25_pct'
+    ELSE 'rest'
+  END AS value_tier,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM value AS v
+LEFT JOIN engagement AS e USING (user_key)

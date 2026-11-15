@@ -1,0 +1,42 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_assisted_conversions",
+  description: "UA MCF 'Assisted Conversions' back from the dead: per channel and month, last click conversions, assisted conversions (channel in the path but not the last touch), first click and the assisted / last click ratio. Ratio > 1 = the channel opens doors more than it closes",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "ua_report"]
+}
+
+WITH
+touch_roles AS (
+  SELECT
+    conversion_id,
+    key_event_name,
+    DATE_TRUNC(conversion_date, MONTH) AS conversion_month,
+    conversion_value,
+    channel,
+    MAX(IF(touch_index = path_length, 1, 0)) AS is_last,
+    MAX(IF(touch_index = 1, 1, 0)) AS is_first,
+    MAX(IF(touch_index < path_length, 1, 0)) AS is_assist
+  FROM ${ref("attr_credits_rule_based")}
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  conversion_month,
+  key_event_name,
+  channel,
+  SUM(is_last) AS last_click_conversions,
+  SUM(is_last * conversion_value) AS last_click_value,
+  -- UA rule: assisted = appeared before the last interaction (a channel can be both, in different touches)
+  SUM(IF(is_assist = 1, 1, 0)) AS assisted_conversions,
+  SUM(IF(is_assist = 1, conversion_value, 0)) AS assisted_value,
+  SUM(is_first) AS first_click_conversions,
+  SAFE_DIVIDE(SUM(IF(is_assist = 1, 1, 0)), SUM(is_last)) AS assisted_last_click_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM touch_roles
+GROUP BY 1, 2, 3

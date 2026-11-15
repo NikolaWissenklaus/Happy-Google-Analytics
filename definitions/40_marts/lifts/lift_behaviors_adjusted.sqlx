@@ -1,0 +1,137 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.lifts,
+  name: "lift_behaviors_adjusted",
+  description: "Which behaviours go with more purchases, ADJUSTED (last 30 days): for every event, the purchase rate of sessions that did it vs sessions that did not, raw and with the Mantel-Haenszel risk ratio stratified by device, new / returning, channel and landing page type. 'Reviews x3.1 raw, x1.4 adjusted' = most of it was just that buyers already arrive with more intent. Association, not causation: use it to choose what to test, the holdouts and A/B tests prove it",
+  bigquery: {
+    labels: { layer: "marts", domain: "lifts" }
+  },
+  tags: ["marts", "lifts", "daily", "cro"],
+  columns: {
+    naive_lift: "purchase rate with / purchase rate without, no adjustment",
+    adjusted_lift: "Mantel-Haenszel risk ratio over the strata (device x new/returning x channel x landing page type)",
+    confounding_ratio: "naive / adjusted. Far from 1 = the raw comparison was mostly the profile of who does the behaviour",
+    attributable_purchases: "If it were causal: purchases of the sessions with the behaviour that would not happen without it (n x (1 - 1 / adjusted lift))",
+    is_purchase_funnel_step: "Steps of the purchase funnel, obviously high. Hide them to see the interesting ones"
+  }
+}
+
+js {
+  const bh = cfg_lifts.behaviors;
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_key,
+    has_purchase,
+    CONCAT(
+      COALESCE(device_category, '?'), '|',
+      IF(is_new_user, 'new', 'returning'), '|',
+      COALESCE(session_default_channel_group, '?'), '|',
+      COALESCE(landing_page_type, '?')
+    ) AS stratum
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(bh.window_days)}
+    ${helpers.martSessionFilter()}
+),
+
+behaviors AS (
+  SELECT DISTINCT session_key, event_name
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(bh.window_days)}
+    AND session_key IS NOT NULL
+    AND event_name NOT IN (${helpers.sqlList(bh.ignore_events)})
+),
+
+candidates AS (
+  SELECT b.event_name
+  FROM behaviors AS b
+  JOIN sessions AS s USING (session_key)
+  GROUP BY b.event_name
+  HAVING COUNT(*) >= ${bh.min_sessions_with_behavior}
+  ORDER BY COUNT(*) DESC
+  LIMIT ${bh.max_behaviors}
+),
+
+stratum_totals AS (
+  SELECT stratum, COUNT(*) AS n, COUNTIF(has_purchase) AS purchases
+  FROM sessions
+  GROUP BY stratum
+),
+
+treated AS (
+  SELECT
+    b.event_name,
+    s.stratum,
+    COUNT(*) AS n1,
+    COUNTIF(s.has_purchase) AS a
+  FROM behaviors AS b
+  JOIN candidates AS c USING (event_name)
+  JOIN sessions AS s USING (session_key)
+  GROUP BY 1, 2
+),
+
+-- 2x2 table per behaviour and stratum: a = did it and bought, c = did not and bought
+cells AS (
+  SELECT
+    t.event_name,
+    CAST(t.n1 AS FLOAT64) AS n1,
+    CAST(t.a AS FLOAT64) AS a,
+    CAST(st.n - t.n1 AS FLOAT64) AS n0,
+    CAST(st.purchases - t.a AS FLOAT64) AS c,
+    CAST(st.n AS FLOAT64) AS n
+  FROM treated AS t
+  JOIN stratum_totals AS st USING (stratum)
+),
+
+mantel_haenszel AS (
+  SELECT
+    event_name,
+    SUM(n1) AS sessions_with,
+    SUM(a) AS purchases_with,
+    SUM(n0) AS sessions_without,
+    SUM(c) AS purchases_without,
+    SUM(a * n0 / n) AS mh_numerator,
+    SUM(c * n1 / n) AS mh_denominator,
+    -- Greenland & Robins (1985) variance of ln(RR_MH)
+    SUM((n1 * n0 * (a + c) - a * c * n) / (n * n)) AS gr_variance_numerator
+  FROM cells
+  GROUP BY event_name
+),
+
+lifts AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(SAFE_DIVIDE(purchases_with, sessions_with), SAFE_DIVIDE(purchases_without, sessions_without)) AS naive_lift,
+    SAFE_DIVIDE(mh_numerator, mh_denominator) AS adjusted_lift,
+    SAFE_DIVIDE(gr_variance_numerator, mh_numerator * mh_denominator) AS var_log_rr
+  FROM mantel_haenszel
+)
+
+SELECT
+  event_name,
+  event_name IN (${helpers.sqlList(bh.funnel_events)}) AS is_purchase_funnel_step,
+  CAST(sessions_with AS INT64) AS sessions_with,
+  CAST(sessions_without AS INT64) AS sessions_without,
+  SAFE_DIVIDE(sessions_with, sessions_with + sessions_without) AS coverage,
+  SAFE_DIVIDE(purchases_with, sessions_with) AS purchase_rate_with,
+  SAFE_DIVIDE(purchases_without, sessions_without) AS purchase_rate_without,
+  ROUND(naive_lift, 3) AS naive_lift,
+  ROUND(adjusted_lift, 3) AS adjusted_lift,
+  ROUND(EXP(SAFE.LN(adjusted_lift) - 1.96 * SAFE.SQRT(var_log_rr)), 3) AS adjusted_lift_ci_low,
+  ROUND(EXP(SAFE.LN(adjusted_lift) + 1.96 * SAFE.SQRT(var_log_rr)), 3) AS adjusted_lift_ci_high,
+  2 * (1 - ${ref("normal_cdf")}(ABS(SAFE_DIVIDE(SAFE.LN(adjusted_lift), SAFE.SQRT(var_log_rr))))) AS p_value,
+  ROUND(SAFE_DIVIDE(naive_lift, adjusted_lift), 3) AS confounding_ratio,
+  ROUND(purchases_with * (1 - SAFE_DIVIDE(1, adjusted_lift)), 1) AS attributable_purchases,
+  CASE
+    WHEN adjusted_lift IS NULL THEN 'not_enough_data'
+    WHEN EXP(SAFE.LN(adjusted_lift) - 1.96 * SAFE.SQRT(var_log_rr)) > 1 THEN 'positive'
+    WHEN EXP(SAFE.LN(adjusted_lift) + 1.96 * SAFE.SQRT(var_log_rr)) < 1 THEN 'negative'
+    ELSE 'no_clear_association'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM lifts
+WHERE adjusted_lift > 0

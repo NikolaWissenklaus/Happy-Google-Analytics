@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_param_int",
+  description: "INT64 value of a GA4 param, also converting strings/doubles (ga_session_id, engagement_time_msec...)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- some sites send numbers as string ("12"), the export keeps whatever came.
+-- this one tries int_value first and then converts the others.
+CREATE OR REPLACE FUNCTION ${self()}(params ANY TYPE, param_key STRING) AS ((
+  SELECT COALESCE(
+    p.value.int_value,
+    SAFE_CAST(p.value.string_value AS INT64),
+    SAFE_CAST(p.value.double_value AS INT64),
+    SAFE_CAST(p.value.float_value AS INT64)
+  )
+  FROM UNNEST(params) AS p
+  WHERE p.key = param_key
+  LIMIT 1
+))
+OPTIONS (description = "INT64 value of a GA4 param, converting string/double when needed")

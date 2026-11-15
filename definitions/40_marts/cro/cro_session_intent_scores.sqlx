@@ -1,0 +1,64 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_session_intent_scores",
+  description: "Purchase intent score (0-100) of the sessions of the last 2 days that did NOT buy, from simple explainable signals (product views, cart, checkout, search, engagement, returning user, logged in). With intraday on, this is near real time: the CRM / media team can act on the hot ones the same day",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["intent_band"],
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "activation"],
+  columns: {
+    intent_band: "hot (70+) / warm (40-69) / cold",
+    intent_reasons: "Signals that added points"
+  }
+}
+
+WITH scored AS (
+  SELECT
+    session_key,
+    session_date,
+    session_start_ts,
+    user_key,
+    user_id,
+    device_category,
+    session_default_channel_group,
+    cart_value,
+    checkout_value,
+    consent_ads_storage,
+    LEAST(100,
+      IF(has_view_item, 10, 0)
+      + IF(view_item_events >= 3, 10, 0)
+      + IF(has_add_to_cart, 25, 0)
+      + IF(has_begin_checkout, 25, 0)
+      + IF(has_add_payment_info, 15, 0)
+      + IF(has_site_search, 5, 0)
+      + IF(engagement_time_sec >= 120, 5, 0)
+      + IF(NOT is_new_user, 5, 0)
+      + IF(is_identified_user, 5, 0)
+    ) AS intent_score,
+    ARRAY_CONCAT(
+      IF(has_view_item, ['viewed_product'], []),
+      IF(view_item_events >= 3, ['viewed_3+_products'], []),
+      IF(has_add_to_cart, ['added_to_cart'], []),
+      IF(has_begin_checkout, ['began_checkout'], []),
+      IF(has_add_payment_info, ['reached_payment'], []),
+      IF(has_site_search, ['searched'], []),
+      IF(engagement_time_sec >= 120, ['engaged_2min+'], []),
+      IF(NOT is_new_user, ['returning'], []),
+      IF(is_identified_user, ['logged_in'], [])
+    ) AS intent_reasons
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 1 DAY)
+    AND NOT has_purchase
+    ${helpers.martSessionFilter()}
+)
+
+SELECT
+  *,
+  CASE WHEN intent_score >= 70 THEN 'hot' WHEN intent_score >= 40 THEN 'warm' ELSE 'cold' END AS intent_band,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored

@@ -1,0 +1,48 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_segment_overlap",
+  description: "GA4 'Segment overlap' exploration for our own segments: for every pair of segment values (lifecycle stage, RFM segment, persona, value tier, engagement tier, price profile) how many users are in both, and the share of each side. Venn diagrams without clicking 30 times",
+  bigquery: {
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily"]
+}
+
+WITH
+memberships AS (
+  SELECT user_key, CONCAT('lifecycle: ', lifecycle_stage) AS segment FROM ${ref("seg_user_profile_360")} WHERE lifecycle_stage IS NOT NULL
+  UNION ALL SELECT user_key, CONCAT('rfm: ', rfm_segment) FROM ${ref("seg_user_profile_360")} WHERE rfm_segment IS NOT NULL
+  UNION ALL SELECT user_key, CONCAT('value: ', value_tier) FROM ${ref("seg_user_profile_360")} WHERE value_tier IS NOT NULL
+  UNION ALL SELECT user_key, CONCAT('engagement: ', engagement_tier) FROM ${ref("seg_user_profile_360")} WHERE engagement_tier IS NOT NULL
+  UNION ALL SELECT user_key, CONCAT('price: ', price_profile) FROM ${ref("seg_user_profile_360")} WHERE price_profile IS NOT NULL
+  UNION ALL SELECT p.user_key, CONCAT('persona: ', persona) FROM ${ref("seg_personas")} AS p, UNNEST(p.personas) AS persona
+),
+
+sizes AS (
+  SELECT segment, COUNT(DISTINCT user_key) AS users FROM memberships GROUP BY 1
+),
+
+pairs AS (
+  SELECT a.segment AS segment_a, b.segment AS segment_b, COUNT(DISTINCT a.user_key) AS users_in_both
+  FROM memberships AS a
+  JOIN memberships AS b ON a.user_key = b.user_key AND a.segment < b.segment
+  GROUP BY 1, 2
+)
+
+SELECT
+  p.segment_a,
+  p.segment_b,
+  sa.users AS users_a,
+  sb.users AS users_b,
+  p.users_in_both,
+  SAFE_DIVIDE(p.users_in_both, sa.users) AS share_of_a,
+  SAFE_DIVIDE(p.users_in_both, sb.users) AS share_of_b,
+  SAFE_DIVIDE(p.users_in_both, sa.users + sb.users - p.users_in_both) AS jaccard,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+JOIN sizes AS sa ON sa.segment = p.segment_a
+JOIN sizes AS sb ON sb.segment = p.segment_b
+WHERE p.users_in_both >= 10

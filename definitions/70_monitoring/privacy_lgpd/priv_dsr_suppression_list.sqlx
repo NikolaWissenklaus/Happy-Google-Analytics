@@ -1,0 +1,21 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_suppression_list",
+  description: "People whose data was deleted (LGPD art. 18 VI). Staging reads it and drops their events, so a full refresh never brings them back from the raw export. Only SHA256 of the ids is kept",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["monitoring", "lgpd", "daily", "bootstrap"]
+}
+
+-- created once, filled by priv_dsr_deletion. never truncate it: it is what keeps
+-- the deleted people deleted
+CREATE TABLE IF NOT EXISTS ${self()} (
+  id_type STRING OPTIONS (description = "user_pseudo_id | user_id"),
+  value_sha256 STRING OPTIONS (description = "TO_HEX(SHA256(id)). The id itself is not stored"),
+  request_id STRING OPTIONS (description = "Data subject request that put the id here"),
+  added_at TIMESTAMP OPTIONS (description = "When it was added")
+)
+OPTIONS (description = "LGPD deletion suppression list (hashed ids)")

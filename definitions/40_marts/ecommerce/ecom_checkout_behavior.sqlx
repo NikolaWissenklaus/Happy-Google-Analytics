@@ -1,0 +1,49 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_checkout_behavior",
+  description: "UA 'Checkout Behavior' with the brazilian details: last 90 days, begin checkout -> shipping -> payment -> purchase, split by shipping tier and payment type (boleto, pix, cartao...). Payment retries and the payment types that die in the last step",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "ua_report", "cro"]
+}
+
+WITH checkout_sessions AS (
+  SELECT
+    session_key,
+    device_category,
+    COALESCE(last_shipping_tier, '(not set)') AS shipping_tier,
+    COALESCE(last_payment_type, '(not set)') AS payment_type,
+    has_begin_checkout,
+    has_add_shipping_info,
+    has_add_payment_info,
+    has_purchase,
+    has_payment_retries,
+    checkout_value
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+    AND has_begin_checkout
+    ${helpers.martSessionFilter()}
+)
+
+SELECT
+  device_category,
+  shipping_tier,
+  payment_type,
+  COUNT(*) AS checkout_sessions,
+  COUNTIF(has_add_shipping_info) AS reached_shipping,
+  COUNTIF(has_add_payment_info) AS reached_payment,
+  COUNTIF(has_purchase) AS purchased,
+  COUNTIF(has_payment_retries) AS sessions_with_payment_retries,
+  SAFE_DIVIDE(COUNTIF(has_add_shipping_info), COUNT(*)) AS checkout_to_shipping_rate,
+  SAFE_DIVIDE(COUNTIF(has_add_payment_info), COUNTIF(has_add_shipping_info)) AS shipping_to_payment_rate,
+  SAFE_DIVIDE(COUNTIF(has_purchase), COUNTIF(has_add_payment_info)) AS payment_to_purchase_rate,
+  SAFE_DIVIDE(COUNTIF(has_purchase), COUNT(*)) AS checkout_conversion_rate,
+  SAFE_DIVIDE(COUNTIF(has_payment_retries), COUNTIF(has_add_payment_info)) AS payment_retry_rate,
+  SUM(IF(NOT has_purchase, checkout_value, 0)) AS abandoned_checkout_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checkout_sessions
+GROUP BY 1, 2, 3

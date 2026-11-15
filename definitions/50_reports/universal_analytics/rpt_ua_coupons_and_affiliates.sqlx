@@ -1,0 +1,72 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_coupons_and_affiliates",
+  description: "UA Conversions > Ecommerce > Marketing per month: Order Coupon Code, Product Coupon Code and Affiliate Code with transactions, revenue and avg order value. Internal promotions are in rpt_ga4_promotions_daily",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily", "ecommerce", "promotions"],
+  columns: {
+    code_type: "order_coupon | product_coupon | affiliation",
+    revenue: "Order revenue for order coupons, item revenue for product coupons and affiliation"
+  }
+}
+
+WITH
+order_coupons AS (
+  SELECT
+    DATE_TRUNC(transaction_date, MONTH) AS transaction_month,
+    'order_coupon' AS code_type,
+    UPPER(TRIM(coupon)) AS code,
+    COUNT(*) AS transactions,
+    SUM(revenue) AS revenue,
+    SUM(item_quantity) AS quantity
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND NULLIF(TRIM(coupon), '') IS NOT NULL
+  GROUP BY transaction_month, code
+),
+
+product_coupons AS (
+  SELECT
+    DATE_TRUNC(transaction_date, MONTH) AS transaction_month,
+    'product_coupon' AS code_type,
+    item_coupon AS code,
+    COUNT(DISTINCT transaction_id) AS transactions,
+    SUM(item_revenue) AS revenue,
+    SUM(quantity) AS quantity
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue
+    AND item_coupon IS NOT NULL
+  GROUP BY transaction_month, code
+),
+
+affiliations AS (
+  SELECT
+    DATE_TRUNC(transaction_date, MONTH) AS transaction_month,
+    'affiliation' AS code_type,
+    TRIM(affiliation) AS code,
+    COUNT(DISTINCT transaction_id) AS transactions,
+    SUM(item_revenue) AS revenue,
+    SUM(quantity) AS quantity
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue
+    AND NULLIF(TRIM(affiliation), '') IS NOT NULL
+  GROUP BY transaction_month, code
+),
+
+all_codes AS (
+  SELECT * FROM order_coupons
+  UNION ALL SELECT * FROM product_coupons
+  UNION ALL SELECT * FROM affiliations
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(revenue, transactions) AS avg_order_value,
+  SAFE_DIVIDE(revenue, SUM(revenue) OVER (PARTITION BY transaction_month, code_type)) AS share_of_type_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM all_codes

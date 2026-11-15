@@ -1,0 +1,18 @@
+{
+  "name": "happy-google-analytics-tools",
+  "private": true,
+  "description": "Dev tools for the Dataform project (the project itself lives one folder up, Dataform does not allow a package.json there when dataformCoreVersion is in workflow_settings.yaml)",
+  "author": "Francisco Lucas / Nikola Wissenklaus / Chico",
+  "scripts": {
+    "compile": "dataform compile ..",
+    "compile:json": "node -e \"require('fs').mkdirSync('out',{recursive:true})\" && dataform compile .. --json > out/compiled.json",
+    "validate:sql": "npm run compile:json && python validate_sql.py out/compiled.json",
+    "test:udfs": "node tests/test_js_udfs.js ../definitions/01_udfs",
+    "check": "npm run test:udfs && npm run validate:sql",
+    "catalog": "npm run compile:json && node generate_catalog.js out/compiled.json ../docs/catalog.md",
+    "alerts:dry-run": "python alerts/send_alerts.py --dry-run --project"
+  },
+  "devDependencies": {
+    "@dataform/cli": "3.0.71"
+  }
+}

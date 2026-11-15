@@ -1,0 +1,137 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_data_inventory",
+  description: "ROPA-lite (registro das operações de tratamento, LGPD art. 37) made from BigQuery itself: every table and view of the project + the raw GA4 export, with size, last change, which personal data it holds (identifiers, hashed contact, location, click ids, consent, free text), legal basis and retention from cfg_privacy, and the mismatches (personal data in a dataset declared as aggregated)",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily", "governance"],
+  columns: {
+    personal_data_detected: "Has identifier columns (user_pseudo_id, user_id, user_key, session_key), hashed contact data or ad click ids",
+    personal_data_declared: "What cfg_privacy.dataset_classification says about the dataset",
+    classification_mismatch: "Detected but not declared. Fix the config or move the table, the DPO needs the truth here",
+    has_free_text: "Columns like page_location / page_title / search_term, where PII can hide. Staging masks them, priv_pii_findings watches the raw ones"
+  }
+}
+
+js {
+  const cls = cfg_privacy.dataset_classification;
+  const known = Object.keys(cls).filter(k => k !== "default" && constants.SCHEMAS[k]);
+  const byDataset = (field, type) => `CASE o.table_schema
+      ${known.map(k => `WHEN '${constants.SCHEMAS[k]}' THEN ${helpers.toSqlLiteral(cls[k][field], type)}`).join("\n      ")}
+      ELSE ${helpers.toSqlLiteral(cls.default[field], type)}
+    END`;
+  const ids = privacy.IDENTIFIER_COLUMNS;
+  const clickIds = ["gclid", "gbraid", "wbraid", "dclid", "fbclid", "fbc", "msclkid", "ttclid", "srsltid"];
+  const freeText = ["page_location", "page_referrer", "page_title", "search_term", "link_url", "link_text", "landing_page", "event_source_url"];
+  const retention = constants.ENABLE.retention_purge
+    ? `'${constants.PRIVACY.retention_months} months, purged daily (priv_retention_purge)'`
+    : `'no automatic purge (enable_retention_purge = false)'`;
+  const rawRetention = constants.PRIVACY.retention_include_raw_export
+    ? `'${constants.PRIVACY.retention_months} months, shards dropped daily'`
+    : `'no automatic purge (retention_include_raw_export = false)'`;
+}
+
+WITH
+objects AS (
+  SELECT table_schema, table_name, table_type, creation_time
+  FROM ${constants.regionTable("TABLES")}
+  WHERE STARTS_WITH(table_schema, '${constants.SCHEMA_PREFIX}_')
+),
+
+columns_found AS (
+  SELECT
+    table_schema,
+    table_name,
+    COUNT(*) AS column_count,
+    ARRAY_AGG(IF(column_name IN (${helpers.sqlList(ids)}), column_name, NULL) IGNORE NULLS ORDER BY column_name) AS identifier_columns,
+    LOGICAL_OR(REGEXP_CONTAINS(column_name, r'(email|phone|mail|fone).*(hash|sha)|(hash|sha).*(email|phone|mail|fone)|^(em|ph)$')) AS has_hashed_contact,
+    LOGICAL_OR(REGEXP_CONTAINS(column_name, r'(^|_)(city|region|uf|metro)$')) AS has_location,
+    LOGICAL_OR(column_name IN (${helpers.sqlList(clickIds)})) AS has_click_ids,
+    LOGICAL_OR(REGEXP_CONTAINS(column_name, r'consent')) AS has_consent_columns,
+    LOGICAL_OR(column_name IN (${helpers.sqlList(freeText)})) AS has_free_text
+  FROM ${constants.regionTable("COLUMNS")}
+  WHERE STARTS_WITH(table_schema, '${constants.SCHEMA_PREFIX}_')
+  GROUP BY table_schema, table_name
+),
+
+storage AS (
+  SELECT table_schema, table_name, total_rows, total_logical_bytes, storage_last_modified_time
+  FROM ${constants.regionTable("TABLE_STORAGE")}
+  WHERE STARTS_WITH(table_schema, '${constants.SCHEMA_PREFIX}_')
+    AND NOT deleted
+),
+
+our_tables AS (
+  SELECT
+    o.table_schema AS dataset,
+    o.table_name,
+    o.table_type,
+    o.creation_time,
+    s.total_rows,
+    ROUND(s.total_logical_bytes / POW(1024, 3), 3) AS logical_gb,
+    s.storage_last_modified_time AS last_modified_at,
+    COALESCE(c.identifier_columns, []) AS identifier_columns,
+    COALESCE(c.has_hashed_contact, FALSE) AS has_hashed_contact,
+    COALESCE(c.has_location, FALSE) AS has_location,
+    COALESCE(c.has_click_ids, FALSE) AS has_click_ids,
+    COALESCE(c.has_consent_columns, FALSE) AS has_consent_columns,
+    COALESCE(c.has_free_text, FALSE) AS has_free_text,
+    ${byDataset("contains_personal_data", "BOOL")} AS personal_data_declared,
+    ${byDataset("legal_basis", "STRING")} AS legal_basis,
+    ${byDataset("notes", "STRING")} AS notes
+  FROM objects AS o
+  LEFT JOIN columns_found AS c USING (table_schema, table_name)
+  LEFT JOIN storage AS s USING (table_schema, table_name)
+),
+
+-- the raw export is the biggest personal data store of all, it goes in the inventory too
+raw_export AS (
+  SELECT
+    '${constants.GA4_DATASET}' AS dataset,
+    CONCAT(REGEXP_EXTRACT(table_id, r'^(.*)_\d{8}$'), '_*') AS table_name,
+    'SHARDED TABLE' AS table_type,
+    TIMESTAMP_MILLIS(MIN(creation_time)) AS creation_time,
+    SUM(row_count) AS total_rows,
+    ROUND(SUM(size_bytes) / POW(1024, 3), 3) AS logical_gb,
+    TIMESTAMP_MILLIS(MAX(last_modified_time)) AS last_modified_at
+  FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.__TABLES__`
+  WHERE REGEXP_CONTAINS(table_id, r'^(events|events_intraday|pseudonymous_users|users)_\d{8}$')
+  GROUP BY table_name
+)
+
+SELECT
+  *,
+  ARRAY_LENGTH(identifier_columns) > 0 OR has_hashed_contact OR has_click_ids AS personal_data_detected,
+  IF(ARRAY_LENGTH(identifier_columns) > 0, ${retention}, 'aggregated, kept') AS retention_rule,
+  (ARRAY_LENGTH(identifier_columns) > 0 OR has_hashed_contact OR has_click_ids) AND NOT personal_data_declared AS classification_mismatch,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM our_tables
+
+UNION ALL
+
+SELECT
+  dataset,
+  table_name,
+  table_type,
+  creation_time,
+  total_rows,
+  logical_gb,
+  last_modified_at,
+  ['user_pseudo_id', 'user_id'] AS identifier_columns,
+  FALSE AS has_hashed_contact,
+  TRUE AS has_location,
+  TRUE AS has_click_ids,
+  TRUE AS has_consent_columns,
+  TRUE AS has_free_text,
+  TRUE AS personal_data_declared,
+  'legitimate_interest' AS legal_basis,
+  'raw GA4 export, nothing masked. Access only for the data engineering team' AS notes,
+  TRUE AS personal_data_detected,
+  ${rawRetention} AS retention_rule,
+  FALSE AS classification_mismatch,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM raw_export

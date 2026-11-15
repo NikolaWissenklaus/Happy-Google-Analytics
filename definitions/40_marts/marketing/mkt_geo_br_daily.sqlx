@@ -1,0 +1,42 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_geo_br_daily",
+  description: "Daily performance by brazilian state (UF), macro region and channel. Shipping cost / delivery time problems in the north and northeast show up here as low conversion",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["geo_uf"],
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "geo"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH agg AS (
+  SELECT
+    session_date,
+    COALESCE(geo_uf, '(fora do BR / nao identificado)') AS geo_uf,
+    COALESCE(geo_macro_region, '(n/a)') AS geo_macro_region,
+    session_default_channel_group,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  *,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

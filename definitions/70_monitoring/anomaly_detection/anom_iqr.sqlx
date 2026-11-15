@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_iqr",
+  description: "Method 4 - Tukey fences: outside Q1 - k*IQR .. Q3 + k*IQR of the previous 56 days (k = 1.5). Does not assume normal distribution at all, good for skewed metrics like revenue",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"]
+}
+
+WITH
+history AS (
+  SELECT
+    *,
+    ARRAY_AGG(value) OVER (
+      PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date)
+      RANGE BETWEEN ${cfg_anomaly.iqr.window_days} PRECEDING AND 1 PRECEDING
+    ) AS hist
+  FROM ${ref("anom_metric_series_daily")}
+),
+
+quartiles AS (
+  SELECT
+    metric_date, metric, breakdown, breakdown_value, value,
+    ARRAY_LENGTH(hist) AS history_points,
+    (SELECT APPROX_QUANTILES(h, 4) FROM UNNEST(hist) AS h) AS q
+  FROM history
+  WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  q[SAFE_OFFSET(2)] AS expected,
+  q[SAFE_OFFSET(1)] - ${cfg_anomaly.iqr.k} * (q[SAFE_OFFSET(3)] - q[SAFE_OFFSET(1)]) AS lower_bound,
+  q[SAFE_OFFSET(3)] + ${cfg_anomaly.iqr.k} * (q[SAFE_OFFSET(3)] - q[SAFE_OFFSET(1)]) AS upper_bound,
+  SAFE_DIVIDE(value - q[SAFE_OFFSET(2)], NULLIF(q[SAFE_OFFSET(3)] - q[SAFE_OFFSET(1)], 0)) AS score,
+  history_points >= ${cfg_anomaly.min_history_points}
+    AND (value < q[SAFE_OFFSET(1)] - ${cfg_anomaly.iqr.k} * (q[SAFE_OFFSET(3)] - q[SAFE_OFFSET(1)])
+      OR value > q[SAFE_OFFSET(3)] + ${cfg_anomaly.iqr.k} * (q[SAFE_OFFSET(3)] - q[SAFE_OFFSET(1)])) AS is_anomaly,
+  'iqr' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM quartiles

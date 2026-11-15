@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_dark_social_estimate",
+  description: "Estimates 'dark social': direct sessions of NEW users landing on deep pages (product, blog, campaign pages) are almost never someone typing the url. They are links shared in WhatsApp, Telegram, Slack, apps that hide the referrer. In Brazil this is huge",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily"],
+  columns: {
+    direct_type: "typed_or_bookmark (home / short urls, returning) | probably_dark_social (new user, deep page) | other_direct",
+    dark_social_share_of_direct: "probably_dark_social sessions / all direct sessions of the day"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH
+direct_sessions AS (
+  SELECT
+    *,
+    CASE
+      WHEN landing_page_type = 'home' OR ARRAY_LENGTH(SPLIT(TRIM(landing_page_path, '/'), '/')) <= 1 AND landing_page_type IN ('category', 'institutional', 'account') THEN 'typed_or_bookmark'
+      WHEN is_new_user AND landing_page_type IN ('product', 'blog', 'landing_page', 'category', 'search', 'other') THEN 'probably_dark_social'
+      ELSE 'other_direct'
+    END AS direct_type
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    AND session_channel_only = 'Direct'
+    ${helpers.martSessionFilter()}
+),
+
+agg AS (
+  SELECT
+    session_date,
+    direct_type,
+    landing_page_type,
+    device_category,
+    ${metrics.sessionMetrics()}
+  FROM direct_sessions
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(
+    SUM(IF(direct_type = 'probably_dark_social', sessions, 0)) OVER (PARTITION BY session_date),
+    SUM(sessions) OVER (PARTITION BY session_date)
+  ) AS dark_social_share_of_direct,
+  ${metrics.sessionRatios()},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM agg
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

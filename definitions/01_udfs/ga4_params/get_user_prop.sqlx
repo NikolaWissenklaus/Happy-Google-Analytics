@@ -1,0 +1,26 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "get_user_prop",
+  description: "User property value as STRING (user_properties array)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- same thing as get_param_any, but with a name that makes the query easier to read:
+--   ga4_udf.get_user_prop(user_properties, 'customer_tier')
+CREATE OR REPLACE FUNCTION ${self()}(user_properties ANY TYPE, property_key STRING) AS ((
+  SELECT COALESCE(
+    p.value.string_value,
+    CAST(p.value.int_value AS STRING),
+    CAST(p.value.double_value AS STRING),
+    CAST(p.value.float_value AS STRING)
+  )
+  FROM UNNEST(user_properties) AS p
+  WHERE p.key = property_key
+  LIMIT 1
+))
+OPTIONS (description = "User property value as STRING")

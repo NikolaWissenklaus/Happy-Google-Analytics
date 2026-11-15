@@ -1,0 +1,49 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_ltv_curves",
+  description: "LTV curves: cumulative revenue per acquired user by acquisition month and months since acquisition (0..24), with the share of the cohort that already bought. Compare the curve of each month to see if the new users are better or worse than the old ones (and how fast they pay back the CAC)",
+  bigquery: {
+    labels: { layer: "marts", domain: "cohorts" }
+  },
+  tags: ["marts", "cohorts", "daily", "ltv"]
+}
+
+WITH
+users AS (
+  SELECT user_key, DATE_TRUNC(first_seen_date, MONTH) AS cohort_month
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 24 MONTH)
+),
+
+monthly AS (
+  SELECT
+    u.cohort_month,
+    DATE_DIFF(DATE_TRUNC(t.transaction_date, MONTH), u.cohort_month, MONTH) AS months_since_acquisition,
+    SUM(t.revenue) AS revenue,
+    COUNT(DISTINCT t.user_key) AS buyers
+  FROM users AS u
+  JOIN ${ref("fct_transactions")} AS t USING (user_key)
+  WHERE t.is_valid_for_revenue
+  GROUP BY 1, 2
+),
+
+grid AS (
+  SELECT c.cohort_month, m AS months_since_acquisition, c.cohort_users
+  FROM (SELECT cohort_month, COUNT(*) AS cohort_users FROM users GROUP BY 1) AS c,
+    UNNEST(GENERATE_ARRAY(0, DATE_DIFF(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), c.cohort_month, MONTH))) AS m
+  WHERE m <= 24
+)
+
+SELECT
+  g.cohort_month,
+  g.months_since_acquisition,
+  g.cohort_users,
+  COALESCE(m.revenue, 0) AS revenue_in_month,
+  SAFE_DIVIDE(SUM(COALESCE(m.revenue, 0)) OVER (PARTITION BY g.cohort_month ORDER BY g.months_since_acquisition), g.cohort_users) AS cumulative_revenue_per_user,
+  SAFE_DIVIDE(COALESCE(m.buyers, 0), g.cohort_users) AS buyers_share_in_month,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM grid AS g
+LEFT JOIN monthly AS m USING (cohort_month, months_since_acquisition)

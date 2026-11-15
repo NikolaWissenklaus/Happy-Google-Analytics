@@ -1,0 +1,43 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.staging,
+  name: "stg_crm__customers",
+  disabled: !constants.ENABLE.crm,
+  description: "Backend customers. Email and phone are only kept HASHED (Google and Meta formats), the clear text stays in the CRM. LGPD by design",
+  bigquery: {
+    clusterBy: ["customer_id", "user_id"],
+    labels: { layer: "staging", source: "crm", pii: "hashed" }
+  },
+  tags: ["staging", "daily", "crm", "optional", "lgpd"],
+  columns: {
+    email_sha256_google: "SHA256 of the normalized email, Google rule (gmail dots removed)",
+    email_sha256_meta: "SHA256 of the normalized email, Meta rule",
+    phone_sha256_google: "SHA256 of the phone in E.164 with +",
+    phone_sha256_meta: "SHA256 of the phone, digits only with country code",
+    has_marketing_consent: "Opt-in for marketing communication in the CRM (LGPD art. 7, I)"
+  }
+}
+
+-- expected columns: customer_id, user_id, email, phone, created_at, city, state,
+--                   birth_date, opt_in_email, opt_in_whatsapp, opt_in_sms
+SELECT
+  CAST(customer_id AS STRING) AS customer_id,
+  CAST(user_id AS STRING) AS user_id,
+  ${ref("hash_email")}(CAST(email AS STRING), TRUE) AS email_sha256_google,
+  ${ref("hash_email")}(CAST(email AS STRING), FALSE) AS email_sha256_meta,
+  ${ref("hash_phone_br")}(CAST(phone AS STRING), TRUE) AS phone_sha256_google,
+  ${ref("hash_phone_br")}(CAST(phone AS STRING), FALSE) AS phone_sha256_meta,
+  LOWER(REGEXP_EXTRACT(CAST(email AS STRING), r'@(.+)$')) AS email_domain,
+  CAST(created_at AS TIMESTAMP) AS customer_created_ts,
+  ${ref("remove_accents")}(CAST(city AS STRING)) AS city,
+  UPPER(TRIM(CAST(state AS STRING))) AS state_uf,
+  DATE_DIFF(CURRENT_DATE(), SAFE_CAST(birth_date AS DATE), YEAR) AS age_years,
+  COALESCE(SAFE_CAST(opt_in_email AS BOOL), FALSE) AS opt_in_email,
+  COALESCE(SAFE_CAST(opt_in_whatsapp AS BOOL), FALSE) AS opt_in_whatsapp,
+  COALESCE(SAFE_CAST(opt_in_sms AS BOOL), FALSE) AS opt_in_sms,
+  COALESCE(SAFE_CAST(opt_in_email AS BOOL), FALSE) OR COALESCE(SAFE_CAST(opt_in_whatsapp AS BOOL), FALSE) OR COALESCE(SAFE_CAST(opt_in_sms AS BOOL), FALSE) AS has_marketing_consent,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ${ref(constants.CRM.customers_table)}
+QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(customer_id AS STRING) ORDER BY CAST(created_at AS TIMESTAMP) DESC) = 1

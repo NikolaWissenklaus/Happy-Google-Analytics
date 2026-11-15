@@ -1,0 +1,18 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "url_param",
+  description: "Value of a query string param in a url (case insensitive key). ex: url_param(page_location, 'utm_source')",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- key should be a simple name (letters, numbers, _ and -). no regex escaping here on purpose,
+-- keep it simple
+CREATE OR REPLACE FUNCTION ${self()}(url STRING, param_key STRING) RETURNS STRING AS (
+  REGEXP_EXTRACT(url, CONCAT('(?i)[?&#]', param_key, '=([^&#]*)'))
+)
+OPTIONS (description = "Query string param value from a url")

@@ -1,0 +1,71 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_bot_traffic_daily",
+  description: "Bot traffic per day, channel, source / medium and campaign (last 90 days): sessions, bot sessions (session or device signals), sessions of devices classified as bots, the top signals and the purchases inside 'bot' sessions (should be ~0: if not, a rule is too aggressive). Paid campaigns with high bot share = click fraud or bad placements",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["channel"],
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "media_quality"],
+  columns: {
+    top_signals: "The 5 signals that fired the most in the bot sessions of the row",
+    bot_sessions_with_purchase: "Real purchases inside sessions flagged as bot. Look at these before trusting the rules"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_date,
+    COALESCE(session_default_channel_group, 'Unassigned') AS channel,
+    COALESCE(session_source_medium, '(direct) / (none)') AS source_medium,
+    COALESCE(session_campaign, '(not set)') AS campaign,
+    is_bot_suspect,
+    is_bot_device,
+    has_purchase,
+    bot_signals
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(90)}
+),
+
+totals AS (
+  SELECT
+    session_date,
+    channel,
+    source_medium,
+    campaign,
+    COUNT(*) AS sessions,
+    COUNTIF(is_bot_suspect) AS bot_sessions,
+    COUNTIF(is_bot_device) AS sessions_of_bot_devices,
+    COUNTIF(is_bot_suspect AND has_purchase) AS bot_sessions_with_purchase
+  FROM sessions
+  GROUP BY 1, 2, 3, 4
+),
+
+signals AS (
+  SELECT
+    session_date,
+    channel,
+    source_medium,
+    campaign,
+    ARRAY_AGG(STRUCT(signal, sessions) ORDER BY sessions DESC LIMIT 5) AS top_signals
+  FROM (
+    SELECT session_date, channel, source_medium, campaign, signal, COUNT(*) AS sessions
+    FROM sessions, UNNEST(bot_signals) AS signal
+    WHERE is_bot_suspect
+    GROUP BY 1, 2, 3, 4, 5
+  )
+  GROUP BY 1, 2, 3, 4
+)
+
+SELECT
+  t.*,
+  SAFE_DIVIDE(t.bot_sessions, t.sessions) AS bot_share,
+  s.top_signals,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM totals AS t
+LEFT JOIN signals AS s USING (session_date, channel, source_medium, campaign)

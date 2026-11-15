@@ -1,0 +1,73 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_spc_nelson_rules",
+  description: "Method 7 - Statistical Process Control, Nelson rules over the z-scores (56 day baseline), the same rules factories use since the 80s: 1 point beyond 3 sigma, 9 in a row on the same side, 6 in a row going up/down, 2 of 3 beyond 2 sigma, 4 of 5 beyond 1 sigma",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["metric", "breakdown"],
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily"],
+  columns: {
+    rules_fired: "Which Nelson rules fired on the day (rule_1, rule_2, rule_3, rule_5, rule_6)"
+  }
+}
+
+WITH
+standardized AS (
+  SELECT
+    *,
+    AVG(value) OVER w AS expected,
+    SAFE_DIVIDE(value - AVG(value) OVER w, STDDEV_SAMP(value) OVER w) AS z
+  FROM ${ref("anom_metric_series_daily")}
+  WINDOW w AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY UNIX_DATE(metric_date) RANGE BETWEEN 56 PRECEDING AND 1 PRECEDING)
+),
+
+with_direction AS (
+  SELECT
+    *,
+    SIGN(value - LAG(value) OVER s) AS step_direction
+  FROM standardized
+  WINDOW s AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY metric_date)
+),
+
+rules AS (
+  SELECT
+    *,
+    ABS(z) > 3 AS rule_1,
+    ABS(SUM(SIGN(z)) OVER last_9) = 9 AND COUNT(z) OVER last_9 = 9 AS rule_2,
+    ABS(SUM(step_direction) OVER last_5) = 5 AND COUNT(step_direction) OVER last_5 = 5 AS rule_3,
+    COUNTIF(z > 2) OVER last_3 >= 2 OR COUNTIF(z < -2) OVER last_3 >= 2 AS rule_5,
+    COUNTIF(z > 1) OVER last_5 >= 4 OR COUNTIF(z < -1) OVER last_5 >= 4 AS rule_6
+  FROM with_direction
+  WINDOW
+    last_9 AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY metric_date ROWS BETWEEN 8 PRECEDING AND CURRENT ROW),
+    last_5 AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY metric_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
+    last_3 AS (PARTITION BY metric, breakdown, breakdown_value ORDER BY metric_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+)
+
+SELECT
+  metric_date,
+  metric,
+  breakdown,
+  breakdown_value,
+  value,
+  expected,
+  CAST(NULL AS FLOAT64) AS lower_bound,
+  CAST(NULL AS FLOAT64) AS upper_bound,
+  z AS score,
+  COALESCE(rule_1 OR rule_2 OR rule_3 OR rule_5 OR rule_6, FALSE) AS is_anomaly,
+  ARRAY_CONCAT(
+    IF(COALESCE(rule_1, FALSE), ['rule_1'], []),
+    IF(COALESCE(rule_2, FALSE), ['rule_2'], []),
+    IF(COALESCE(rule_3, FALSE), ['rule_3'], []),
+    IF(COALESCE(rule_5, FALSE), ['rule_5'], []),
+    IF(COALESCE(rule_6, FALSE), ['rule_6'], [])
+  ) AS rules_fired,
+  'nelson_rules' AS method,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rules
+WHERE metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 90 DAY)

@@ -1,0 +1,91 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_lifecycle_transitions",
+  description: "Lifecycle as a Markov chain: stage of each customer at the end of every month (last 12 months) and the transition matrix month to month with probabilities. 'Of the active customers of october, 61% stayed active, 22% went at risk, 17%...' and the steady state if nothing changes",
+  bigquery: {
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "data_science"],
+  columns: {
+    transition_probability: "customers going from from_stage to to_stage / customers in from_stage"
+  }
+}
+
+WITH
+month_ends AS (
+  SELECT LAST_DAY(m) AS month_end
+  FROM UNNEST(GENERATE_DATE_ARRAY(
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 13 MONTH),
+    DATE_SUB(DATE_TRUNC(CURRENT_DATE('${constants.TIMEZONE}'), MONTH), INTERVAL 1 MONTH),
+    INTERVAL 1 MONTH)) AS m
+),
+
+orders AS (
+  SELECT user_key, transaction_date
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+),
+
+stage_at_month_end AS (
+  SELECT
+    o.user_key,
+    m.month_end,
+    COUNT(*) AS orders_until_then,
+    DATE_DIFF(m.month_end, MAX(o.transaction_date), DAY) AS days_since_last_order,
+    COUNTIF(o.transaction_date > DATE_SUB(m.month_end, INTERVAL 1 MONTH)) AS orders_in_month
+  FROM month_ends AS m
+  JOIN orders AS o ON o.transaction_date <= m.month_end
+  GROUP BY 1, 2
+),
+
+classified AS (
+  SELECT
+    user_key,
+    month_end,
+    CASE
+      WHEN orders_until_then = orders_in_month THEN 'new_customer'
+      WHEN days_since_last_order <= 90 THEN 'active_customer'
+      WHEN days_since_last_order <= 180 THEN 'at_risk_customer'
+      WHEN days_since_last_order <= 365 THEN 'lapsed_customer'
+      ELSE 'churned_customer'
+    END AS stage
+  FROM stage_at_month_end
+),
+
+transitions AS (
+  SELECT
+    a.month_end AS from_month,
+    a.stage AS from_stage,
+    b.stage AS to_stage,
+    COUNT(*) AS customers
+  FROM classified AS a
+  JOIN classified AS b ON b.user_key = a.user_key AND b.month_end = LAST_DAY(DATE_ADD(a.month_end, INTERVAL 1 DAY))
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  'monthly' AS grain,
+  from_month,
+  from_stage,
+  to_stage,
+  customers,
+  SAFE_DIVIDE(customers, SUM(customers) OVER (PARTITION BY from_month, from_stage)) AS transition_probability,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM transitions
+
+UNION ALL
+
+-- average matrix of the period (use this one for planning)
+SELECT
+  'average_last_12m',
+  CAST(NULL AS DATE),
+  from_stage,
+  to_stage,
+  SUM(customers),
+  SAFE_DIVIDE(SUM(customers), SUM(SUM(customers)) OVER (PARTITION BY from_stage)),
+  CURRENT_TIMESTAMP()
+FROM transitions
+GROUP BY 3, 4

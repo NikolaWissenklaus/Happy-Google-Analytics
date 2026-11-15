@@ -1,0 +1,35 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_user_explorer",
+  description: "GA4 Explorations > User explorer: the timeline of a stitched user (all devices) in the last 30 days, one row per user with the sessions and the events in order. Query it WHERE user_key = '...' (the filter is pushed down)",
+  tags: ["reports", "ga4_report", "daily"]
+}
+
+SELECT
+  id.user_key,
+  ANY_VALUE(id.resolved_user_id) AS user_id,
+  COUNT(DISTINCT e.user_pseudo_id) AS devices,
+  COUNT(DISTINCT e.session_key) AS sessions,
+  MIN(e.event_ts) AS first_event_ts,
+  MAX(e.event_ts) AS last_event_ts,
+  ARRAY_AGG(STRUCT(
+    e.event_ts,
+    e.event_name,
+    e.session_key,
+    e.page_path,
+    e.page_title,
+    e.event_source,
+    e.event_medium,
+    e.device_category,
+    e.geo_city,
+    e.transaction_id,
+    COALESCE(e.purchase_revenue, e.event_value) AS value
+  ) ORDER BY e.event_ts DESC LIMIT 500) AS events_newest_first
+FROM ${ref("stg_ga4__events")} AS e
+JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+WHERE e.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  AND e.event_name NOT IN ('user_engagement', 'scroll')
+GROUP BY id.user_key

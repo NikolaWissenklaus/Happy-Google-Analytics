@@ -1,0 +1,61 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_benford_purchase_values",
+  description: "Benford's law test on the purchase values of the last 365 days (first digit). Natural transaction values follow Benford, fake / test / bot orders and broken value tracking (always the same value, value in cents, value sent as quantity) do not. Chi-square p value + Nigrini MAD conformity",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "stats"],
+  columns: {
+    mad_conformity: "Nigrini: < 0.006 close, < 0.012 acceptable, < 0.015 marginal, else nonconformity",
+    chi_square_p_value: "Same test across all digits (df = 8). With many orders it rejects easily, look at MAD too"
+  }
+}
+
+WITH
+first_digits AS (
+  SELECT CAST(SUBSTR(REGEXP_REPLACE(CAST(ROUND(revenue, 2) AS STRING), r'[^1-9]', ''), 1, 1) AS INT64) AS digit
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND revenue >= 1
+    AND NOT is_test_transaction
+),
+
+observed AS (
+  SELECT digit, COUNT(*) AS orders
+  FROM first_digits
+  WHERE digit BETWEEN 1 AND 9
+  GROUP BY digit
+),
+
+compared AS (
+  SELECT
+    d AS digit,
+    COALESCE(o.orders, 0) AS orders,
+    SUM(COALESCE(o.orders, 0)) OVER () AS total_orders,
+    ${ref("benford_expected")}(d) AS expected_share
+  FROM UNNEST(GENERATE_ARRAY(1, 9)) AS d
+  LEFT JOIN observed AS o ON o.digit = d
+)
+
+SELECT
+  digit,
+  orders,
+  SAFE_DIVIDE(orders, total_orders) AS observed_share,
+  expected_share,
+  SAFE_DIVIDE(orders, total_orders) - expected_share AS difference,
+  AVG(ABS(SAFE_DIVIDE(orders, total_orders) - expected_share)) OVER () AS mad_conformity,
+  ${ref("chi_square_pvalue")}(
+    SUM(SAFE_DIVIDE(POW(orders - total_orders * expected_share, 2), total_orders * expected_share)) OVER (), 8
+  ) AS chi_square_p_value,
+  CASE
+    WHEN AVG(ABS(SAFE_DIVIDE(orders, total_orders) - expected_share)) OVER () < 0.006 THEN 'close_conformity'
+    WHEN AVG(ABS(SAFE_DIVIDE(orders, total_orders) - expected_share)) OVER () < 0.012 THEN 'acceptable'
+    WHEN AVG(ABS(SAFE_DIVIDE(orders, total_orders) - expected_share)) OVER () < 0.015 THEN 'marginal'
+    ELSE 'nonconformity'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM compared

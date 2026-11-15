@@ -1,0 +1,74 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_ga4_mp_user_properties",
+  description: "Write back to GA4 with the Measurement Protocol: our traits (RFM, lifecycle, value tier, propensity band, CLV decile) as user properties of the device, so they show up in GA4 audiences, explorations and Google Ads. Only users that can_write_back_ga4, last device of each user, payload_json ready to POST to /mp/collect (web streams: client_id = user_pseudo_id)",
+  bigquery: {
+    labels: { layer: "activation", destination: "ga4" }
+  },
+  tags: ["activation", "daily", "ga4"],
+  columns: {
+    payload_json: "Body of the MP request. The event user_traits_sync is needed because MP does not accept a request without events",
+    traits_fingerprint: "Send only when it changed since the last run (MP has no 'upsert', every send is a new event)"
+  }
+}
+
+js {
+  // GA4 limit: user property values up to 36 chars
+  const v = expr => `STRUCT(SUBSTR(CAST(${expr} AS STRING), 1, 36) AS value)`;
+}
+
+WITH traits AS (
+  SELECT
+    e.user_key,
+    e.user_id,
+    e.user_pseudo_id,
+    e.latest_consent_ads,
+    COALESCE(l.lifecycle_stage, 'unknown') AS lifecycle_stage,
+    COALESCE(f.rfm_segment, 'unknown') AS rfm_segment,
+    COALESCE(f.value_tier, 'unknown') AS value_tier,
+    CASE
+      WHEN f.purchase_propensity >= 0.7 THEN 'high'
+      WHEN f.purchase_propensity >= 0.3 THEN 'medium'
+      WHEN f.purchase_propensity IS NOT NULL THEN 'low'
+      ELSE 'unknown'
+    END AS propensity_band,
+    COALESCE(CAST(b.clv_decile AS STRING), 'none') AS clv_decile
+  FROM ${ref("act_consent_eligible_users")} AS e
+  LEFT JOIN ${ref("aud_user_features")} AS f USING (user_key)
+  LEFT JOIN ${ref("seg_lifecycle")} AS l USING (user_key)
+  LEFT JOIN ${ref("ds_btyd_customer_clv")} AS b USING (user_key)
+  WHERE e.can_write_back_ga4
+    AND e.user_pseudo_id IS NOT NULL
+)
+
+SELECT
+  user_key,
+  user_pseudo_id AS client_id,
+  user_id,
+  lifecycle_stage,
+  rfm_segment,
+  value_tier,
+  propensity_band,
+  clv_decile,
+  FARM_FINGERPRINT(CONCAT(lifecycle_stage, '|', rfm_segment, '|', value_tier, '|', propensity_band, '|', clv_decile)) AS traits_fingerprint,
+  ${helpers.jsonStripNulls(`TO_JSON_STRING(STRUCT(
+    user_pseudo_id AS client_id,
+    user_id,
+    STRUCT(
+      IF(latest_consent_ads = 'granted', 'GRANTED', 'DENIED') AS ad_user_data,
+      IF(latest_consent_ads = 'granted', 'GRANTED', 'DENIED') AS ad_personalization
+    ) AS consent,
+    STRUCT(
+      ${v("lifecycle_stage")} AS hga_lifecycle,
+      ${v("rfm_segment")} AS hga_rfm_segment,
+      ${v("value_tier")} AS hga_value_tier,
+      ${v("propensity_band")} AS hga_propensity,
+      ${v("clv_decile")} AS hga_clv_decile
+    ) AS user_properties,
+    [STRUCT('user_traits_sync' AS name, STRUCT(1 AS engagement_time_msec) AS params)] AS events
+  ))`)} AS payload_json,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM traits

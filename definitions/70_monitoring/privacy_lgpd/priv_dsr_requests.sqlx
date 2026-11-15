@@ -1,0 +1,76 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_requests",
+  description: "Data subject requests (titulares, LGPD art. 18) with SLA, what we found for each one and where the deletion is. No identifiers here, only flags, so this one can go to a dashboard",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    due_date: "requested_at + cfg_privacy.dsr_sla_days (LGPD art. 19: 15 days for the complete answer)",
+    pipeline_status: "waiting_dpo_approval | approved_waiting_deletion_run | deleted_waiting_closure (close it in the source) | done | rejected | in_progress",
+    devices_found: "Devices (user_pseudo_id) linked to the request. 0 = we have nothing about this person in GA4"
+  }
+}
+
+WITH
+requests AS (
+  SELECT
+    CAST(request_id AS STRING) AS request_id,
+    LOWER(TRIM(request_type)) AS request_type,
+    LOWER(TRIM(status)) AS status,
+    CAST(requested_at AS DATE) AS requested_at,
+    NULLIF(TRIM(CAST(user_id AS STRING)), '') IS NOT NULL AS has_user_id,
+    NULLIF(TRIM(CAST(user_pseudo_id AS STRING)), '') IS NOT NULL AS has_user_pseudo_id
+  FROM ${ref(privacy.dsrSourceName())}
+),
+
+found AS (
+  SELECT
+    request_id,
+    COUNT(DISTINCT IF(id_type = 'user_pseudo_id', value, NULL)) AS devices_found,
+    COUNT(DISTINCT IF(id_type = 'user_key', value, NULL)) AS user_keys_found
+  FROM ${ref("priv_dsr_identifiers")}
+  GROUP BY request_id
+),
+
+deletions AS (
+  SELECT
+    request_id,
+    MIN(deleted_at) AS first_deleted_at,
+    MAX(deleted_at) AS last_deleted_at,
+    COUNT(DISTINCT IF(rows_deleted > 0, target_table, NULL)) AS tables_with_rows_deleted
+  FROM ${ref("priv_dsr_deletion_log")}, UNNEST(request_ids) AS request_id
+  GROUP BY request_id
+)
+
+SELECT
+  r.request_id,
+  r.request_type,
+  r.status,
+  r.requested_at,
+  r.has_user_id,
+  r.has_user_pseudo_id,
+  DATE_ADD(r.requested_at, INTERVAL ${cfg_privacy.dsr_sla_days} DAY) AS due_date,
+  DATE_DIFF(${helpers.today()}, r.requested_at, DAY) AS days_since_request,
+  COALESCE(f.devices_found, 0) AS devices_found,
+  COALESCE(f.user_keys_found, 0) AS user_keys_found,
+  d.first_deleted_at,
+  d.last_deleted_at,
+  d.tables_with_rows_deleted,
+  CASE
+    WHEN r.status IN ('done', 'rejected') THEN r.status
+    WHEN r.request_type IN ('deletion', 'anonymization') AND d.first_deleted_at IS NOT NULL THEN 'deleted_waiting_closure'
+    WHEN r.request_type IN ('deletion', 'anonymization') AND r.status = 'approved' THEN 'approved_waiting_deletion_run'
+    WHEN r.status = 'open' THEN 'waiting_dpo_approval'
+    ELSE 'in_progress'
+  END AS pipeline_status,
+  r.status NOT IN ('done', 'rejected')
+    AND ${helpers.today()} > DATE_ADD(r.requested_at, INTERVAL ${cfg_privacy.dsr_sla_days} DAY) AS is_overdue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM requests AS r
+LEFT JOIN found AS f USING (request_id)
+LEFT JOIN deletions AS d USING (request_id)

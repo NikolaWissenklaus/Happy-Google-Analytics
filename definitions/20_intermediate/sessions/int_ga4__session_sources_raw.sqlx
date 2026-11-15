@@ -1,0 +1,221 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.intermediate,
+  name: "int_ga4__session_sources_raw",
+  description: "Source of each session ONLY looking at the session itself (no carry over yet). All the GA4 export fixes for traffic are here: gclid without cpc, shopping free listings, payment gateway and self referrals, referrer fallback",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["user_pseudo_id"],
+    labels: { layer: "intermediate", domain: "attribution" }
+  },
+  tags: ["ga4", "intermediate", "daily", "attribution"],
+  columns: {
+    source: "Session source after the fixes, before the carry over. '(direct)' when nothing was found",
+    collected_source: "What GA4 collected (collected_traffic_source / params / utm), before our fixes",
+    fix_applied: "Which fix changed the source: google_click_id, microsoft_click_id, tiktok_click_id, google_shopping_free_listing, facebook_click_id, referrer_fallback",
+    excluded_referral_reason: "payment_gateway or self_referral when a referral was thrown away (becomes direct and gets the carry over)",
+    is_direct: "Session is direct after the fixes (candidate to inherit the last non-direct source)"
+  }
+}
+
+js {
+  const normalizedReferrer = channels.normalizeSource("external_referrer");
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+events_with_source_info AS (
+  SELECT
+    session_key,
+    user_pseudo_id,
+    event_date,
+    event_ts,
+    event_source,
+    event_medium,
+    event_campaign,
+    event_campaign_id,
+    event_term,
+    event_content,
+    event_source_platform,
+    gclid,
+    gbraid,
+    wbraid,
+    dclid,
+    srsltid,
+    fbclid,
+    msclkid,
+    ttclid,
+    ignore_referrer,
+    IF(referrer_hostname IS NOT NULL AND referrer_hostname != COALESCE(page_hostname, ''), referrer_hostname, NULL) AS external_referrer,
+    ga4_session_source,
+    ga4_session_medium,
+    ga4_session_campaign,
+    ga4_session_campaign_id,
+    ga4_session_default_channel_group,
+    google_ads_customer_id,
+    google_ads_account_name,
+    google_ads_campaign_id,
+    google_ads_campaign_name,
+    google_ads_ad_group_id,
+    google_ads_ad_group_name
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= DATE_SUB(run_from, INTERVAL 1 DAY)
+    AND session_key IS NOT NULL
+    ${helpers.noiseFilter()}
+),
+
+first_touch_of_session AS (
+  SELECT
+    session_key,
+    ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
+    MIN(event_date) AS session_date,
+    MIN(event_ts) AS session_start_ts,
+    ARRAY_AGG(
+      IF(event_source IS NOT NULL AND NOT ignore_referrer,
+        STRUCT(event_source AS source, event_medium AS medium, event_campaign AS campaign, event_campaign_id AS campaign_id,
+               event_term AS term, event_content AS content, event_source_platform AS source_platform),
+        NULL)
+      IGNORE NULLS ORDER BY event_ts LIMIT 1
+    )[SAFE_OFFSET(0)] AS collected,
+    ARRAY_AGG(gclid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS gclid,
+    ARRAY_AGG(gbraid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS gbraid,
+    ARRAY_AGG(wbraid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS wbraid,
+    ARRAY_AGG(dclid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS dclid,
+    ARRAY_AGG(srsltid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS srsltid,
+    ARRAY_AGG(fbclid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS fbclid,
+    ARRAY_AGG(msclkid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS msclkid,
+    ARRAY_AGG(ttclid IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS ttclid,
+    ARRAY_AGG(IF(ignore_referrer, NULL, external_referrer) IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS external_referrer,
+    ARRAY_AGG(
+      IF(COALESCE(ga4_session_source, ga4_session_default_channel_group) IS NOT NULL,
+        STRUCT(ga4_session_source AS source, ga4_session_medium AS medium, ga4_session_campaign AS campaign,
+               ga4_session_campaign_id AS campaign_id, ga4_session_default_channel_group AS default_channel_group),
+        NULL)
+      IGNORE NULLS ORDER BY event_ts LIMIT 1
+    )[SAFE_OFFSET(0)] AS ga4_native,
+    ARRAY_AGG(
+      IF(google_ads_campaign_id IS NOT NULL,
+        STRUCT(google_ads_customer_id AS customer_id, google_ads_account_name AS account_name, google_ads_campaign_id AS campaign_id,
+               google_ads_campaign_name AS campaign_name, google_ads_ad_group_id AS ad_group_id, google_ads_ad_group_name AS ad_group_name),
+        NULL)
+      IGNORE NULLS ORDER BY event_ts LIMIT 1
+    )[SAFE_OFFSET(0)] AS google_ads
+  FROM events_with_source_info
+  GROUP BY session_key
+),
+
+-- which fix (if any) applies. order matters, auto-tagging wins like in the GA4 default settings
+pick_fix AS (
+  SELECT
+    *,
+    CASE
+      WHEN COALESCE(gclid, gbraid, wbraid) IS NOT NULL
+        AND NOT COALESCE(collected.source = 'google' AND collected.medium = 'cpc', FALSE) THEN 'google_click_id'
+      WHEN msclkid IS NOT NULL AND (collected IS NULL OR collected.medium IN ('organic', 'referral', '(none)')) THEN 'microsoft_click_id'
+      WHEN ttclid IS NOT NULL AND (collected IS NULL OR collected.medium IN ('organic', 'referral', '(none)')) THEN 'tiktok_click_id'
+      WHEN srsltid IS NOT NULL
+        AND (collected IS NULL OR COALESCE(collected.source = 'google' AND collected.medium IN ('organic', 'referral', '(none)'), FALSE)) THEN 'google_shopping_free_listing'
+      WHEN collected IS NOT NULL THEN NULL
+      WHEN fbclid IS NOT NULL THEN 'facebook_click_id'
+      WHEN external_referrer IS NOT NULL THEN 'referrer_fallback'
+      ELSE NULL
+    END AS fix_applied
+  FROM first_touch_of_session
+),
+
+resolve_source AS (
+  SELECT
+    *,
+    CASE fix_applied
+      WHEN 'google_click_id' THEN 'google'
+      WHEN 'microsoft_click_id' THEN 'bing'
+      WHEN 'tiktok_click_id' THEN 'tiktok'
+      WHEN 'google_shopping_free_listing' THEN 'google'
+      WHEN 'facebook_click_id' THEN 'facebook'
+      WHEN 'referrer_fallback' THEN ${normalizedReferrer}
+      ELSE ${channels.normalizeSource("collected.source")}
+    END AS source_fixed,
+    CASE fix_applied
+      WHEN 'google_click_id' THEN 'cpc'
+      WHEN 'microsoft_click_id' THEN 'cpc'
+      WHEN 'tiktok_click_id' THEN 'cpc'
+      WHEN 'google_shopping_free_listing' THEN 'organic'
+      WHEN 'facebook_click_id' THEN 'referral'
+      WHEN 'referrer_fallback' THEN IF(${helpers.inList(normalizedReferrer, cfg_channels.search)}, 'organic', 'referral')
+      ELSE collected.medium
+    END AS medium_fixed,
+    CASE fix_applied
+      WHEN 'google_click_id' THEN LOWER(COALESCE(google_ads.campaign_name, collected.campaign))
+      -- "shopping" in the name makes GA4 rules call it Organic Shopping, which is what it is
+      WHEN 'google_shopping_free_listing' THEN '(shopping free listings)'
+      WHEN 'referrer_fallback' THEN NULL
+      WHEN 'facebook_click_id' THEN NULL
+      ELSE collected.campaign
+    END AS campaign_fixed
+  FROM pick_fix
+),
+
+-- payment gateways and our own domain are not traffic sources, they are "the user went
+-- to pay and came back". GA4 unwanted referrals should handle it, but old data says otherwise.
+drop_bad_referrals AS (
+  SELECT
+    *,
+    CASE
+      WHEN medium_fixed = 'referral' AND ${channels.isPaymentGateway("source_fixed")} THEN 'payment_gateway'
+      WHEN medium_fixed = 'referral' AND ${channels.isSelfReferral("source_fixed")} THEN 'self_referral'
+      ELSE NULL
+    END AS excluded_referral_reason
+  FROM resolve_source
+)
+
+SELECT
+  session_key,
+  user_pseudo_id,
+  session_date,
+  session_start_ts,
+  IF(excluded_referral_reason IS NULL, COALESCE(source_fixed, '(direct)'), '(direct)') AS source,
+  IF(excluded_referral_reason IS NULL, COALESCE(medium_fixed, IF(source_fixed IS NULL, '(none)', '(not set)')), '(none)') AS medium,
+  IF(excluded_referral_reason IS NULL, campaign_fixed, NULL) AS campaign,
+  IF(excluded_referral_reason IS NULL, COALESCE(collected.campaign_id, google_ads.campaign_id), NULL) AS campaign_id,
+  IF(excluded_referral_reason IS NULL, collected.term, NULL) AS term,
+  IF(excluded_referral_reason IS NULL, collected.content, NULL) AS content,
+  IF(excluded_referral_reason IS NULL, collected.source_platform, NULL) AS source_platform,
+  excluded_referral_reason IS NOT NULL
+    OR COALESCE(source_fixed, '(direct)') = '(direct)' AND COALESCE(medium_fixed, '(none)') IN ('(none)', '(not set)') AS is_direct,
+  collected.source AS collected_source,
+  collected.medium AS collected_medium,
+  collected.campaign AS collected_campaign,
+  fix_applied,
+  IF(excluded_referral_reason IS NULL, NULL, source_fixed) AS excluded_referral_source,
+  excluded_referral_reason,
+  external_referrer,
+  gclid,
+  gbraid,
+  wbraid,
+  dclid,
+  srsltid,
+  fbclid,
+  msclkid,
+  ttclid,
+  ga4_native.source AS ga4_native_source,
+  ga4_native.medium AS ga4_native_medium,
+  ga4_native.campaign AS ga4_native_campaign,
+  ga4_native.default_channel_group AS ga4_native_default_channel_group,
+  google_ads.customer_id AS google_ads_customer_id,
+  google_ads.account_name AS google_ads_account_name,
+  google_ads.campaign_id AS google_ads_campaign_id,
+  google_ads.campaign_name AS google_ads_campaign_name,
+  google_ads.ad_group_id AS google_ads_ad_group_id,
+  google_ads.ad_group_name AS google_ads_ad_group_name,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM drop_bad_referrals
+WHERE session_date >= run_from
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

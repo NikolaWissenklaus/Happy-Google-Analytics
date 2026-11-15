@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_ctr_opportunities",
+  disabled: !constants.ENABLE.search_console,
+  description: "Query + page pairs (last 28 days) with CTR below the expected CTR for their position, where expected = the site's OWN median CTR per position (not a generic industry curve). Extra clicks and extra revenue if the title / meta description reached the expected CTR",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo" }
+  },
+  tags: ["marts", "seo", "daily", "search_console", "optional"]
+}
+
+WITH
+pairs AS (
+  SELECT
+    query,
+    page_path,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SAFE_DIVIDE(SUM(sum_position), SUM(impressions)) + 1 AS position
+  FROM ${ref("stg_gsc__url_impressions")}
+  WHERE data_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 28 DAY)
+    AND search_type = 'WEB'
+    AND NOT is_anonymized_query
+  GROUP BY 1, 2
+  HAVING SUM(impressions) >= 100
+),
+
+ctr_curve AS (
+  SELECT
+    LEAST(CAST(ROUND(position) AS INT64), 20) AS position_bucket,
+    APPROX_QUANTILES(SAFE_DIVIDE(clicks, impressions), 2)[OFFSET(1)] AS expected_ctr
+  FROM pairs
+  GROUP BY 1
+),
+
+value_per_click AS (
+  SELECT page_path, revenue_per_click FROM ${ref("seo_landing_pages_gsc")}
+)
+
+SELECT
+  p.query,
+  p.page_path,
+  p.impressions,
+  p.clicks,
+  p.position,
+  SAFE_DIVIDE(p.clicks, p.impressions) AS ctr,
+  c.expected_ctr,
+  GREATEST(c.expected_ctr * p.impressions - p.clicks, 0) AS extra_clicks_possible,
+  GREATEST(c.expected_ctr * p.impressions - p.clicks, 0) * COALESCE(v.revenue_per_click, 0) AS extra_revenue_possible_28d,
+  REGEXP_CONTAINS(LOWER(p.query), r'(?i)${helpers.regexFromList(cfg_project.brand_terms, false)}') AS is_brand_query,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+JOIN ctr_curve AS c ON c.position_bucket = LEAST(CAST(ROUND(p.position) AS INT64), 20)
+LEFT JOIN value_per_click AS v USING (page_path)
+WHERE SAFE_DIVIDE(p.clicks, p.impressions) < c.expected_ctr * 0.7

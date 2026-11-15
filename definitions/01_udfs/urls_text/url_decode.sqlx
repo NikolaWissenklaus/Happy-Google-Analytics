@@ -1,0 +1,23 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "url_decode",
+  description: "decodeURIComponent with '+' as space. Returns the input when the string is not valid encoding",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- BigQuery still has no native url decode (2026...), so JS it is.
+-- search terms come like "t%C3%AAnis+azul" and this turns it into "tênis azul"
+CREATE OR REPLACE FUNCTION ${self()}(value STRING) RETURNS STRING LANGUAGE js AS r"""
+  if (value === null || value === undefined) return null;
+  try {
+    return decodeURIComponent(String(value).replace(/\+/g, ' '));
+  } catch (e) {
+    return value;
+  }
+"""
+OPTIONS (description = "URL decode")

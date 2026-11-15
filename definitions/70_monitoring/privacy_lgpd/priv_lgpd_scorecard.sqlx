@@ -1,0 +1,103 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_lgpd_scorecard",
+  description: "The DPO page: every LGPD check of today in one table (consent mode health, PII leaks, user_id, data subject requests SLA, inventory, masking, retention, activation only with consent), same format as dq_scorecard_daily, plus the overall LGPD score",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"],
+  columns: {
+    lgpd_score: "100 * weighted share of checks in pass (warn counts half). Same value in every row",
+    how_to_fix: "Where to look first"
+  }
+}
+
+WITH
+consent_7d AS (
+  SELECT
+    SAFE_DIVIDE(SUM(analytics_unknown_events), SUM(events)) AS unknown_share,
+    SAFE_DIVIDE(SUM(consent_mismatch_events), SUM(analytics_denied_events)) AS mismatch_share
+  FROM ${ref("priv_consent_daily")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+),
+
+user_ids_7d AS (
+  SELECT
+    SUM(email_user_ids + cpf_user_ids + phone_user_ids) AS pii_user_ids,
+    SUM(placeholder_user_ids) AS placeholder_user_ids
+  FROM ${ref("priv_user_id_quality")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+),
+
+checks AS (
+  SELECT 'consent' AS check_group, 'consent_mode_missing_share_7d' AS check_name, unknown_share AS value, 0.05 AS warn_at, 0.20 AS fail_at, 2 AS weight,
+    'priv_consent_by_page (looks_broken = TRUE) shows the pages without consent mode' AS how_to_fix
+  FROM consent_7d
+  UNION ALL
+  SELECT 'consent', 'consent_mismatch_share_7d', mismatch_share, 0.01, 0.05, 3,
+    'Tags firing with cookie after a denied consent. Check the CMP default state and hardcoded gtag'
+  FROM consent_7d
+  UNION ALL
+  SELECT 'pii', 'pii_leaks_open', CAST(COUNTIF(status IN ('new', 'active', 'intermittent')) AS FLOAT64), 1.0, 3.0, 3,
+    'priv_pii_summary has the field, an example (masked) and the fix'
+  FROM ${ref("priv_pii_summary")}
+  UNION ALL
+  SELECT 'pii', 'user_id_with_pii_7d', CAST(COALESCE(pii_user_ids, 0) AS FLOAT64), 1.0, 10.0, 3,
+    'user_id must be an internal id. priv_user_id_quality'
+  FROM user_ids_7d
+  UNION ALL
+  SELECT 'identity', 'user_id_placeholders_7d', CAST(COALESCE(placeholder_user_ids, 0) AS FLOAT64), 1.0, 5.0, 1,
+    'dataLayer sends undefined / null / 0 as user_id: thousands of people stitched together'
+  FROM user_ids_7d
+  UNION ALL
+  SELECT 'titulares', 'dsr_overdue', CAST(COUNTIF(is_overdue) AS FLOAT64), 1.0, 1.0, 3,
+    'priv_dsr_requests (pipeline_status shows where each one is stuck)'
+  FROM ${ref("priv_dsr_requests")}
+  UNION ALL
+  SELECT 'activation', 'activation_rows_without_permission', CAST(SUM(rows_not_allowed) AS FLOAT64), 1.0, 1.0, 3,
+    'priv_activation_consent_audit: some act_ table is not joining act_consent_eligible_users'
+  FROM ${ref("priv_activation_consent_audit")}
+  UNION ALL
+  SELECT 'inventory', 'inventory_classification_mismatch', CAST(COUNTIF(classification_mismatch) AS FLOAT64), 1.0, 5.0, 1,
+    'priv_data_inventory: personal data where cfg_privacy says aggregated'
+  FROM ${ref("priv_data_inventory")}
+  UNION ALL
+  SELECT 'config', 'pii_masking_off', ${constants.MASK_PII ? "0.0" : "1.0"}, 1.0, 1.0, 3,
+    'var mask_pii_in_urls = true'
+  UNION ALL
+  SELECT 'config', 'retention_purge_off', ${constants.ENABLE.retention_purge ? "0.0" : "1.0"}, 1.0, 2.0, 1,
+    'A decision for the DPO: data_retention_months + enable_retention_purge (look at priv_retention_preview first)'
+),
+
+with_status AS (
+  SELECT
+    ${helpers.today()} AS check_date,
+    *,
+    CASE
+      WHEN value IS NULL THEN 'no_data'
+      WHEN value >= fail_at THEN 'fail'
+      WHEN value >= warn_at THEN 'warn'
+      ELSE 'pass'
+    END AS status
+  FROM checks
+)
+
+SELECT
+  check_date,
+  check_group,
+  check_name,
+  value,
+  warn_at,
+  fail_at,
+  status,
+  weight,
+  how_to_fix,
+  ROUND(100 * SAFE_DIVIDE(
+    SUM(CASE status WHEN 'pass' THEN weight WHEN 'warn' THEN weight / 2 ELSE 0 END) OVER (),
+    SUM(IF(status = 'no_data', 0, weight)) OVER ()
+  ), 1) AS lgpd_score,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_status

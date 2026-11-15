@@ -1,0 +1,106 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "markov_removal_effects",
+  description: "Data driven attribution with a first order Markov chain: removal effect of each channel and its share of the conversions",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "attribution"]
+}
+
+-- input: one row per distinct path (array of channels in order) with how many times
+-- it converted and how many times it did not. same idea of the R package ChannelAttribution.
+--
+-- 1. build the transition probabilities (start -> c1 -> c2 -> ... -> conversion | null)
+-- 2. P(conversion) from start, solved by value iteration (the chain is absorbing, it converges)
+-- 3. remove a channel (everything that goes to it goes to null) and solve again
+-- 4. removal effect = 1 - P(conversion without channel) / P(conversion)
+-- 5. share = removal effect / sum of removal effects
+CREATE OR REPLACE FUNCTION ${self()}(
+  paths ARRAY<STRUCT<path ARRAY<STRING>, conversions FLOAT64, non_conversions FLOAT64>>
+)
+RETURNS ARRAY<STRUCT<channel STRING, removal_effect FLOAT64, share FLOAT64, base_conversion_probability FLOAT64>>
+LANGUAGE js AS r"""
+  var START = '(start)', CONV = '(conversion)', LOST = '(null)';
+  var counts = {};
+  var channels = {};
+
+  function add(from, to, w) {
+    if (!counts[from]) counts[from] = {};
+    counts[from][to] = (counts[from][to] || 0) + w;
+  }
+
+  for (var i = 0; i < (paths || []).length; i++) {
+    var row = paths[i];
+    if (!row || !row.path || row.path.length === 0) continue;
+    var conv = row.conversions || 0;
+    var lost = row.non_conversions || 0;
+    var total = conv + lost;
+    if (total <= 0) continue;
+    var prev = START;
+    for (var j = 0; j < row.path.length; j++) {
+      var ch = row.path[j];
+      if (ch === null || ch === undefined || ch === '') ch = '(unknown)';
+      channels[ch] = true;
+      add(prev, ch, total);
+      prev = ch;
+    }
+    if (conv > 0) add(prev, CONV, conv);
+    if (lost > 0) add(prev, LOST, lost);
+  }
+
+  var probs = {};
+  Object.keys(counts).forEach(function (from) {
+    var tos = counts[from];
+    var sum = 0;
+    Object.keys(tos).forEach(function (to) { sum += tos[to]; });
+    probs[from] = {};
+    Object.keys(tos).forEach(function (to) { probs[from][to] = tos[to] / sum; });
+  });
+
+  var states = Object.keys(probs);
+
+  function conversionProbability(removed) {
+    var P = {};
+    states.forEach(function (s) { P[s] = 0; });
+    for (var it = 0; it < 5000; it++) {
+      var delta = 0;
+      for (var k = 0; k < states.length; k++) {
+        var s = states[k];
+        if (s === removed) continue;
+        var v = 0;
+        var tos = probs[s];
+        for (var to in tos) {
+          if (to === removed || to === LOST) continue;
+          v += tos[to] * (to === CONV ? 1 : (P[to] || 0));
+        }
+        var diff = Math.abs(v - P[s]);
+        if (diff > delta) delta = diff;
+        P[s] = v;
+      }
+      if (delta < 1e-12) break;
+    }
+    return P[START] || 0;
+  }
+
+  var base = conversionProbability(null);
+  var names = Object.keys(channels);
+  if (base <= 0 || names.length === 0) return [];
+
+  var effects = names.map(function (ch) {
+    return Math.max(0, 1 - conversionProbability(ch) / base);
+  });
+  var totalEffect = effects.reduce(function (acc, e) { return acc + e; }, 0);
+
+  return names.map(function (ch, i) {
+    return {
+      channel: ch,
+      removal_effect: effects[i],
+      share: totalEffect > 0 ? effects[i] / totalEffect : null,
+      base_conversion_probability: base
+    };
+  });
+"""
+OPTIONS (description = "Markov chain removal effects")

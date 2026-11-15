@@ -1,0 +1,17 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "has_param",
+  description: "TRUE when the param key exists in the array (even with NULL value)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily"]
+}
+
+-- useful to check tracking: "how many add_to_cart came without currency?"
+CREATE OR REPLACE FUNCTION ${self()}(params ANY TYPE, param_key STRING) AS (
+  EXISTS(SELECT 1 FROM UNNEST(params) AS p WHERE p.key = param_key)
+)
+OPTIONS (description = "TRUE when the param key exists")

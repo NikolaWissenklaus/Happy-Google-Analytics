@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_category_basket_rules",
+  description: "Association rules at category level (last 365 days). Less sparse than items, gives the merchandising team the 'mission' of the baskets (ex: shoes -> socks has lift 4)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "data_science"]
+}
+
+WITH
+baskets AS (
+  SELECT DISTINCT t.transaction_id, COALESCE(d.item_category, t.item_category, '(not set)') AS category
+  FROM ${ref("fct_transaction_items")} AS t
+  LEFT JOIN ${ref("dim_items")} AS d USING (item_id)
+  WHERE t.transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND t.is_valid_for_revenue
+),
+
+total_orders AS (SELECT COUNT(DISTINCT transaction_id) AS orders FROM baskets),
+category_orders AS (SELECT category, COUNT(*) AS orders_with_category FROM baskets GROUP BY 1),
+
+pairs AS (
+  SELECT a.category AS category_a, b.category AS category_b, COUNT(*) AS orders_with_both
+  FROM baskets AS a
+  JOIN baskets AS b ON a.transaction_id = b.transaction_id AND a.category != b.category
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= 10
+)
+
+SELECT
+  p.category_a,
+  p.category_b,
+  p.orders_with_both,
+  SAFE_DIVIDE(p.orders_with_both, t.orders) AS support,
+  SAFE_DIVIDE(p.orders_with_both, ca.orders_with_category) AS confidence,
+  SAFE_DIVIDE(SAFE_DIVIDE(p.orders_with_both, ca.orders_with_category), SAFE_DIVIDE(cb.orders_with_category, t.orders)) AS lift,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+CROSS JOIN total_orders AS t
+JOIN category_orders AS ca ON ca.category = p.category_a
+JOIN category_orders AS cb ON cb.category = p.category_b

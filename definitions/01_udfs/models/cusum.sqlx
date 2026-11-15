@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "cusum",
+  description: "Two sided tabular CUSUM over a standardized series (z scores, in date order). Resets after each alarm",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "anomaly"]
+}
+
+-- CUSUM catches small and persistent shifts that z-score ignores (ex: conversion rate dropping
+-- 8% for 10 days after a deploy). k = slack (0.5 sigma), h = decision interval (4 or 5 sigma).
+-- S_high(t) = max(0, S_high(t-1) + z(t) - k)   S_low(t) = max(0, S_low(t-1) - z(t) - k)
+-- input array cannot have NULLs (bigquery rule), send COALESCE(z, 0)
+CREATE OR REPLACE FUNCTION ${self()}(standardized_values ARRAY<FLOAT64>, k FLOAT64, h FLOAT64)
+RETURNS ARRAY<STRUCT<s_high FLOAT64, s_low FLOAT64, alarm_high BOOL, alarm_low BOOL>>
+LANGUAGE js AS r"""
+  var slack = (k === null) ? 0.5 : k;
+  var limit = (h === null) ? 5 : h;
+  var out = [];
+  var hi = 0, lo = 0;
+  var values = standardized_values || [];
+  for (var i = 0; i < values.length; i++) {
+    var z = values[i];
+    if (z === null || z === undefined || isNaN(z)) z = 0;
+    hi = Math.max(0, hi + z - slack);
+    lo = Math.max(0, lo - z - slack);
+    var alarmHigh = hi > limit;
+    var alarmLow = lo > limit;
+    out.push({ s_high: hi, s_low: lo, alarm_high: alarmHigh, alarm_low: alarmLow });
+    if (alarmHigh) hi = 0;
+    if (alarmLow) lo = 0;
+  }
+  return out;
+"""
+OPTIONS (description = "Tabular CUSUM")

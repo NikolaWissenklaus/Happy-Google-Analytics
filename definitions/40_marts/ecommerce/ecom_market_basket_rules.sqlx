@@ -1,0 +1,67 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_market_basket_rules",
+  description: "Market basket analysis (association rules) on the orders of the last 365 days: for item A -> item B, support, confidence and lift. Lift > 1 = bought together more than by chance. Kits, cross sell, 'who bought this also bought'",
+  bigquery: {
+    clusterBy: ["item_a"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "data_science"],
+  columns: {
+    support: "orders with A and B / all orders",
+    confidence: "orders with A and B / orders with A  (P(B | A))",
+    lift: "confidence / P(B). 3 = B is 3x more likely when A is in the basket"
+  }
+}
+
+js {
+  const minPairOrders = 5;
+}
+
+WITH
+baskets AS (
+  SELECT DISTINCT transaction_id, item_id
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 365 DAY)
+    AND is_valid_for_revenue
+    AND item_id IS NOT NULL
+),
+
+total_orders AS (
+  SELECT COUNT(DISTINCT transaction_id) AS orders FROM baskets
+),
+
+item_orders AS (
+  SELECT item_id, COUNT(*) AS orders_with_item FROM baskets GROUP BY item_id
+),
+
+-- only multi item orders can make pairs
+pairs AS (
+  SELECT a.item_id AS item_a, b.item_id AS item_b, COUNT(*) AS orders_with_both
+  FROM baskets AS a
+  JOIN baskets AS b ON a.transaction_id = b.transaction_id AND a.item_id != b.item_id
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${minPairOrders}
+)
+
+SELECT
+  p.item_a,
+  da.item_name AS item_a_name,
+  p.item_b,
+  db.item_name AS item_b_name,
+  p.orders_with_both,
+  ia.orders_with_item AS orders_with_a,
+  ib.orders_with_item AS orders_with_b,
+  SAFE_DIVIDE(p.orders_with_both, t.orders) AS support,
+  SAFE_DIVIDE(p.orders_with_both, ia.orders_with_item) AS confidence,
+  SAFE_DIVIDE(SAFE_DIVIDE(p.orders_with_both, ia.orders_with_item), SAFE_DIVIDE(ib.orders_with_item, t.orders)) AS lift,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+CROSS JOIN total_orders AS t
+JOIN item_orders AS ia ON ia.item_id = p.item_a
+JOIN item_orders AS ib ON ib.item_id = p.item_b
+LEFT JOIN ${ref("dim_items")} AS da ON da.item_id = p.item_a
+LEFT JOIN ${ref("dim_items")} AS db ON db.item_id = p.item_b

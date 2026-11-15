@@ -1,0 +1,36 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_exit_pages",
+  description: "Exit rate per page (last 30 days) with Wilson interval, compared with the median of the same page type. Exits from cart and checkout pages are money walking out the door",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily"]
+}
+
+WITH per_page AS (
+  SELECT
+    page_path,
+    ANY_VALUE(page_type) AS page_type,
+    COUNT(*) AS views,
+    COUNTIF(is_exit) AS exits,
+    COUNTIF(is_exit AND interactions_on_page = 0) AS exits_without_interaction
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+  GROUP BY page_path
+  HAVING COUNT(*) >= 100
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(exits, views) AS exit_rate,
+  ${helpers.wilsonLower("exits", "views")} AS exit_rate_wilson_low,
+  PERCENTILE_CONT(SAFE_DIVIDE(exits, views), 0.5) OVER (PARTITION BY page_type) AS page_type_median_exit_rate,
+  SAFE_DIVIDE(exits_without_interaction, exits) AS silent_exit_share,
+  page_type IN ('cart', 'checkout') AS is_money_page,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_page

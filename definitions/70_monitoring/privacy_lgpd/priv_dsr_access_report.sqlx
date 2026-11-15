@@ -1,0 +1,58 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_dsr_access_report",
+  description: "What we have about each person that asked for access / confirmation / portability (LGPD art. 18 I, II and V): activity, devices, where they came from, purchases, consent, user properties and the audiences they are in today. The DPO answers the titular with this",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "privacy" }
+  },
+  tags: ["monitoring", "lgpd", "daily"]
+}
+
+WITH
+access_requests AS (
+  SELECT DISTINCT request_id, value AS user_key
+  FROM ${ref("priv_dsr_identifiers")}
+  WHERE id_type = 'user_key'
+    AND request_type IN ('access', 'confirmation', 'portability')
+    AND status NOT IN ('done', 'rejected')
+),
+
+audiences_today AS (
+  SELECT user_key, ARRAY_AGG(DISTINCT audience_name ORDER BY audience_name) AS audiences
+  FROM ${ref("aud_memberships_today")}
+  GROUP BY user_key
+)
+
+SELECT
+  a.request_id,
+  u.user_key,
+  u.is_identified,
+  u.devices,
+  u.device_categories,
+  u.first_seen_date,
+  u.last_seen_date,
+  u.sessions,
+  u.views,
+  u.engagement_time_sec,
+  u.key_events,
+  u.transactions,
+  u.lifetime_revenue,
+  u.first_channel,
+  u.first_source,
+  u.first_medium,
+  u.first_campaign,
+  u.first_country,
+  u.first_uf,
+  u.last_uf,
+  u.last_city,
+  u.latest_consent_analytics,
+  u.latest_consent_ads,
+  u.user_properties,
+  COALESCE(au.audiences, []) AS audiences_today,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM access_requests AS a
+JOIN ${ref("dim_users")} AS u USING (user_key)
+LEFT JOIN audiences_today AS au USING (user_key)

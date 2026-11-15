@@ -1,0 +1,51 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.core,
+  name: "fct_user_daily",
+  description: "One row per user (user_key) per active day. Base of DAU/WAU/MAU, stickiness, retention, cohorts, lifecycle and the power user curve",
+  bigquery: {
+    partitionBy: "activity_date",
+    clusterBy: ["user_key"],
+    labels: { layer: "core", domain: "users" }
+  },
+  tags: ["ga4", "core", "daily", "users"],
+  columns: {
+    activity_date: "Day with at least one session",
+    is_first_day: "First day we ever saw this user",
+    days_since_first_seen: "Age of the user in days on this activity day"
+  }
+}
+
+WITH per_day AS (
+  SELECT
+    user_key,
+    session_date AS activity_date,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(page_views + screen_views) AS views,
+    SUM(engagement_time_sec) AS engagement_time_sec,
+    SUM(key_events) AS key_events,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    LOGICAL_OR(has_add_to_cart) AS added_to_cart,
+    LOGICAL_OR(is_new_user) AS had_new_user_session,
+    ARRAY_AGG(session_default_channel_group ORDER BY session_start_ts LIMIT 1)[OFFSET(0)] AS first_channel_of_day,
+    ARRAY_AGG(device_category ORDER BY session_start_ts LIMIT 1)[OFFSET(0)] AS first_device_of_day,
+    COUNT(DISTINCT device_category) AS device_categories,
+    LOGICAL_OR(platform = 'WEB') AS used_web,
+    LOGICAL_OR(platform IN ('ANDROID', 'IOS')) AS used_app
+  FROM ${ref("fct_sessions")}
+  WHERE TRUE ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+)
+
+SELECT
+  *,
+  MIN(activity_date) OVER (PARTITION BY user_key) AS first_seen_date,
+  activity_date = MIN(activity_date) OVER (PARTITION BY user_key) AS is_first_day,
+  DATE_DIFF(activity_date, MIN(activity_date) OVER (PARTITION BY user_key), DAY) AS days_since_first_seen,
+  DATE_DIFF(activity_date, LAG(activity_date) OVER (PARTITION BY user_key ORDER BY activity_date), DAY) AS days_since_previous_activity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_day

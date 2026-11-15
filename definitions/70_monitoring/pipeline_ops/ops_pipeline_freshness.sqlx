@@ -1,0 +1,60 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ops,
+  name: "ops_pipeline_freshness",
+  description: "Did last night run? Per incremental model: last load, last run_from, mode, runs in 7 days and how late it is. Plus the daily tables that were not written in the last 30 hours. The first thing to look at when a dashboard looks weird in the morning",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ops" }
+  },
+  tags: ["ops", "daily"],
+  columns: {
+    object_kind: "incremental (from the watermarks) | table (from TABLE_STORAGE)",
+    is_late: "Incremental: no load in 30 hours. Table: not written in 30 hours (daily ones)"
+  }
+}
+
+WITH
+incrementals AS (
+  SELECT
+    model,
+    MAX(loaded_at) AS last_loaded_at,
+    ARRAY_AGG(run_from ORDER BY loaded_at DESC LIMIT 1)[OFFSET(0)] AS last_run_from,
+    ARRAY_AGG(run_mode ORDER BY loaded_at DESC LIMIT 1)[OFFSET(0)] AS last_run_mode,
+    COUNTIF(loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)) AS runs_last_7d,
+    COUNTIF(run_mode = 'full_refresh' AND loaded_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)) AS full_refreshes_last_30d
+  FROM ${ref("ops_incremental_watermarks")}
+  GROUP BY model
+)
+
+SELECT
+  'incremental' AS object_kind,
+  model AS object_name,
+  last_loaded_at,
+  last_run_from,
+  last_run_mode,
+  runs_last_7d,
+  full_refreshes_last_30d,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_loaded_at, HOUR) AS hours_since_load,
+  TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), last_loaded_at, HOUR) > 30 AS is_late,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM incrementals
+
+UNION ALL
+
+SELECT
+  'table',
+  CONCAT(dataset, '.', table_name),
+  last_modified_at,
+  CAST(NULL AS DATE),
+  CAST(NULL AS STRING),
+  CAST(NULL AS INT64),
+  CAST(NULL AS INT64),
+  hours_since_change,
+  hours_since_change > 30,
+  CURRENT_TIMESTAMP()
+FROM ${ref("ops_table_inventory")}
+WHERE table_type = 'BASE TABLE'
+  -- tables written by the daily run (seeds and the bootstrap ones too, they are recreated every day)
+  AND dataset NOT IN ('${constants.SCHEMAS.udf}')

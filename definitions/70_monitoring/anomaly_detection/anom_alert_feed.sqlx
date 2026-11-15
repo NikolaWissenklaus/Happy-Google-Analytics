@@ -1,0 +1,65 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.anomaly,
+  name: "anom_alert_feed",
+  description: "Ready to send alerts of the last 3 days (severity medium+), one line each, with a human message and the main root cause. tools/alerts/send_alerts.py reads this table and posts to Slack / Google Chat / email",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "anomaly" }
+  },
+  tags: ["monitoring", "anomaly", "daily", "alerts"],
+  columns: {
+    message: "ex: '[high] revenue on 2026-11-12 was 23.9k, -31% vs usual (34.6k). 6/8 methods agree. Main cause: device_browser = Safari (68% of the change)'"
+  }
+}
+
+WITH
+recent_alerts AS (
+  SELECT *
+  FROM ${ref("anom_ensemble")}
+  WHERE is_alert
+    AND severity IN ('medium', 'high', 'critical')
+    AND metric_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 3 DAY)
+),
+
+main_cause AS (
+  SELECT
+    alert_date,
+    metric,
+    ARRAY_AGG(STRUCT(dimension, dimension_value, share_of_change) ORDER BY ABS(share_of_change) DESC LIMIT 1)[OFFSET(0)] AS cause
+  FROM ${ref("anom_root_cause")}
+  WHERE cause_rank = 1
+    AND share_of_change BETWEEN 0 AND 1.5
+  GROUP BY 1, 2
+)
+
+SELECT
+  a.metric_date,
+  a.metric,
+  a.breakdown,
+  a.breakdown_value,
+  a.severity,
+  a.direction,
+  a.value,
+  a.expected_same_weekday,
+  a.deviation_pct,
+  a.votes,
+  a.methods_available,
+  a.methods_flagged,
+  a.special_day_name,
+  c.cause.dimension AS cause_dimension,
+  c.cause.dimension_value AS cause_value,
+  c.cause.share_of_change AS cause_share,
+  CONCAT(
+    '[', a.severity, '] ', a.metric,
+    IF(a.breakdown = 'all', '', CONCAT(' (', a.breakdown, ' = ', a.breakdown_value, ')')),
+    ' on ', CAST(a.metric_date AS STRING), ' was ', FORMAT('%.4g', a.value),
+    ', ', FORMAT('%+.0f', 100 * COALESCE(a.deviation_pct, 0)), '% vs usual (', FORMAT('%.4g', a.expected_same_weekday), '). ',
+    CAST(a.votes AS STRING), '/', CAST(a.methods_available AS STRING), ' methods agree.',
+    IF(a.special_day_name IS NULL, '', CONCAT(' Special day: ', a.special_day_name, '.')),
+    IF(c.cause IS NULL, '', CONCAT(' Main cause: ', c.cause.dimension, ' = ', c.cause.dimension_value, ' (', FORMAT('%.0f', 100 * c.cause.share_of_change), '% of the change)'))
+  ) AS message,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM recent_alerts AS a
+LEFT JOIN main_cause AS c ON c.alert_date = a.metric_date AND c.metric = a.metric AND a.breakdown = 'all'

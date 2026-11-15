@@ -1,0 +1,66 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_feature_adoption",
+  description: "Adoption of the product features (cfg_project.features) in the last 30 days, and how adopters behave vs non adopters: conversion and return rate. Correlation, not causation, but it tells where to look",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily"],
+  columns: {
+    adoption_rate: "users that used the feature / active users",
+    conversion_lift: "conversion of adopters / conversion of non adopters"
+  }
+}
+
+js {
+  const features = cfg_project.features;
+}
+
+WITH
+active_users AS (
+  SELECT
+    s.user_key,
+    LOGICAL_OR(s.has_purchase) AS purchased,
+    COUNT(DISTINCT s.session_date) AS active_days
+  FROM ${ref("fct_sessions")} AS s
+  WHERE s.session_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    ${helpers.martSessionFilter("s")}
+  GROUP BY 1
+),
+
+feature_users AS (
+  SELECT DISTINCT
+    CASE ${features.map(f => `WHEN e.event_name = '${f.event_name}' THEN '${f.feature}'`).join(" ")} END AS feature,
+    id.user_key
+  FROM ${ref("stg_ga4__events")} AS e
+  JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  WHERE e.event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND e.event_name IN (${helpers.sqlList(features.map(f => f.event_name))})
+    ${helpers.noiseFilter("e")}
+),
+
+features AS (
+  SELECT feature FROM UNNEST([${helpers.sqlList(features.map(f => f.feature))}]) AS feature
+)
+
+SELECT
+  f.feature,
+  COUNT(DISTINCT a.user_key) AS active_users,
+  COUNT(DISTINCT fu.user_key) AS adopters,
+  SAFE_DIVIDE(COUNT(DISTINCT fu.user_key), COUNT(DISTINCT a.user_key)) AS adoption_rate,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(fu.user_key IS NOT NULL AND a.purchased, a.user_key, NULL)), COUNT(DISTINCT fu.user_key)) AS adopter_conversion,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(fu.user_key IS NULL AND a.purchased, a.user_key, NULL)), COUNT(DISTINCT IF(fu.user_key IS NULL, a.user_key, NULL))) AS non_adopter_conversion,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(COUNT(DISTINCT IF(fu.user_key IS NOT NULL AND a.purchased, a.user_key, NULL)), COUNT(DISTINCT fu.user_key)),
+    SAFE_DIVIDE(COUNT(DISTINCT IF(fu.user_key IS NULL AND a.purchased, a.user_key, NULL)), COUNT(DISTINCT IF(fu.user_key IS NULL, a.user_key, NULL)))
+  ) AS conversion_lift,
+  AVG(IF(fu.user_key IS NOT NULL, a.active_days, NULL)) AS adopter_avg_active_days,
+  AVG(IF(fu.user_key IS NULL, a.active_days, NULL)) AS non_adopter_avg_active_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM features AS f
+CROSS JOIN active_users AS a
+LEFT JOIN feature_users AS fu ON fu.feature = f.feature AND fu.user_key = a.user_key
+GROUP BY f.feature

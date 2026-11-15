@@ -1,0 +1,47 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_navigation_summary",
+  description: "UA Behavior > Site Content > Navigation Summary (last 30 days): for every page, where people came from (previous page path, '(entrance)') and where they went next (next page path, '(exit)'), top 10 each with the share. The report that GA4 removed and every UX person misses",
+  bigquery: {
+    clusterBy: ["page_path"],
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"],
+  columns: {
+    direction: "previous (came from) | next (went to)"
+  }
+}
+
+WITH
+views AS (
+  SELECT page_path, COALESCE(previous_page_path, '(entrance)') AS previous_page, COALESCE(next_page_path, '(exit)') AS next_page
+  FROM ${ref("int_ga4__page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT is_reload
+),
+
+both_directions AS (
+  SELECT page_path, 'previous' AS direction, previous_page AS other_page FROM views
+  UNION ALL
+  SELECT page_path, 'next', next_page FROM views
+),
+
+counted AS (
+  SELECT page_path, direction, other_page, COUNT(*) AS pageviews
+  FROM both_directions
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  page_path,
+  direction,
+  other_page,
+  pageviews,
+  SAFE_DIVIDE(pageviews, SUM(pageviews) OVER (PARTITION BY page_path, direction)) AS share,
+  ROW_NUMBER() OVER (PARTITION BY page_path, direction ORDER BY pageviews DESC) AS rank_in_direction,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM counted
+QUALIFY rank_in_direction <= 10

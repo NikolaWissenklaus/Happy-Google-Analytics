@@ -1,0 +1,38 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_item_catalog_consistency",
+  description: "Catalog consistency as seen by GA4 (last 30 days): item_id with many names or categories, items without category / brand, same name with different ids, and items whose price jumps a lot inside the same day (tracking sending the installment value or the price without discount)",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "ecommerce"]
+}
+
+WITH
+items AS (
+  SELECT *
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+    AND NOT is_internal_traffic
+)
+
+SELECT 'item_id_with_many_names' AS problem, item_id AS object, CAST(COUNT(DISTINCT item_name) AS STRING) AS detail, COUNT(*) AS events
+FROM items WHERE item_id IS NOT NULL GROUP BY item_id HAVING COUNT(DISTINCT item_name) > 1
+UNION ALL
+SELECT 'item_id_with_many_categories', item_id, CAST(COUNT(DISTINCT item_category) AS STRING), COUNT(*)
+FROM items WHERE item_id IS NOT NULL GROUP BY item_id HAVING COUNT(DISTINCT item_category) > 1
+UNION ALL
+SELECT 'item_name_with_many_ids', item_name, CAST(COUNT(DISTINCT item_id) AS STRING), COUNT(*)
+FROM items WHERE item_name IS NOT NULL GROUP BY item_name HAVING COUNT(DISTINCT item_id) > 3
+UNION ALL
+SELECT 'item_without_category', item_id, ANY_VALUE(item_name), COUNT(*)
+FROM items WHERE item_id IS NOT NULL AND item_category IS NULL GROUP BY item_id
+UNION ALL
+SELECT 'item_without_brand', item_id, ANY_VALUE(item_name), COUNT(*)
+FROM items WHERE item_id IS NOT NULL AND item_brand IS NULL GROUP BY item_id
+UNION ALL
+SELECT 'price_unstable_in_same_day', CONCAT(item_id, ' @ ', CAST(event_date AS STRING)), CONCAT(CAST(MIN(price) AS STRING), ' .. ', CAST(MAX(price) AS STRING)), COUNT(*)
+FROM items WHERE item_id IS NOT NULL AND price > 0 GROUP BY item_id, event_date HAVING SAFE_DIVIDE(MAX(price), MIN(price)) > 3

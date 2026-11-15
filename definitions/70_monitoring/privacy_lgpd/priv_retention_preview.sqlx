@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.privacy,
+  name: "priv_retention_preview",
+  description: "Dry run of the retention purge, always on: per user level table, the oldest date it has and how many rows are older than data_retention_months. Raw export shards older than the cutoff are listed too. Cheap, it only counts partitions",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["monitoring", "lgpd", "daily"]
+}
+
+DECLARE cutoff DATE DEFAULT DATE_SUB(${helpers.today()}, INTERVAL ${constants.PRIVACY.retention_months} MONTH);
+
+CREATE OR REPLACE TABLE ${self()} (
+  target_table STRING,
+  partition_column STRING,
+  cutoff_date DATE,
+  oldest_date DATE,
+  older_than_cutoff INT64 OPTIONS (description = "How much would go away: rows for our tables, shards (days) for the raw export"),
+  unit STRING OPTIONS (description = "rows | shards"),
+  checked_at TIMESTAMP
+)
+OPTIONS (description = "LGPD retention dry run");
+
+FOR t IN (${privacy.partitionedUserTablesSql()}) DO
+  EXECUTE IMMEDIATE FORMAT(
+    "INSERT INTO ${self()} SELECT '%s.%s', '%s', @cutoff, MIN(%s), COUNTIF(%s < @cutoff), 'rows', CURRENT_TIMESTAMP() FROM `${constants.PROJECT}.%s.%s`",
+    t.table_schema, t.table_name, t.partition_column, t.partition_column, t.partition_column, t.table_schema, t.table_name
+  ) USING cutoff AS cutoff;
+END FOR;
+
+-- raw export shards (only counted, never touched here)
+INSERT INTO ${self()}
+SELECT
+  CONCAT('${constants.GA4_DATASET}.', REGEXP_EXTRACT(table_name, r'^(.*)_\d{8}$'), '_*') AS target_table,
+  '_TABLE_SUFFIX' AS partition_column,
+  cutoff AS cutoff_date,
+  MIN(PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(table_name, r'(\d{8})$'))) AS oldest_date,
+  COUNTIF(PARSE_DATE('%Y%m%d', REGEXP_EXTRACT(table_name, r'(\d{8})$')) < cutoff) AS older_than_cutoff,
+  'shards' AS unit,
+  CURRENT_TIMESTAMP() AS checked_at
+FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.INFORMATION_SCHEMA.TABLES`
+WHERE REGEXP_CONTAINS(table_name, r'^(events|pseudonymous_users|users)_\d{8}$')
+GROUP BY 1;

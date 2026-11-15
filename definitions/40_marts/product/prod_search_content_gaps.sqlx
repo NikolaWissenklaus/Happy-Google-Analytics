@@ -1,0 +1,48 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_search_content_gaps",
+  description: "What customers want and you dont have (or they cant find): search WORDS (stopwords in portuguese removed) with many searches, high exit / zero results and few product views after. Goes straight to the catalog and SEO teams",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "seo"],
+  columns: {
+    gap_score: "searches x (exit rate + zero results rate + (1 - product view rate)) / 3. Bigger = bigger gap"
+  }
+}
+
+WITH
+terms AS (
+  SELECT * FROM ${ref("prod_site_search_terms")}
+),
+
+words AS (
+  SELECT
+    word,
+    SUM(t.searches) AS searches,
+    SUM(t.searches * t.pct_search_exits) AS exits,
+    SUM(t.zero_results_searches) AS zero_results,
+    SUM(t.searches * t.product_view_after_search_rate) AS searches_with_product_view,
+    ARRAY_AGG(t.search_term_normalized ORDER BY t.searches DESC LIMIT 5) AS example_terms
+  FROM terms AS t,
+    UNNEST(SPLIT(t.search_term_normalized, ' ')) AS word
+  WHERE LENGTH(word) >= 3
+    AND word NOT IN (SELECT word FROM ${ref("seed_pt_stopwords")})
+    AND NOT REGEXP_CONTAINS(word, r'^[0-9]+$')
+  GROUP BY word
+)
+
+SELECT
+  word,
+  searches,
+  SAFE_DIVIDE(exits, searches) AS exit_rate,
+  SAFE_DIVIDE(zero_results, searches) AS zero_results_rate,
+  SAFE_DIVIDE(searches_with_product_view, searches) AS product_view_rate,
+  searches * (COALESCE(SAFE_DIVIDE(exits, searches), 0) + COALESCE(SAFE_DIVIDE(zero_results, searches), 0) + (1 - COALESCE(SAFE_DIVIDE(searches_with_product_view, searches), 0))) / 3 AS gap_score,
+  example_terms,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM words
+WHERE searches >= 10

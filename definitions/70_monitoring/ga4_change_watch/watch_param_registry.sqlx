@@ -1,0 +1,66 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_param_registry",
+  description: "Every event x param pair seen in the last 120 days (stg_ga4__event_params keeps 120): types it arrived with, fill rate in the last 7 days, first / last day and status. type_drift = sometimes string, sometimes number: the GA4 custom dimension shows half of the values, and nobody knows why",
+  bigquery: {
+    clusterBy: ["event_name"],
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    value_types: "Types seen: string, int, double, float, null",
+    has_type_drift: "Arrived both as text and as number (int / double mixing alone is fine, GA4 does that with whole numbers)",
+    fill_rate_7d: "Events of the event_name that had this param, last 7 days",
+    status: "new | gone | type_drift | ok"
+  }
+}
+
+WITH
+params AS (
+  SELECT
+    event_name,
+    param_key,
+    value_type,
+    MIN(event_date) AS first_seen_date,
+    MAX(event_date) AS last_seen_date,
+    COUNT(*) AS rows_with_type,
+    COUNTIF(event_date >= ${helpers.daysAgo(7)}) AS rows_last_7d
+  FROM ${ref("stg_ga4__event_params")}
+  GROUP BY 1, 2, 3
+),
+
+per_param AS (
+  SELECT
+    event_name,
+    param_key,
+    MIN(first_seen_date) AS first_seen_date,
+    MAX(last_seen_date) AS last_seen_date,
+    ARRAY_AGG(STRUCT(value_type, rows_with_type) ORDER BY rows_with_type DESC) AS value_types,
+    LOGICAL_OR(value_type = 'string') AND LOGICAL_OR(value_type IN ('int', 'double', 'float')) AS has_type_drift,
+    SUM(rows_last_7d) AS events_with_param_7d
+  FROM params
+  GROUP BY event_name, param_key
+),
+
+events_7d AS (
+  SELECT event_name, COUNT(*) AS events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+  GROUP BY event_name
+)
+
+SELECT
+  p.*,
+  SAFE_DIVIDE(p.events_with_param_7d, e.events) AS fill_rate_7d,
+  CASE
+    WHEN p.first_seen_date >= ${helpers.daysAgo(7)} THEN 'new'
+    WHEN p.last_seen_date < ${helpers.daysAgo(3)} THEN 'gone'
+    WHEN p.has_type_drift THEN 'type_drift'
+    ELSE 'ok'
+  END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_param AS p
+LEFT JOIN events_7d AS e USING (event_name)

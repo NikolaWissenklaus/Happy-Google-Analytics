@@ -1,0 +1,27 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_export_schema_by_shard",
+  description: "Schema of every daily shard of the GA4 export (field path + type), from INFORMATION_SCHEMA. Google changes the export without telling anyone (session_traffic_source_last_click in jul/2024, batch_* fields, is_active_user, publisher...). This table remembers every version",
+  bigquery: {
+    partitionBy: "shard_date",
+    clusterBy: ["field_path"],
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    field_path: "Full path of the column, nested ones with dots (device.web_info.browser)",
+    data_type: "BigQuery type of the field in that shard"
+  }
+}
+
+SELECT
+  PARSE_DATE('%Y%m%d', SUBSTR(table_name, 8)) AS shard_date,
+  field_path,
+  data_type,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.INFORMATION_SCHEMA.COLUMN_FIELD_PATHS`
+WHERE REGEXP_CONTAINS(table_name, r'^events_\d{8}$')
+  AND PARSE_DATE('%Y%m%d', SUBSTR(table_name, 8)) >= ${helpers.martWindowStart()}

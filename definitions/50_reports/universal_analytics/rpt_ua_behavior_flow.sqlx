@@ -1,0 +1,46 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ua,
+  name: "rpt_ua_behavior_flow",
+  description: "UA Behavior Flow (last 30 days): starting page -> 1st interaction -> 2nd -> 3rd, with sessions that went through each node and the drop-offs at every step, for the top 50 landing pages. Columns ready for a Sankey",
+  bigquery: {
+    labels: { layer: "reports", flavor: "ua" }
+  },
+  tags: ["reports", "ua_report", "daily"]
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_key,
+    MAX(IF(page_number = 1, page_path, NULL)) AS starting_page,
+    MAX(IF(page_number = 2, page_path, NULL)) AS interaction_1,
+    MAX(IF(page_number = 3, page_path, NULL)) AS interaction_2,
+    MAX(IF(page_number = 4, page_path, NULL)) AS interaction_3
+  FROM ${ref("int_ga4__page_views")}
+  WHERE event_date >= DATE_SUB(CURRENT_DATE('${constants.TIMEZONE}'), INTERVAL 30 DAY)
+  GROUP BY session_key
+),
+
+top_landings AS (
+  SELECT starting_page
+  FROM sessions
+  GROUP BY 1
+  ORDER BY COUNT(*) DESC
+  LIMIT 50
+)
+
+SELECT
+  s.starting_page,
+  COALESCE(s.interaction_1, '(drop-off)') AS interaction_1,
+  IF(s.interaction_1 IS NULL, NULL, COALESCE(s.interaction_2, '(drop-off)')) AS interaction_2,
+  IF(s.interaction_2 IS NULL, NULL, COALESCE(s.interaction_3, '(drop-off)')) AS interaction_3,
+  COUNT(*) AS sessions,
+  SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY s.starting_page)) AS share_of_landing,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions AS s
+JOIN top_landings AS t USING (starting_page)
+GROUP BY 1, 2, 3, 4
+HAVING COUNT(*) >= 5

@@ -1,0 +1,97 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.activation,
+  name: "act_google_ads_offline_conversions",
+  description: "Google Ads offline conversion import (last 90 days): every valid key event of a consented user, matched to the LAST Google Ads click of the user (gclid, gbraid or wbraid) in the 90 days before it, with value from the deduplicated revenue, order_id and the consent fields Google asks for. Ready for the API (ClickConversion) or the CSV upload. With enable_crm the hashed email / phone go too (enhanced conversions for leads)",
+  bigquery: {
+    partitionBy: "conversion_date",
+    clusterBy: ["conversion_name"],
+    labels: { layer: "activation", destination: "google_ads" }
+  },
+  tags: ["activation", "daily", "google_ads"],
+  columns: {
+    conversion_name: "cfg_key_events google_ads_conversion_name (else the key event name). Must exist in Google Ads with the same name",
+    conversion_time: "yyyy-mm-dd hh:mm:ss+hh:mm in the property timezone, the format of the upload",
+    click_id_type: "gclid | gbraid (iOS app to web) | wbraid (web to app). The API takes exactly one",
+    order_id: "transaction_id for purchases: Google uses it to deduplicate the upload with the tag",
+    ad_user_data: "GRANTED / DENIED for the consent field of the upload. Only GRANTED rows are here"
+  }
+}
+
+WITH
+conversions AS (
+  SELECT
+    k.key_event_id,
+    k.key_event_name,
+    COALESCE(c.google_ads_conversion_name, k.key_event_name) AS conversion_name,
+    k.event_ts,
+    k.user_key,
+    k.transaction_id,
+    -- purchases use the deduplicated revenue of fct_transactions (test / outlier orders are out)
+    IF(k.transaction_id IS NOT NULL, t.revenue, k.key_event_value) AS conversion_value,
+    COALESCE(t.currency, k.currency, '${constants.CURRENCY}') AS currency
+  FROM ${ref("fct_key_events")} AS k
+  LEFT JOIN ${ref("seed_key_events")} AS c USING (key_event_name)
+  LEFT JOIN ${ref("fct_transactions")} AS t ON t.transaction_id = k.transaction_id
+  WHERE k.event_date >= ${helpers.daysAgo(90)}
+    AND (k.transaction_id IS NULL OR COALESCE(t.is_valid_for_revenue, FALSE))
+    AND NOT COALESCE(t.is_bot_suspect, FALSE)
+  -- one conversion per order (a purchase sent twice by the site is still one order)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY conversion_name, COALESCE(k.transaction_id, k.key_event_id) ORDER BY k.event_ts) = 1
+),
+
+google_clicks AS (
+  SELECT
+    user_key,
+    session_start_ts AS click_ts,
+    CASE WHEN gclid IS NOT NULL THEN 'gclid' WHEN gbraid IS NOT NULL THEN 'gbraid' ELSE 'wbraid' END AS click_id_type,
+    COALESCE(gclid, gbraid, wbraid) AS click_id
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(180)}
+    AND COALESCE(gclid, gbraid, wbraid) IS NOT NULL
+    AND NOT is_bot_suspect
+),
+
+last_click_before AS (
+  SELECT
+    c.*,
+    g.click_id_type,
+    g.click_id,
+    g.click_ts
+  FROM conversions AS c
+  JOIN google_clicks AS g
+    ON g.user_key = c.user_key
+    AND g.click_ts <= c.event_ts
+    AND g.click_ts >= TIMESTAMP_SUB(c.event_ts, INTERVAL 90 DAY)
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY c.key_event_id ORDER BY g.click_ts DESC) = 1
+)
+
+${constants.ENABLE.crm ? `,
+crm_contacts AS (
+  SELECT CONCAT('uid:', user_id) AS user_key, ANY_VALUE(email_sha256_google) AS email_sha256, ANY_VALUE(phone_sha256_google) AS phone_sha256
+  FROM ${ref("stg_crm__customers")}
+  WHERE user_id IS NOT NULL
+  GROUP BY 1
+)` : ``}
+
+SELECT
+  DATE(l.event_ts, '${constants.TIMEZONE}') AS conversion_date,
+  l.conversion_name,
+  l.key_event_name,
+  l.click_id_type,
+  l.click_id,
+  FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S%Ez', l.event_ts, '${constants.TIMEZONE}') AS conversion_time,
+  ROUND(COALESCE(l.conversion_value, 0), 2) AS conversion_value,
+  l.currency,
+  l.transaction_id AS order_id,
+  'GRANTED' AS ad_user_data,
+  'GRANTED' AS ad_personalization,
+  TIMESTAMP_DIFF(l.event_ts, l.click_ts, HOUR) AS hours_since_click,
+  ${constants.ENABLE.crm ? `cc.email_sha256, cc.phone_sha256,` : ``}
+  l.user_key,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM last_click_before AS l
+JOIN ${ref("act_consent_eligible_users")} AS e ON e.user_key = l.user_key AND e.can_send_to_ads
+${constants.ENABLE.crm ? `LEFT JOIN crm_contacts AS cc ON cc.user_key = l.user_key` : ``}

@@ -1,0 +1,63 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.watch,
+  name: "watch_event_registry",
+  description: "Every event name ever seen, with first / last day, volume of the last 7 days against the 4 weeks before, and a status (new, gone, dropping, spiking, stable). Plus: is it in the tracking plan, is it a key event, is it automatic. The 'what changed in the tracking this week' list",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ga4_watch" }
+  },
+  tags: ["monitoring", "ga4_watch", "daily"],
+  columns: {
+    status: "new (first seen in the last 7 days) | gone (was regular, nothing in 3 days) | dropping (< 50% of the usual week) | spiking (> 200%) | stable | rare",
+    avg_week_before: "Average events per week in the 28 days before the last 7"
+  }
+}
+
+WITH
+per_day AS (
+  SELECT event_date, event_name, COUNT(*) AS events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2
+),
+
+per_event AS (
+  SELECT
+    event_name,
+    MIN(event_date) AS first_seen_date,
+    MAX(event_date) AS last_seen_date,
+    COUNT(*) AS active_days,
+    SUM(events) AS total_events,
+    SUM(IF(event_date >= ${helpers.daysAgo(7)}, events, 0)) AS events_last_7d,
+    SUM(IF(event_date BETWEEN ${helpers.daysAgo(35)} AND ${helpers.daysAgo(8)}, events, 0)) / 4 AS avg_week_before
+  FROM per_day
+  GROUP BY event_name
+),
+
+plan AS (SELECT DISTINCT event_name, owner FROM ${ref("seed_tracking_plan")}),
+automatic AS (SELECT DISTINCT event_name FROM ${ref("seed_automatic_events")}),
+key_events AS (SELECT DISTINCT event_name FROM ${ref("seed_key_events")})
+
+SELECT
+  e.*,
+  SAFE_DIVIDE(e.events_last_7d, NULLIF(e.avg_week_before, 0)) AS ratio_vs_usual,
+  CASE
+    WHEN e.first_seen_date >= ${helpers.daysAgo(7)} THEN 'new'
+    WHEN e.last_seen_date < ${helpers.daysAgo(3)} AND e.active_days >= 7 THEN 'gone'
+    WHEN e.active_days < 7 THEN 'rare'
+    WHEN e.avg_week_before > 0 AND e.events_last_7d < 0.5 * e.avg_week_before THEN 'dropping'
+    WHEN e.avg_week_before > 0 AND e.events_last_7d > 2 * e.avg_week_before THEN 'spiking'
+    ELSE 'stable'
+  END AS status,
+  p.event_name IS NOT NULL AS in_tracking_plan,
+  p.owner AS plan_owner,
+  a.event_name IS NOT NULL AS is_automatic,
+  k.event_name IS NOT NULL AS is_key_event,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_event AS e
+LEFT JOIN plan AS p USING (event_name)
+LEFT JOIN automatic AS a USING (event_name)
+LEFT JOIN key_events AS k USING (event_name)

@@ -1,0 +1,31 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_model_purchase_propensity_evaluation",
+  disabled: !constants.ENABLE.bqml,
+  description: "Evaluation of the propensity model (ML.EVALUATE: precision, recall, accuracy, f1, log loss, ROC AUC) and the top features (ML.GLOBAL_EXPLAIN), in one table",
+  bigquery: {
+    labels: { layer: "data_science", domain: "models" }
+  },
+  tags: ["data_science", "bqml", "weekly", "optional"]
+}
+
+SELECT
+  'metrics' AS section,
+  TO_JSON_STRING(e) AS details,
+  CAST(NULL AS STRING) AS feature,
+  CAST(NULL AS FLOAT64) AS attribution,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ML.EVALUATE(MODEL ${ref("ds_model_purchase_propensity")}) AS e
+
+UNION ALL
+
+SELECT
+  'feature_importance',
+  CAST(NULL AS STRING),
+  g.feature,
+  g.attribution,
+  CURRENT_TIMESTAMP()
+FROM ML.GLOBAL_EXPLAIN(MODEL ${ref("ds_model_purchase_propensity")}) AS g

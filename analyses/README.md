@@ -20,3 +20,7 @@ paste in the BigQuery console and adapt. Replace `your-gcp-project` by your proj
 | `10_utm_mess.sql` | send to the agency |
 | `11_media_quality.sql` | bots, broken urls and lost attribution per campaign |
 | `12_what_really_works.sql` | every lift measured (holdouts, tests, interventions, promos) |
+| `13_what_was_that_spike.sql` | "what happened yesterday at 21h?": bursts, blackouts and peak load |
+| `14_merchandising_moves.sql` | weekly list of who decides the shelf: positions, gems, substitutes, reminders |
+| `15_who_broke_the_habit.sql` | CRM: regular users late for their own rhythm, open missions with value |
+| `16_is_the_number_real.sql` | before presenting a number: mix vs rate, shrunk rates, peeking, UI vs BigQuery |

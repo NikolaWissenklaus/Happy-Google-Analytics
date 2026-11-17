@@ -1,0 +1,86 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 25/07/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_journey_state_values",
+  description: "The value of every step of the journey (last 60 days): an absorbing Markov chain over the page types gives, for each one, the probability that a session that is THERE NOW ends in a purchase. Each transition gets the probability it adds or destroys ('cart -> home throws away 27 points of purchase probability, and it happens 4 thousand times a month'). The map of where the sale is won and lost",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs", "data_science"],
+  columns: {
+    from_state: "Page type where the session is, or '(start)'",
+    to_state: "Next page type, '(purchase)' or '(exit)'",
+    from_purchase_probability: "P(the session ends with a purchase | it is in from_state now)",
+    probability_delta: "to_purchase_probability - from_purchase_probability. Negative = this step destroys chance of sale",
+    purchases_at_stake: "transitions * probability_delta. The size of the prize (or of the damage) of the step in the period",
+    expected_steps_to_end: "Expected page views until the purchase or the exit, from from_state"
+  }
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    page_number,
+    COALESCE(page_type, 'other') AS state,
+    session_has_purchase
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(60)}
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+),
+
+-- the confirmation page is the purchase itself, the chain ends before it
+steps AS (
+  SELECT
+    session_key,
+    state AS from_state,
+    LEAD(state) OVER (PARTITION BY session_key ORDER BY page_number) AS next_state,
+    page_number = 1 AS is_first,
+    session_has_purchase
+  FROM views
+  WHERE state != 'thank_you'
+),
+
+transitions AS (
+  SELECT from_state, COALESCE(next_state, IF(session_has_purchase, '(purchase)', '(exit)')) AS to_state, COUNT(*) AS transitions
+  FROM steps
+  -- reloads and paginations inside the same page type are not a step of the journey
+  WHERE next_state IS NULL OR next_state != from_state
+  GROUP BY 1, 2
+  UNION ALL
+  SELECT '(start)' AS from_state, from_state AS to_state, COUNT(*) AS transitions
+  FROM steps
+  WHERE is_first
+  GROUP BY steps.from_state
+),
+
+state_values AS (
+  SELECT v.state, v.success_probability, v.expected_steps
+  FROM UNNEST(${ref("absorbing_markov_values")}(
+    (SELECT ARRAY_AGG(STRUCT(from_state AS src, to_state AS dst, CAST(transitions AS FLOAT64) AS weight)) FROM transitions),
+    '(purchase)', '(exit)', 300
+  )) AS v
+)
+
+SELECT
+  t.from_state,
+  t.to_state,
+  t.transitions,
+  SAFE_DIVIDE(t.transitions, SUM(t.transitions) OVER (PARTITION BY t.from_state)) AS transition_probability,
+  a.success_probability AS from_purchase_probability,
+  b.success_probability AS to_purchase_probability,
+  b.success_probability - a.success_probability AS probability_delta,
+  t.transitions * (b.success_probability - a.success_probability) AS purchases_at_stake,
+  a.expected_steps AS expected_steps_to_end,
+  CASE
+    WHEN b.success_probability - a.success_probability <= -0.05 THEN 'destroys_value'
+    WHEN b.success_probability - a.success_probability >= 0.05 THEN 'creates_value'
+    ELSE 'neutral'
+  END AS step_effect,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM transitions AS t
+LEFT JOIN state_values AS a ON a.state = t.from_state
+LEFT JOIN state_values AS b ON b.state = t.to_state

@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 06/04/2019
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "msprt_p_value",
+  description: "Mixture sequential probability ratio test for the difference of two conversion rates. Returns 1 / likelihood ratio (capped at 1): take the running MIN over the days and you have an 'always valid' p value, the one you can look at every day without inflating the false positives",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "labs"]
+}
+
+-- the classic z-test is only valid if you look ONCE, at the planned sample size. everybody looks
+-- every morning and stops at the first green day, and that turns 5% of false positives into 30%+.
+-- mSPRT (Johari, Pekelis, Walsh 2017, what Optimizely uses) fixes that with a N(0, tau^2) prior
+-- over the true difference:
+--   lambda = sqrt(V / (V + tau2)) * exp(tau2 * diff^2 / (2 * V * (V + tau2)))
+-- V = variance of the observed difference. p value of the day = 1 / lambda, the always valid
+-- p value is the smallest one seen so far (the caller does the running MIN)
+CREATE OR REPLACE FUNCTION ${self()}(conv_a FLOAT64, n_a FLOAT64, conv_b FLOAT64, n_b FLOAT64, tau_squared FLOAT64)
+RETURNS FLOAT64 AS ((
+  SELECT
+    IF(
+      v IS NULL OR v <= 0,
+      1.0,
+      LEAST(1.0, 1 / (SQRT(v / (v + t2)) * EXP(LEAST(700.0, t2 * diff * diff / (2 * v * (v + t2))))))
+    )
+  FROM (
+    SELECT
+      SAFE_DIVIDE(conv_b, n_b) - SAFE_DIVIDE(conv_a, n_a) AS diff,
+      SAFE_DIVIDE(SAFE_DIVIDE(conv_a, n_a) * (1 - SAFE_DIVIDE(conv_a, n_a)), n_a)
+        + SAFE_DIVIDE(SAFE_DIVIDE(conv_b, n_b) * (1 - SAFE_DIVIDE(conv_b, n_b)), n_b) AS v,
+      COALESCE(tau_squared, 0.0001) AS t2
+  )
+))
+OPTIONS (description = "mSPRT p value of the day for two proportions")

@@ -1,0 +1,75 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 13/07/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_session_timeout_splits",
+  description: "Visits that GA4 cut in two because of the 30 minute timeout (lunch, a phone call, the boleto being paid in the bank app): sessions that start shortly after the previous one of the same device ended. They inflate the sessions, deflate the conversion rate and create 'landing pages' in the middle of the checkout. Per day and device: how many, what the conversion rate would be with the visits glued back, and the purchases credited to a resumed session (last 90 days)",
+  bigquery: {
+    partitionBy: "session_date",
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs"],
+  columns: Object.assign(docs.pick("session_date", "device_category", "sessions"), {
+    resumed_sessions: "Sessions that started up to cfg_labs.timeout_splits.max_gap_minutes after the previous session of the device ended",
+    resumed_on_same_page: "Resumed sessions whose landing page is the exit page of the previous session (the tab was just left open)",
+    visits: "sessions - resumed_sessions: the sessions with the cut visits glued back",
+    visit_conversion_rate: "transactions / visits. The conversion rate without the timeout inflation",
+    purchases_in_resumed_sessions: "Purchases whose session is a resumed one: the landing page and sometimes the source of these are artifacts",
+    resumed_funnel_landings: "Resumed sessions that 'landed' on cart / checkout / thank you pages"
+  })
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_key,
+    session_date,
+    device_category,
+    landing_page_path,
+    landing_page_type,
+    is_engaged,
+    transactions,
+    revenue,
+    has_purchase,
+    session_start_ts,
+    LAG(session_end_ts) OVER (PARTITION BY user_pseudo_id ORDER BY session_start_ts) AS previous_session_end_ts,
+    LAG(exit_page_path) OVER (PARTITION BY user_pseudo_id ORDER BY session_start_ts) AS previous_exit_page_path,
+    LAG(is_engaged) OVER (PARTITION BY user_pseudo_id ORDER BY session_start_ts) AS previous_was_engaged
+  FROM ${ref("fct_sessions")}
+  -- one extra day so the first sessions of the window can see the one before
+  WHERE session_date >= ${helpers.daysAgo(91)}
+    ${helpers.martSessionFilter()}
+),
+
+flagged AS (
+  SELECT
+    *,
+    TIMESTAMP_DIFF(session_start_ts, previous_session_end_ts, SECOND) / 60 AS minutes_since_previous,
+    COALESCE(TIMESTAMP_DIFF(session_start_ts, previous_session_end_ts, MINUTE) <= ${cfg_labs.timeout_splits.max_gap_minutes}, FALSE) AS is_resumed
+  FROM sessions
+)
+
+SELECT
+  session_date,
+  device_category,
+  COUNT(*) AS sessions,
+  COUNTIF(is_resumed) AS resumed_sessions,
+  SAFE_DIVIDE(COUNTIF(is_resumed), COUNT(*)) AS resumed_share,
+  COUNTIF(is_resumed AND landing_page_path = previous_exit_page_path) AS resumed_on_same_page,
+  COUNTIF(is_resumed AND landing_page_type IN ('cart', 'checkout', 'thank_you')) AS resumed_funnel_landings,
+  COUNTIF(is_resumed AND NOT COALESCE(previous_was_engaged, FALSE)) AS resumed_after_a_bounce,
+  APPROX_QUANTILES(IF(is_resumed, minutes_since_previous, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)] AS median_pause_minutes,
+  COUNT(*) - COUNTIF(is_resumed) AS visits,
+  SUM(transactions) AS transactions,
+  SUM(revenue) AS revenue,
+  SAFE_DIVIDE(SUM(transactions), COUNT(*)) AS session_conversion_rate,
+  SAFE_DIVIDE(SUM(transactions), COUNT(*) - COUNTIF(is_resumed)) AS visit_conversion_rate,
+  COUNTIF(is_resumed AND has_purchase) AS purchases_in_resumed_sessions,
+  SAFE_DIVIDE(COUNTIF(is_resumed AND has_purchase), COUNTIF(has_purchase)) AS share_of_purchases_in_resumed_sessions,
+  SUM(IF(is_resumed, revenue, 0)) AS revenue_in_resumed_sessions,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM flagged
+WHERE session_date >= ${helpers.daysAgo(90)}
+GROUP BY 1, 2

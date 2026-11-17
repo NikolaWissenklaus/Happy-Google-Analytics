@@ -1,0 +1,57 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 14/03/2025
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "pagerank",
+  description: "Weighted PageRank of a graph given as an array of edges (src, dst, weight). Runs inside BigQuery, no export to Python. Used with the real navigation between pages, but it works for any graph (items bought together, channels, referrers)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "models", "labs"]
+}
+
+-- Google ranks the web with the links between pages. Here the "links" are the real clicks of
+-- the users (page A -> page B, weight = how many times), so the score says which pages hold the
+-- navigation of the site together. Dangling nodes (pages with no way out) give their score back
+-- to everybody, like in the original paper. damping 0.85 and 30-40 iterations are the usual.
+-- numbers are FLOAT64 because JS UDFs do not take INT64
+CREATE OR REPLACE FUNCTION ${self()}(edges ARRAY<STRUCT<src STRING, dst STRING, weight FLOAT64>>, damping FLOAT64, iterations FLOAT64)
+RETURNS ARRAY<STRUCT<node STRING, pagerank FLOAT64, in_weight FLOAT64, out_weight FLOAT64>>
+LANGUAGE js AS r"""
+  var d = (damping === null || damping === undefined) ? 0.85 : damping;
+  var rounds = (iterations === null || iterations === undefined) ? 30 : Math.max(1, Math.round(iterations));
+  var list = edges || [];
+  var index = {};
+  var names = [];
+  function idOf(name) {
+    if (index[name] === undefined) { index[name] = names.length; names.push(name); }
+    return index[name];
+  }
+  var src = [], dst = [], w = [];
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i];
+    if (!e || e.src === null || e.dst === null || e.src === undefined || e.dst === undefined) continue;
+    var weight = (e.weight === null || e.weight === undefined || isNaN(e.weight)) ? 1 : Number(e.weight);
+    if (weight <= 0 || e.src === e.dst) continue;
+    src.push(idOf(e.src)); dst.push(idOf(e.dst)); w.push(weight);
+  }
+  var n = names.length;
+  if (n === 0) return [];
+  var outW = new Array(n), inW = new Array(n), rank = new Array(n);
+  for (var k = 0; k < n; k++) { outW[k] = 0; inW[k] = 0; rank[k] = 1 / n; }
+  for (var j = 0; j < src.length; j++) { outW[src[j]] += w[j]; inW[dst[j]] += w[j]; }
+  for (var it = 0; it < rounds; it++) {
+    var next = new Array(n);
+    var dangling = 0;
+    for (var a = 0; a < n; a++) { next[a] = 0; if (outW[a] === 0) dangling += rank[a]; }
+    for (var m = 0; m < src.length; m++) next[dst[m]] += rank[src[m]] * w[m] / outW[src[m]];
+    var base = (1 - d) / n + d * dangling / n;
+    for (var b = 0; b < n; b++) rank[b] = base + d * next[b];
+  }
+  var out = [];
+  for (var c = 0; c < n; c++) out.push({ node: names[c], pagerank: rank[c], in_weight: inW[c], out_weight: outW[c] });
+  out.sort(function (x, y) { return y.pagerank - x.pagerank; });
+  return out;
+"""
+OPTIONS (description = "Weighted PageRank over an array of edges")

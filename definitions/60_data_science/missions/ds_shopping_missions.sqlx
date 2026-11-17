@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 14/06/2023
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_shopping_missions",
+  description: "The unit GA4 does not have: the shopping mission. A session is too small (nobody buys a sofa in one visit) and a user is too big (the same person buys a sofa in march and socks in june). A mission glues the sessions of one person while the pauses are short (cfg_labs.missions.max_gap_days) and closes at the purchase. One row per mission: sessions, days, devices, first and last channel, how deep it went and how it ended. The honest denominator for the conversion rate and the natural grain for attribution and remarketing (last 180 days)",
+  bigquery: {
+    partitionBy: "mission_start_date",
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "missions" }
+  },
+  tags: ["data_science", "missions", "daily", "labs"],
+  columns: Object.assign(docs.pick("user_key"), {
+    mission_id: "user_key + ':' + number of the mission of the user inside the window",
+    mission_days: "Days between the first and the last session of the mission (0 = solved in one day)",
+    deepest_stage: "purchase | checkout | cart | product_view | browse",
+    outcome: "purchased | open (last session is recent, the customer may still come back) | abandoned_checkout | abandoned_cart | left_after_product | bounced_or_browsed",
+    is_cross_device: "More than one device category inside the mission",
+    first_channel: "Channel of the session that opened the mission (the session itself, no carry over)",
+    last_channel: "Channel of the session that closed it",
+    value_at_stake: "Revenue when purchased, else the biggest cart / checkout value seen in the mission"
+  })
+}
+
+js {
+  const ms = cfg_labs.missions;
+}
+
+WITH
+sessions AS (
+  SELECT
+    user_key,
+    session_key,
+    session_start_ts,
+    session_end_ts,
+    session_date,
+    COALESCE(session_channel_only, session_default_channel_group, '(not set)') AS channel,
+    device_category,
+    landing_page_type,
+    is_engaged,
+    has_view_item,
+    has_add_to_cart,
+    has_begin_checkout,
+    has_purchase,
+    has_site_search,
+    transactions,
+    revenue,
+    cart_value,
+    checkout_value,
+    LAG(session_end_ts) OVER (PARTITION BY user_key ORDER BY session_start_ts) AS previous_end_ts,
+    LAG(has_purchase) OVER (PARTITION BY user_key ORDER BY session_start_ts) AS previous_had_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(ms.window_days)}
+    ${helpers.martSessionFilter()}
+),
+
+numbered AS (
+  SELECT
+    *,
+    -- a new mission starts after a long pause, or right after a purchase (mission accomplished)
+    SUM(IF(
+      previous_end_ts IS NULL
+        OR COALESCE(previous_had_purchase, FALSE)
+        OR TIMESTAMP_DIFF(session_start_ts, previous_end_ts, HOUR) > ${ms.max_gap_days * 24},
+      1, 0
+    )) OVER (PARTITION BY user_key ORDER BY session_start_ts) AS mission_number
+  FROM sessions
+),
+
+missions AS (
+  SELECT
+    user_key,
+    mission_number,
+    MIN(session_start_ts) AS mission_start_ts,
+    MAX(session_end_ts) AS mission_end_ts,
+    MIN(session_date) AS mission_start_date,
+    MAX(session_date) AS mission_end_date,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    COUNT(DISTINCT session_date) AS active_days,
+    COUNT(DISTINCT device_category) AS device_categories,
+    COUNT(DISTINCT channel) AS distinct_channels,
+    ARRAY_AGG(channel ORDER BY session_start_ts LIMIT 1)[OFFSET(0)] AS first_channel,
+    ARRAY_AGG(channel ORDER BY session_start_ts DESC LIMIT 1)[OFFSET(0)] AS last_channel,
+    ARRAY_AGG(device_category IGNORE NULLS ORDER BY session_start_ts LIMIT 1)[SAFE_OFFSET(0)] AS first_device,
+    ARRAY_AGG(device_category IGNORE NULLS ORDER BY session_start_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_device,
+    ARRAY_AGG(landing_page_type IGNORE NULLS ORDER BY session_start_ts LIMIT 1)[SAFE_OFFSET(0)] AS first_landing_page_type,
+    STRING_AGG(channel, ' > ' ORDER BY session_start_ts LIMIT 12) AS channel_path,
+    LOGICAL_OR(has_site_search) AS used_site_search,
+    LOGICAL_OR(has_view_item) AS has_view_item,
+    LOGICAL_OR(has_add_to_cart) AS has_add_to_cart,
+    LOGICAL_OR(has_begin_checkout) AS has_begin_checkout,
+    LOGICAL_OR(has_purchase) AS has_purchase,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    MAX(GREATEST(COALESCE(cart_value, 0), COALESCE(checkout_value, 0))) AS max_cart_value
+  FROM numbered
+  GROUP BY user_key, mission_number
+)
+
+SELECT
+  CONCAT(user_key, ':', CAST(mission_number AS STRING)) AS mission_id,
+  user_key,
+  mission_number,
+  mission_start_date,
+  mission_end_date,
+  mission_start_ts,
+  mission_end_ts,
+  DATE_DIFF(mission_end_date, mission_start_date, DAY) AS mission_days,
+  sessions,
+  engaged_sessions,
+  active_days,
+  device_categories > 1 AS is_cross_device,
+  first_device,
+  last_device,
+  distinct_channels,
+  first_channel,
+  last_channel,
+  channel_path,
+  first_landing_page_type,
+  used_site_search,
+  CASE
+    WHEN has_purchase THEN 'purchase'
+    WHEN has_begin_checkout THEN 'checkout'
+    WHEN has_add_to_cart THEN 'cart'
+    WHEN has_view_item THEN 'product_view'
+    ELSE 'browse'
+  END AS deepest_stage,
+  CASE
+    WHEN has_purchase THEN 'purchased'
+    WHEN mission_end_date >= ${helpers.daysAgo(ms.max_gap_days)} THEN 'open'
+    WHEN has_begin_checkout THEN 'abandoned_checkout'
+    WHEN has_add_to_cart THEN 'abandoned_cart'
+    WHEN has_view_item THEN 'left_after_product'
+    ELSE 'bounced_or_browsed'
+  END AS outcome,
+  has_purchase,
+  transactions,
+  revenue,
+  IF(has_purchase, revenue, max_cart_value) AS value_at_stake,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM missions

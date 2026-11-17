@@ -1,0 +1,187 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/12/2019
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_ab_test_cuped",
+  description: "A/B tests that finish sooner with the same traffic: CUPED (the variance reduction Microsoft, Netflix and Booking use) removes from the revenue per user of each variant the part already explained by how that user behaved BEFORE the test. Heavy buyers falling by luck in one side stop looking like an effect. Per experiment and variant: raw and adjusted revenue per user, the variance removed and how many days of test that saves",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "labs", "stats", "experiments"],
+  columns: {
+    revenue_per_user: "Revenue after the first exposure / users of the variant",
+    revenue_per_user_cuped: "Same metric adjusted: y - theta * (x - mean of x), x = revenue + sessions signal of the user in the days before the exposure",
+    theta: "cov(x, y) / var(x) of the whole experiment (all variants together, so the adjustment is the same for everybody)",
+    variance_reduction: "1 - var(adjusted) / var(raw) = squared correlation between before and after. 0.3 = the test needs 30% less users for the same precision",
+    p_value_raw: "Welch t-test of revenue per user against control, no adjustment",
+    p_value_cuped: "Same test on the adjusted metric",
+    users_without_history: "Users of the variant with no activity before the exposure (new users): CUPED cannot help with them"
+  }
+}
+
+js {
+  const exp = cfg_experiments.exposure;
+  const preDays = cfg_labs.cuped_pre_period_days;
+}
+
+WITH
+tests AS (
+  SELECT * FROM ${ref("seed_ab_tests")}
+),
+
+exposure_events AS (
+  SELECT
+    ${ga4.paramAny(exp.experiment_param)} AS experiment_id,
+    ${ga4.paramAny(exp.variant_param)} AS variant_id,
+    e.user_pseudo_id,
+    e.event_ts
+  FROM ${ref("stg_ga4__events")} AS e
+  WHERE e.event_date >= (SELECT MIN(start_date) FROM tests)
+    AND e.event_name = '${exp.event_name}'
+    ${helpers.noiseFilter("e")}
+),
+
+assignments AS (
+  SELECT
+    x.experiment_id,
+    COALESCE(id.user_key, CONCAT('dev:', x.user_pseudo_id)) AS user_key,
+    ARRAY_AGG(x.variant_id ORDER BY x.event_ts LIMIT 1)[OFFSET(0)] AS variant_id,
+    MIN(x.event_ts) AS first_exposure_ts,
+    ANY_VALUE(t.control_variant) AS control_variant,
+    ANY_VALUE(t.experiment_name) AS experiment_name,
+    ANY_VALUE(COALESCE(t.end_date, CURRENT_DATE('${constants.TIMEZONE}'))) AS end_date
+  FROM exposure_events AS x
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  JOIN tests AS t USING (experiment_id)
+  WHERE x.variant_id IS NOT NULL
+    AND DATE(x.event_ts, '${constants.TIMEZONE}') BETWEEN t.start_date AND COALESCE(t.end_date, CURRENT_DATE('${constants.TIMEZONE}'))
+  GROUP BY 1, 2
+),
+
+-- y: revenue after the exposure, until the end of the test
+outcome AS (
+  SELECT a.experiment_id, a.user_key, SUM(t.revenue) AS revenue_after
+  FROM assignments AS a
+  JOIN ${ref("fct_transactions")} AS t
+    ON t.user_key = a.user_key
+    AND t.is_valid_for_revenue
+    AND t.transaction_ts >= a.first_exposure_ts
+    AND t.transaction_date <= a.end_date
+  GROUP BY 1, 2
+),
+
+-- x: what the user did BEFORE seeing the test. it cannot be affected by the variant, and
+-- that is the whole trick. revenue alone is zero for almost everybody, sessions give signal
+history AS (
+  SELECT
+    a.experiment_id,
+    a.user_key,
+    SUM(d.revenue) AS revenue_before,
+    SUM(d.sessions) AS sessions_before
+  FROM assignments AS a
+  JOIN ${ref("fct_user_daily")} AS d
+    ON d.user_key = a.user_key
+    AND d.activity_date < DATE(a.first_exposure_ts, '${constants.TIMEZONE}')
+    AND d.activity_date >= DATE_SUB(DATE(a.first_exposure_ts, '${constants.TIMEZONE}'), INTERVAL ${preDays} DAY)
+  GROUP BY 1, 2
+),
+
+users AS (
+  SELECT
+    a.experiment_id,
+    a.experiment_name,
+    a.variant_id,
+    a.control_variant,
+    a.user_key,
+    COALESCE(o.revenue_after, 0) AS y,
+    COALESCE(h.revenue_before, 0) AS revenue_before,
+    COALESCE(h.sessions_before, 0) AS sessions_before,
+    h.user_key IS NULL AS has_no_history
+  FROM assignments AS a
+  LEFT JOIN outcome AS o USING (experiment_id, user_key)
+  LEFT JOIN history AS h USING (experiment_id, user_key)
+),
+
+-- one covariate out of the two signals: revenue before + sessions before valued at the
+-- average revenue per session of the experiment (keeps everything in currency)
+with_covariate AS (
+  SELECT
+    *,
+    revenue_before + sessions_before * COALESCE(SAFE_DIVIDE(SUM(y) OVER (PARTITION BY experiment_id), NULLIF(SUM(sessions_before) OVER (PARTITION BY experiment_id), 0)), 0) AS x
+  FROM users
+),
+
+theta AS (
+  SELECT
+    experiment_id,
+    COALESCE(SAFE_DIVIDE(COVAR_POP(x, y), VAR_POP(x)), 0) AS theta,
+    AVG(x) AS mean_x,
+    POW(CORR(x, y), 2) AS variance_reduction
+  FROM with_covariate
+  GROUP BY experiment_id
+),
+
+adjusted AS (
+  SELECT u.*, th.theta, th.variance_reduction, u.y - th.theta * (u.x - th.mean_x) AS y_cuped
+  FROM with_covariate AS u
+  JOIN theta AS th USING (experiment_id)
+),
+
+per_variant AS (
+  SELECT
+    experiment_id,
+    ANY_VALUE(experiment_name) AS experiment_name,
+    variant_id,
+    variant_id = ANY_VALUE(control_variant) AS is_control,
+    COUNT(*) AS users,
+    COUNTIF(has_no_history) AS users_without_history,
+    AVG(y) AS revenue_per_user,
+    VAR_SAMP(y) AS revenue_variance,
+    AVG(y_cuped) AS revenue_per_user_cuped,
+    VAR_SAMP(y_cuped) AS revenue_variance_cuped,
+    AVG(x) AS avg_pre_period_covariate,
+    ANY_VALUE(theta) AS theta,
+    ANY_VALUE(variance_reduction) AS variance_reduction
+  FROM adjusted
+  GROUP BY experiment_id, variant_id
+),
+
+compared AS (
+  SELECT
+    v.*,
+    ${ref("welch_t_test")}(c.revenue_per_user, c.revenue_variance, c.users, v.revenue_per_user, v.revenue_variance, v.users) AS raw_test,
+    ${ref("welch_t_test")}(c.revenue_per_user_cuped, c.revenue_variance_cuped, c.users, v.revenue_per_user_cuped, v.revenue_variance_cuped, v.users) AS cuped_test
+  FROM per_variant AS v
+  LEFT JOIN per_variant AS c ON c.experiment_id = v.experiment_id AND c.is_control
+)
+
+SELECT
+  experiment_id,
+  experiment_name,
+  variant_id,
+  is_control,
+  users,
+  users_without_history,
+  SAFE_DIVIDE(users_without_history, users) AS share_without_history,
+  revenue_per_user,
+  revenue_per_user_cuped,
+  avg_pre_period_covariate,
+  theta,
+  variance_reduction,
+  IF(is_control, NULL, raw_test.rel_diff) AS uplift_raw,
+  IF(is_control, NULL, raw_test.p_value) AS p_value_raw,
+  IF(is_control, NULL, cuped_test.rel_diff) AS uplift_cuped,
+  IF(is_control, NULL, cuped_test.p_value) AS p_value_cuped,
+  -- same precision with (1 - reduction) of the sample = that share of the days saved
+  variance_reduction AS share_of_test_duration_saved,
+  CASE
+    WHEN is_control THEN 'control'
+    WHEN cuped_test.p_value < 0.05 AND raw_test.p_value >= 0.05 THEN 'significant_only_with_cuped'
+    WHEN cuped_test.p_value < 0.05 THEN 'significant'
+    WHEN raw_test.p_value < 0.05 THEN 'raw_significance_was_pre_existing_difference'
+    ELSE 'not_significant'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM compared

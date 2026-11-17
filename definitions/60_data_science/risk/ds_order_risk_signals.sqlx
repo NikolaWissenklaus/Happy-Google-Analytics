@@ -1,0 +1,156 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 03/12/2023
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_order_risk_signals",
+  description: "A review queue for suspicious orders built only with behaviour GA4 already has (last 90 days): many orders from the same device in 24 hours, payment retries, a brand new device buying something expensive in seconds without browsing, a purchase far from where the customer always is, the middle of the night, a device with bot behaviour or with many accounts, and values off the curve. Each order with its signals and a 0-100 score. It is NOT an anti fraud system (it never sees the card), it is the context the anti fraud does not have: how the person behaved before paying",
+  bigquery: {
+    partitionBy: "transaction_date",
+    clusterBy: ["risk_level"],
+    labels: { layer: "data_science", domain: "risk" }
+  },
+  tags: ["data_science", "risk", "daily", "labs", "alerts"],
+  columns: Object.assign(docs.pick("transaction_id", "user_key", "session_key"), {
+    orders_same_device_24h: "Orders of the same user_pseudo_id in the 24 hours up to this one (this one included)",
+    seconds_from_session_start: "Seconds between the start of the session and the purchase",
+    risk_signals: "Names of the signals that fired (ARRAY)",
+    risk_score: "Sum of the weights of the signals (cfg_labs.order_risk.weights), capped at 100",
+    risk_level: "review (score >= cfg_labs.order_risk.review_from_score) | watch | normal"
+  })
+}
+
+js {
+  const rk = cfg_labs.order_risk;
+  const w = rk.weights;
+}
+
+WITH
+orders AS (
+  SELECT
+    transaction_id,
+    transaction_date,
+    transaction_ts,
+    session_key,
+    user_pseudo_id,
+    user_key,
+    revenue,
+    payment_type,
+    coupon,
+    device_category,
+    geo_country,
+    geo_uf,
+    geo_city,
+    is_new_user,
+    is_first_purchase,
+    is_revenue_outlier,
+    is_bot_suspect,
+    is_test_transaction,
+    EXTRACT(HOUR FROM DATETIME(transaction_ts, '${constants.TIMEZONE}')) AS local_hour,
+    COUNT(*) OVER (
+      PARTITION BY user_pseudo_id
+      ORDER BY UNIX_SECONDS(transaction_ts)
+      RANGE BETWEEN 86400 PRECEDING AND CURRENT ROW
+    ) AS orders_same_device_24h,
+    PERCENT_RANK() OVER (ORDER BY revenue) AS revenue_percentile
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${helpers.daysAgo(rk.window_days)}
+    AND NOT is_test_transaction
+),
+
+with_context AS (
+  SELECT
+    o.*,
+    s.has_payment_retries,
+    s.page_views,
+    s.view_item_events,
+    s.device_bot_score,
+    TIMESTAMP_DIFF(o.transaction_ts, s.session_start_ts, SECOND) AS seconds_from_session_start,
+    u.first_uf AS usual_uf,
+    u.first_country AS usual_country,
+    u.transactions AS user_lifetime_orders,
+    COALESCE(i.is_shared_device, FALSE) AS is_shared_device
+  FROM orders AS o
+  LEFT JOIN ${ref("fct_sessions")} AS s USING (session_key)
+  LEFT JOIN ${ref("dim_users")} AS u ON u.user_key = o.user_key
+  LEFT JOIN ${ref("dim_user_identity")} AS i ON i.user_pseudo_id = o.user_pseudo_id
+),
+
+signals AS (
+  SELECT
+    *,
+    orders_same_device_24h >= ${rk.orders_in_24h} AS sig_order_velocity,
+    COALESCE(has_payment_retries, FALSE) AS sig_payment_retries,
+    COALESCE(is_new_user AND revenue_percentile >= 0.9 AND seconds_from_session_start <= ${rk.fast_checkout_seconds}, FALSE) AS sig_new_device_high_value_fast,
+    -- a customer with history buying from another country or state than the one of the first visit
+    COALESCE(user_lifetime_orders > 1 AND (geo_country != usual_country OR (geo_uf IS NOT NULL AND usual_uf IS NOT NULL AND geo_uf != usual_uf)), FALSE) AS sig_unusual_location,
+    COALESCE(local_hour BETWEEN 1 AND 5 AND revenue_percentile >= 0.9, FALSE) AS sig_night_owl_high_value,
+    COALESCE(is_bot_suspect OR device_bot_score >= ${cfg_project.bot.min_score_to_flag}, FALSE) AS sig_bot_like_device,
+    is_shared_device AS sig_shared_device,
+    COALESCE(is_revenue_outlier, FALSE) AS sig_value_outlier
+  FROM with_context
+),
+
+scored AS (
+  SELECT
+    *,
+    LEAST(100,
+      IF(sig_order_velocity, ${w.order_velocity}, 0)
+      + IF(sig_payment_retries, ${w.payment_retries}, 0)
+      + IF(sig_new_device_high_value_fast, ${w.new_device_high_value_fast}, 0)
+      + IF(sig_unusual_location, ${w.unusual_location}, 0)
+      + IF(sig_night_owl_high_value, ${w.night_owl_high_value}, 0)
+      + IF(sig_bot_like_device, ${w.bot_like_device}, 0)
+      + IF(sig_shared_device, ${w.shared_device}, 0)
+      + IF(sig_value_outlier, ${w.value_outlier}, 0)
+    ) AS risk_score,
+    ARRAY(
+      SELECT name
+      FROM UNNEST([
+        STRUCT('order_velocity' AS name, sig_order_velocity AS fired),
+        STRUCT('payment_retries', sig_payment_retries),
+        STRUCT('new_device_high_value_fast', sig_new_device_high_value_fast),
+        STRUCT('unusual_location', sig_unusual_location),
+        STRUCT('night_owl_high_value', sig_night_owl_high_value),
+        STRUCT('bot_like_device', sig_bot_like_device),
+        STRUCT('shared_device', sig_shared_device),
+        STRUCT('value_outlier', sig_value_outlier)
+      ])
+      WHERE fired
+    ) AS risk_signals
+  FROM signals
+)
+
+SELECT
+  transaction_id,
+  transaction_date,
+  transaction_ts,
+  session_key,
+  user_key,
+  revenue,
+  payment_type,
+  coupon,
+  device_category,
+  geo_country,
+  geo_uf,
+  geo_city,
+  usual_uf,
+  is_new_user,
+  is_first_purchase,
+  local_hour,
+  orders_same_device_24h,
+  seconds_from_session_start,
+  page_views AS session_page_views,
+  view_item_events AS session_product_views,
+  device_bot_score,
+  risk_signals,
+  ARRAY_LENGTH(risk_signals) AS signals_fired,
+  risk_score,
+  CASE
+    WHEN risk_score >= ${rk.review_from_score} THEN 'review'
+    WHEN risk_score >= ${Math.round(rk.review_from_score / 2)} THEN 'watch'
+    ELSE 'normal'
+  END AS risk_level,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored

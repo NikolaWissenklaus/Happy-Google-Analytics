@@ -1,0 +1,90 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 06/09/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_shopping_missions_summary",
+  description: "The economics of the shopping missions per month and opening channel: mission conversion rate (the real one: 'of the times somebody came to buy something, how many bought'), sessions and days a purchase takes, share that crosses devices, where the missions that fail stop, and the revenue of the channel that OPENED the mission next to the one that closed it. Open missions stay out of the rates",
+  bigquery: {
+    labels: { layer: "data_science", domain: "missions" }
+  },
+  tags: ["data_science", "missions", "daily", "labs"],
+  columns: {
+    mission_month: "Month of the first session of the mission",
+    first_channel: "Channel that opened the mission",
+    mission_conversion_rate: "Purchased missions / closed missions. Compare with the session conversion rate of the same period: it is usually 2 to 4 times bigger",
+    avg_sessions_to_purchase: "Sessions of the missions that ended in a purchase",
+    closed_by_other_channel_share: "Purchased missions opened by this channel and closed by another one: what last click attribution takes away from the channel",
+    revenue_opened: "Revenue of the missions this channel opened",
+    revenue_closed: "Revenue of the missions this channel closed (last click view)"
+  }
+}
+
+WITH
+missions AS (
+  SELECT *, DATE_TRUNC(mission_start_date, MONTH) AS mission_month
+  FROM ${ref("ds_shopping_missions")}
+),
+
+opened AS (
+  SELECT
+    mission_month,
+    first_channel AS channel,
+    COUNT(*) AS missions,
+    COUNTIF(outcome = 'open') AS open_missions,
+    COUNTIF(outcome != 'open') AS closed_missions,
+    COUNTIF(outcome = 'purchased') AS purchased_missions,
+    COUNTIF(outcome = 'abandoned_checkout') AS abandoned_checkout_missions,
+    COUNTIF(outcome = 'abandoned_cart') AS abandoned_cart_missions,
+    COUNTIF(outcome = 'left_after_product') AS left_after_product_missions,
+    COUNTIF(outcome = 'bounced_or_browsed') AS bounced_or_browsed_missions,
+    SUM(sessions) AS sessions,
+    AVG(IF(outcome = 'purchased', sessions, NULL)) AS avg_sessions_to_purchase,
+    AVG(IF(outcome = 'purchased', mission_days, NULL)) AS avg_days_to_purchase,
+    APPROX_QUANTILES(IF(outcome = 'purchased', mission_days, NULL), 100 IGNORE NULLS)[SAFE_OFFSET(90)] AS p90_days_to_purchase,
+    COUNTIF(outcome = 'purchased' AND sessions = 1) AS one_session_purchases,
+    COUNTIF(outcome = 'purchased' AND is_cross_device) AS cross_device_purchases,
+    COUNTIF(outcome = 'purchased' AND first_channel != last_channel) AS closed_by_other_channel,
+    SUM(IF(outcome = 'purchased', revenue, 0)) AS revenue_opened,
+    SUM(IF(outcome IN ('abandoned_checkout', 'abandoned_cart'), value_at_stake, 0)) AS abandoned_value
+  FROM missions
+  GROUP BY 1, 2
+),
+
+closed AS (
+  SELECT mission_month, last_channel AS channel, COUNT(*) AS purchased_missions_closed, SUM(revenue) AS revenue_closed
+  FROM missions
+  WHERE outcome = 'purchased'
+  GROUP BY 1, 2
+)
+
+SELECT
+  o.mission_month,
+  o.channel AS first_channel,
+  o.missions,
+  o.open_missions,
+  o.closed_missions,
+  o.purchased_missions,
+  SAFE_DIVIDE(o.purchased_missions, o.closed_missions) AS mission_conversion_rate,
+  SAFE_DIVIDE(o.purchased_missions, o.sessions) AS session_conversion_rate,
+  SAFE_DIVIDE(o.sessions, o.missions) AS sessions_per_mission,
+  o.avg_sessions_to_purchase,
+  o.avg_days_to_purchase,
+  o.p90_days_to_purchase,
+  SAFE_DIVIDE(o.one_session_purchases, o.purchased_missions) AS one_session_purchase_share,
+  SAFE_DIVIDE(o.cross_device_purchases, o.purchased_missions) AS cross_device_purchase_share,
+  SAFE_DIVIDE(o.closed_by_other_channel, o.purchased_missions) AS closed_by_other_channel_share,
+  SAFE_DIVIDE(o.abandoned_checkout_missions, o.closed_missions) AS abandoned_checkout_share,
+  SAFE_DIVIDE(o.abandoned_cart_missions, o.closed_missions) AS abandoned_cart_share,
+  SAFE_DIVIDE(o.left_after_product_missions, o.closed_missions) AS left_after_product_share,
+  SAFE_DIVIDE(o.bounced_or_browsed_missions, o.closed_missions) AS bounced_or_browsed_share,
+  o.abandoned_value,
+  o.revenue_opened,
+  COALESCE(c.revenue_closed, 0) AS revenue_closed,
+  COALESCE(c.purchased_missions_closed, 0) AS purchased_missions_closed,
+  -- above 1 = the channel starts more sales than it finishes (undervalued by last click)
+  SAFE_DIVIDE(o.revenue_opened, c.revenue_closed) AS opener_to_closer_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM opened AS o
+LEFT JOIN closed AS c USING (mission_month, channel)

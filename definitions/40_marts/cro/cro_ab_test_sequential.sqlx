@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 30/06/2024
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_ab_test_sequential",
+  description: "The A/B test you ARE allowed to peek at: an 'always valid' p value per day and variant (mixture SPRT, the method of the commercial testing tools), next to the classic one of cro_ab_test_daily. It can be looked at every morning and the test can stop the day it crosses 5%, without the false positives the daily peeking creates on the normal p value. Also flags the days where the classic test would have fooled you",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "labs", "stats", "experiments"],
+  columns: {
+    naive_p_value: "Classic z-test p value, cumulative up to the day (the one from cro_ab_test_daily). Only valid if you look once",
+    always_valid_p_value: "Smallest mSPRT p value seen up to the day. Valid at every look, it never goes back up",
+    can_stop: "always_valid_p_value < 0.05: stopping today is statistically honest",
+    peeking_trap: "The classic p value is under 0.05 today but the always valid one is not: the 'winner' most teams would ship by mistake",
+    first_day_can_stop: "First day the always valid p value went under 0.05",
+    decision: "stop_winner | stop_loser | keep_running"
+  }
+}
+
+WITH
+tests AS (
+  SELECT experiment_id, experiment_name, control_variant FROM ${ref("seed_ab_tests")}
+),
+
+daily AS (
+  SELECT
+    v.experiment_id,
+    t.experiment_name,
+    v.day,
+    v.variant_id,
+    v.users,
+    v.conversions,
+    c.users AS control_users,
+    c.conversions AS control_conversions,
+    v.cumulative_uplift,
+    v.cumulative_p_value AS naive_p_value,
+    ${ref("msprt_p_value")}(c.conversions, c.users, v.conversions, v.users, ${cfg_labs.sequential_tau_squared}) AS msprt_p_value_of_the_day
+  FROM ${ref("cro_ab_test_daily")} AS v
+  JOIN tests AS t USING (experiment_id)
+  JOIN ${ref("cro_ab_test_daily")} AS c
+    ON c.experiment_id = v.experiment_id AND c.day = v.day AND c.variant_id = t.control_variant
+  WHERE v.variant_id != t.control_variant
+),
+
+running AS (
+  SELECT
+    *,
+    MIN(msprt_p_value_of_the_day) OVER (PARTITION BY experiment_id, variant_id ORDER BY day) AS always_valid_p_value
+  FROM daily
+)
+
+SELECT
+  experiment_id,
+  experiment_name,
+  variant_id,
+  day,
+  users,
+  conversions,
+  control_users,
+  control_conversions,
+  SAFE_DIVIDE(conversions, users) AS conversion_rate,
+  SAFE_DIVIDE(control_conversions, control_users) AS control_conversion_rate,
+  cumulative_uplift,
+  naive_p_value,
+  always_valid_p_value,
+  always_valid_p_value < 0.05 AS can_stop,
+  COALESCE(naive_p_value < 0.05 AND always_valid_p_value >= 0.05, FALSE) AS peeking_trap,
+  COUNTIF(naive_p_value < 0.05 AND always_valid_p_value >= 0.05) OVER (PARTITION BY experiment_id, variant_id) AS days_in_peeking_trap,
+  MIN(IF(always_valid_p_value < 0.05, day, NULL)) OVER (PARTITION BY experiment_id, variant_id) AS first_day_can_stop,
+  CASE
+    WHEN always_valid_p_value < 0.05 AND cumulative_uplift > 0 THEN 'stop_winner'
+    WHEN always_valid_p_value < 0.05 AND cumulative_uplift < 0 THEN 'stop_loser'
+    ELSE 'keep_running'
+  END AS decision,
+  day = MAX(day) OVER (PARTITION BY experiment_id, variant_id) AS is_latest_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM running

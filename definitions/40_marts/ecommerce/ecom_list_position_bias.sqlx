@@ -1,0 +1,106 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 12/06/2024
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_list_position_bias",
+  description: "Product lists without the position bias: the first positions are clicked because they are the first, not because the product is good. For each item and list, the clicks it got against the clicks ANY item would get in the same positions (COEC, clicks over expected clicks, the metric search engines use to rank). Above 1.3 buried in the list = promote it. Below 0.7 at the top = it is wasting the best spot of the shelf",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "merchandising"],
+  columns: {
+    expected_clicks: "Sum over the impressions of the item of the average click rate of the position where it was shown (in the same list)",
+    coec: "clicks / expected_clicks. 1 = performs like the average item of those positions",
+    avg_position: "Average position of the impressions of the item (item_list_index as the site sends it)",
+    position_ctr_at_avg_position: "Click rate of the list at the usual position of the item, for reference",
+    merchandising_action: "promote (clicked more than its position explains, and it is not at the top) | demote (top position, clicked less than expected) | keep"
+  }
+}
+
+js {
+  const pb = cfg_labs.position_bias;
+}
+
+WITH
+list_events AS (
+  SELECT
+    COALESCE(item_list_name, '(not set)') AS item_list_name,
+    item_list_index AS position,
+    item_id,
+    event_name
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(pb.window_days)}
+    AND event_name IN ('view_item_list', 'select_item')
+    AND item_id IS NOT NULL
+    AND item_list_index BETWEEN 0 AND ${pb.max_position}
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+),
+
+per_item_position AS (
+  SELECT
+    item_list_name,
+    position,
+    item_id,
+    COUNTIF(event_name = 'view_item_list') AS impressions,
+    COUNTIF(event_name = 'select_item') AS clicks
+  FROM list_events
+  GROUP BY 1, 2, 3
+),
+
+-- what a position is worth by itself, whatever the product on it
+position_curve AS (
+  SELECT
+    item_list_name,
+    position,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SAFE_DIVIDE(SUM(clicks), SUM(impressions)) AS position_ctr
+  FROM per_item_position
+  GROUP BY 1, 2
+),
+
+per_item AS (
+  SELECT
+    i.item_list_name,
+    i.item_id,
+    SUM(i.impressions) AS impressions,
+    SUM(i.clicks) AS clicks,
+    SUM(i.impressions * c.position_ctr) AS expected_clicks,
+    SAFE_DIVIDE(SUM(i.impressions * i.position), SUM(i.impressions)) AS avg_position
+  FROM per_item_position AS i
+  JOIN position_curve AS c USING (item_list_name, position)
+  GROUP BY 1, 2
+  HAVING SUM(i.impressions) >= ${pb.min_impressions}
+)
+
+SELECT
+  p.item_list_name,
+  p.item_id,
+  d.item_name,
+  d.item_category,
+  d.item_brand,
+  d.current_price,
+  p.impressions,
+  p.clicks,
+  SAFE_DIVIDE(p.clicks, p.impressions) AS ctr,
+  p.expected_clicks,
+  SAFE_DIVIDE(p.clicks, p.expected_clicks) AS coec,
+  p.avg_position,
+  c.position_ctr AS position_ctr_at_avg_position,
+  PERCENT_RANK() OVER (PARTITION BY p.item_list_name ORDER BY p.avg_position) AS position_percentile_in_list,
+  CASE
+    WHEN SAFE_DIVIDE(p.clicks, p.expected_clicks) >= 1.3
+      AND PERCENT_RANK() OVER (PARTITION BY p.item_list_name ORDER BY p.avg_position) > 0.25 THEN 'promote'
+    WHEN SAFE_DIVIDE(p.clicks, p.expected_clicks) <= 0.7
+      AND PERCENT_RANK() OVER (PARTITION BY p.item_list_name ORDER BY p.avg_position) <= 0.25 THEN 'demote'
+    ELSE 'keep'
+  END AS merchandising_action,
+  -- clicks the list would gain if this item had the top position with the same relative appeal
+  SAFE_DIVIDE(p.clicks, p.expected_clicks) * p.impressions * MAX(c.position_ctr) OVER (PARTITION BY p.item_list_name) - p.clicks AS extra_clicks_at_best_position,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_item AS p
+LEFT JOIN position_curve AS c
+  ON c.item_list_name = p.item_list_name AND c.position = CAST(ROUND(p.avg_position) AS INT64)
+LEFT JOIN ${ref("dim_items")} AS d USING (item_id)

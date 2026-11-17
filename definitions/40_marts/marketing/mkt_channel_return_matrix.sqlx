@@ -1,0 +1,80 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2022
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_channel_return_matrix",
+  description: "Where does each channel send people NEXT? For every session, the channel of the following session of the same person (or '(did not return)' after 30 days of silence), last 180 days. The matrix shows which channel really brings back the visitors that the paid media bought, how long it takes, and how the comeback converts. Attribution looks backwards from the sale, this looks forward from the visit",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "labs", "attribution"],
+  columns: {
+    from_channel: "Channel of the session itself (no carry over from older sessions)",
+    to_channel: "Channel of the next session of the same user_key, or '(did not return)'",
+    share_of_from_channel: "transitions / all the sessions of from_channel old enough to be judged",
+    median_days_to_return: "Median days between the two sessions",
+    return_conversion_rate: "Conversion rate of the returning session",
+    is_first_visit_row: "TRUE = only the transitions that started on the first session of the user"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT
+    user_key,
+    session_start_ts,
+    session_date,
+    is_new_user,
+    COALESCE(session_channel_only, session_default_channel_group, '(not set)') AS channel,
+    has_purchase,
+    revenue,
+    LEAD(COALESCE(session_channel_only, session_default_channel_group, '(not set)')) OVER next_session AS next_channel,
+    LEAD(session_start_ts) OVER next_session AS next_session_start_ts,
+    LEAD(has_purchase) OVER next_session AS next_has_purchase,
+    LEAD(revenue) OVER next_session AS next_revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(180)}
+    ${helpers.martSessionFilter()}
+  WINDOW next_session AS (PARTITION BY user_key ORDER BY session_start_ts)
+),
+
+-- a session of yesterday did not have time to "not return" yet
+judged AS (
+  SELECT
+    *,
+    CASE
+      WHEN next_channel IS NOT NULL AND TIMESTAMP_DIFF(next_session_start_ts, session_start_ts, DAY) <= 30 THEN next_channel
+      ELSE '(did not return)'
+    END AS to_channel
+  FROM sessions
+  WHERE session_date < ${helpers.daysAgo(30)}
+),
+
+matrix AS (
+  SELECT
+    channel AS from_channel,
+    to_channel,
+    is_new_user AS is_first_visit_row,
+    COUNT(*) AS transitions,
+    APPROX_QUANTILES(IF(to_channel != '(did not return)', TIMESTAMP_DIFF(next_session_start_ts, session_start_ts, HOUR) / 24, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)] AS median_days_to_return,
+    COUNTIF(to_channel != '(did not return)' AND next_has_purchase) AS return_purchases,
+    SUM(IF(to_channel != '(did not return)', next_revenue, 0)) AS return_revenue
+  FROM judged
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  from_channel,
+  to_channel,
+  is_first_visit_row,
+  transitions,
+  SAFE_DIVIDE(transitions, SUM(transitions) OVER (PARTITION BY from_channel, is_first_visit_row)) AS share_of_from_channel,
+  median_days_to_return,
+  return_purchases,
+  IF(to_channel = '(did not return)', NULL, SAFE_DIVIDE(return_purchases, transitions)) AS return_conversion_rate,
+  return_revenue,
+  from_channel = to_channel AS is_same_channel,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM matrix

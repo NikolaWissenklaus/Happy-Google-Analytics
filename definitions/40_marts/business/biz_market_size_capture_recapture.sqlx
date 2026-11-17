@@ -1,0 +1,108 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 08/04/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_market_size_capture_recapture",
+  description: "How big is the pond? Biologists count the fish of a lake without draining it: catch and tag some, come back later, see how many of the new catch are tagged. Here the two catches are two consecutive months and the tag is the user_key (Chapman estimator, with confidence interval). It estimates the population that orbits the store, visitors and buyers, including the people that did not show up in either month, and how much of it each month really reaches. The 'total addressable audience' nobody can pull from a GA4 report",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "labs", "data_science"],
+  columns: {
+    population: "visitors (any session) | engaged_visitors (engaged session) | buyers (valid purchase)",
+    first_month: "First catch (month start)",
+    seen_first_month: "n1: people seen in the first month",
+    seen_second_month: "n2: people seen in the following month",
+    seen_in_both: "m: the recaptured, seen in both",
+    estimated_population: "Chapman: (n1 + 1) * (n2 + 1) / (m + 1) - 1",
+    reach_of_second_month: "seen_second_month / estimated_population: share of the pond that one month touches",
+    never_seen_estimate: "estimated_population - people seen in at least one of the two months",
+    caveat: "Cookie churn breaks tags (anonymous people look like new fish), so the visitors number is a ceiling. The buyers one, mostly logged in, is the trustworthy one"
+  }
+}
+
+WITH
+monthly AS (
+  SELECT
+    user_key,
+    DATE_TRUNC(activity_date, MONTH) AS month_start,
+    TRUE AS is_visitor,
+    LOGICAL_OR(engaged_sessions > 0) AS is_engaged_visitor,
+    LOGICAL_OR(transactions > 0) AS is_buyer
+  FROM ${ref("fct_user_daily")}
+  -- only complete months
+  WHERE activity_date >= DATE_TRUNC(${helpers.martWindowStart(760)}, MONTH)
+    AND activity_date < DATE_TRUNC(${helpers.today()}, MONTH)
+  GROUP BY 1, 2
+),
+
+populations AS (
+  SELECT 'visitors' AS population, user_key, month_start FROM monthly WHERE is_visitor
+  UNION ALL
+  SELECT 'engaged_visitors', user_key, month_start FROM monthly WHERE is_engaged_visitor
+  UNION ALL
+  SELECT 'buyers', user_key, month_start FROM monthly WHERE is_buyer
+),
+
+paired AS (
+  SELECT
+    a.population,
+    a.month_start AS first_month,
+    COUNT(*) AS seen_first_month,
+    COUNTIF(b.user_key IS NOT NULL) AS seen_in_both
+  FROM populations AS a
+  LEFT JOIN populations AS b
+    ON b.population = a.population
+    AND b.user_key = a.user_key
+    AND b.month_start = DATE_ADD(a.month_start, INTERVAL 1 MONTH)
+  GROUP BY 1, 2
+),
+
+sizes AS (
+  SELECT population, month_start, COUNT(*) AS people
+  FROM populations
+  GROUP BY 1, 2
+),
+
+estimates AS (
+  SELECT
+    p.population,
+    p.first_month,
+    DATE_ADD(p.first_month, INTERVAL 1 MONTH) AS second_month,
+    CAST(p.seen_first_month AS FLOAT64) AS n1,
+    CAST(s.people AS FLOAT64) AS n2,
+    CAST(p.seen_in_both AS FLOAT64) AS m
+  FROM paired AS p
+  JOIN sizes AS s
+    ON s.population = p.population AND s.month_start = DATE_ADD(p.first_month, INTERVAL 1 MONTH)
+),
+
+chapman AS (
+  SELECT
+    *,
+    (n1 + 1) * (n2 + 1) / (m + 1) - 1 AS estimated_population,
+    -- variance of the Chapman estimator (Seber 1970)
+    SQRT((n1 + 1) * (n2 + 1) * (n1 - m) * (n2 - m) / ((m + 1) * (m + 1) * (m + 2))) AS standard_error
+  FROM estimates
+)
+
+SELECT
+  population,
+  first_month,
+  second_month,
+  CAST(n1 AS INT64) AS seen_first_month,
+  CAST(n2 AS INT64) AS seen_second_month,
+  CAST(m AS INT64) AS seen_in_both,
+  SAFE_DIVIDE(m, n1) AS return_rate,
+  ROUND(estimated_population) AS estimated_population,
+  ROUND(GREATEST(n1 + n2 - m, estimated_population - 1.96 * standard_error)) AS estimated_population_low,
+  ROUND(estimated_population + 1.96 * standard_error) AS estimated_population_high,
+  SAFE_DIVIDE(n2, estimated_population) AS reach_of_second_month,
+  ROUND(estimated_population - (n1 + n2 - m)) AS never_seen_estimate,
+  -- with less than ~30 recaptured the estimate is too wide to use
+  m >= 30 AS is_reliable,
+  'Cookie churn breaks tags, so the visitors number is a ceiling. Buyers (mostly logged in) is the trustworthy one' AS caveat,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM chapman

@@ -1,0 +1,109 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 11/06/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_search_reformulations",
+  description: "The synonym dictionary the customers write for free: pairs of searches made one right after the other in the same session, without clicking a product in between (last 90 days). 'tenis corrida' -> 'tenis running', 'sofa' -> 'estofado', and all the typos. Each pair says whether the second try worked, so it is ready to become a synonym or a redirect in the search engine",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs", "search"],
+  columns: {
+    from_term: "First search (normalized: lower case, no accents)",
+    to_term: "The search made right after, without a product click in between",
+    reformulation_type: "typo (1-2 characters apart) | refinement (added words) | generalization (removed words) | synonym_candidate (different words)",
+    to_term_success_rate: "Share of the times the second search was followed by a product click. High = the second term is the one the catalog understands",
+    suggested_action: "add_synonym | add_typo_correction | fix_both (the second try fails too) | watch"
+  }
+}
+
+WITH
+relevant_events AS (
+  SELECT
+    session_key,
+    event_ts,
+    event_name,
+    IF(event_name = 'view_search_results', ${ref("normalize_text")}(${ref("url_decode")}(search_term)), NULL) AS term
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(90)}
+    AND (
+      (event_name = 'view_search_results' AND search_term IS NOT NULL)
+      OR event_name IN ('view_item', 'select_item', 'add_to_cart')
+    )
+    ${helpers.noiseFilter()}
+),
+
+sequenced AS (
+  SELECT
+    *,
+    LEAD(event_name) OVER (PARTITION BY session_key ORDER BY event_ts) AS next_event_name,
+    LEAD(term) OVER (PARTITION BY session_key ORDER BY event_ts) AS next_term,
+    LEAD(event_ts) OVER (PARTITION BY session_key ORDER BY event_ts) AS next_event_ts
+  FROM relevant_events
+),
+
+searches AS (
+  SELECT
+    session_key,
+    term,
+    next_term,
+    TIMESTAMP_DIFF(next_event_ts, event_ts, SECOND) AS seconds_to_next,
+    COALESCE(next_event_name = 'view_search_results' AND next_term != term, FALSE) AS was_reformulated,
+    COALESCE(next_event_name IN ('view_item', 'select_item', 'add_to_cart'), FALSE) AS got_product_click
+  FROM sequenced
+  WHERE event_name = 'view_search_results'
+    AND term IS NOT NULL
+),
+
+term_stats AS (
+  SELECT
+    term,
+    COUNT(*) AS searches,
+    SAFE_DIVIDE(COUNTIF(got_product_click), COUNT(*)) AS success_rate
+  FROM searches
+  GROUP BY term
+),
+
+pairs AS (
+  SELECT
+    term AS from_term,
+    next_term AS to_term,
+    COUNT(*) AS reformulations,
+    COUNT(DISTINCT session_key) AS sessions,
+    APPROX_QUANTILES(seconds_to_next, 2)[OFFSET(1)] AS median_seconds_between
+  FROM searches
+  WHERE was_reformulated
+    -- more than 5 minutes later it is another need, not a second try
+    AND seconds_to_next <= 300
+  GROUP BY 1, 2
+  HAVING COUNT(DISTINCT session_key) >= 3
+)
+
+SELECT
+  p.from_term,
+  p.to_term,
+  p.reformulations,
+  p.sessions,
+  p.median_seconds_between,
+  f.searches AS from_term_searches,
+  SAFE_DIVIDE(p.reformulations, f.searches) AS share_of_from_term_searches,
+  f.success_rate AS from_term_success_rate,
+  t.success_rate AS to_term_success_rate,
+  CASE
+    WHEN EDIT_DISTANCE(p.from_term, p.to_term) <= 2 THEN 'typo'
+    WHEN STARTS_WITH(p.to_term, p.from_term) OR STRPOS(p.to_term, CONCAT(' ', p.from_term)) > 0 THEN 'refinement'
+    WHEN STARTS_WITH(p.from_term, p.to_term) OR STRPOS(p.from_term, CONCAT(' ', p.to_term)) > 0 THEN 'generalization'
+    ELSE 'synonym_candidate'
+  END AS reformulation_type,
+  CASE
+    WHEN t.success_rate < 0.2 THEN 'fix_both'
+    WHEN EDIT_DISTANCE(p.from_term, p.to_term) <= 2 AND t.success_rate >= f.success_rate + 0.1 THEN 'add_typo_correction'
+    WHEN NOT (STARTS_WITH(p.to_term, p.from_term) OR STARTS_WITH(p.from_term, p.to_term)) AND t.success_rate >= f.success_rate + 0.1 THEN 'add_synonym'
+    ELSE 'watch'
+  END AS suggested_action,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+JOIN term_stats AS f ON f.term = p.from_term
+JOIN term_stats AS t ON t.term = p.to_term

@@ -1,0 +1,130 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 03/04/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_post_purchase_behavior",
+  description: "What happens AFTER the thank you page, where every GA4 report stops: in the 30 days after each order, did the customer come back, how many times did they open the order tracking, did they go to the support or to the exchange / return pages, and did they buy again. By payment type, shipping tier, state, device and first x repeat order. 'Customers of the economic shipping open the tracking page 6 times and 9% end up in the support': the delivery anxiety, measured",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs", "ecommerce"],
+  columns: {
+    dimension: "payment_type | shipping_tier | geo_uf | device_category | order_type | all",
+    dimension_value: "Value of the dimension ('all' has one row with the total)",
+    tracking_visit_rate: "Orders whose customer opened an order tracking page in the window (cfg_labs.post_purchase.order_tracking_pattern)",
+    avg_tracking_views: "Tracking page views per order that opened it at least once. Anxiety meter",
+    support_visit_rate: "Orders followed by a visit to contact / help / FAQ pages",
+    returns_visit_rate: "Orders followed by a visit to exchange / return / cancel pages. Early warning of a refund",
+    anxiety_index: "support_visit_rate of the row / support_visit_rate of all orders"
+  }
+}
+
+js {
+  const pp = cfg_labs.post_purchase;
+}
+
+WITH
+-- only orders old enough to have the whole window observed
+orders AS (
+  SELECT
+    transaction_id,
+    user_key,
+    transaction_ts,
+    transaction_date,
+    revenue,
+    COALESCE(payment_type, '(not set)') AS payment_type,
+    COALESCE(shipping_tier, '(not set)') AS shipping_tier,
+    COALESCE(geo_uf, '(outside BR / unknown)') AS geo_uf,
+    COALESCE(device_category, '(not set)') AS device_category,
+    IF(is_first_purchase, 'first order', 'repeat order') AS order_type
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date BETWEEN ${helpers.daysAgo(pp.window_days + 120)} AND ${helpers.daysAgo(pp.window_days + 1)}
+),
+
+views_after AS (
+  SELECT
+    o.transaction_id,
+    COUNT(DISTINCT v.session_key) AS sessions_after,
+    COUNTIF(REGEXP_CONTAINS(v.page_path, r'${pp.order_tracking_pattern}')) AS tracking_views,
+    COUNTIF(REGEXP_CONTAINS(v.page_path, r'${pp.support_pattern}')) AS support_views,
+    COUNTIF(REGEXP_CONTAINS(v.page_path, r'${pp.returns_pattern}')) AS returns_views,
+    MIN(IF(REGEXP_CONTAINS(v.page_path, r'${pp.support_pattern}'), TIMESTAMP_DIFF(v.event_ts, o.transaction_ts, HOUR), NULL)) / 24 AS days_to_first_support_visit,
+    MIN(TIMESTAMP_DIFF(v.event_ts, o.transaction_ts, HOUR)) / 24 AS days_to_first_return
+  FROM orders AS o
+  JOIN ${ref("fct_page_views")} AS v
+    ON v.user_key = o.user_key
+    AND v.event_date BETWEEN o.transaction_date AND DATE_ADD(o.transaction_date, INTERVAL ${pp.window_days} DAY)
+    -- the session of the order itself (thank you page, order summary) is not "after"
+    AND v.event_ts > TIMESTAMP_ADD(o.transaction_ts, INTERVAL 60 MINUTE)
+  WHERE v.event_date >= ${helpers.daysAgo(pp.window_days + 120)}
+  GROUP BY o.transaction_id
+),
+
+next_order AS (
+  SELECT o.transaction_id, COUNT(*) AS orders_after
+  FROM orders AS o
+  JOIN ${ref("fct_transactions")} AS n
+    ON n.user_key = o.user_key
+    AND n.is_valid_for_revenue
+    AND n.transaction_ts > o.transaction_ts
+    AND n.transaction_date <= DATE_ADD(o.transaction_date, INTERVAL ${pp.window_days} DAY)
+  GROUP BY o.transaction_id
+),
+
+per_order AS (
+  SELECT
+    o.*,
+    COALESCE(a.sessions_after, 0) AS sessions_after,
+    COALESCE(a.tracking_views, 0) AS tracking_views,
+    COALESCE(a.support_views, 0) AS support_views,
+    COALESCE(a.returns_views, 0) AS returns_views,
+    a.days_to_first_support_visit,
+    a.days_to_first_return,
+    COALESCE(n.orders_after, 0) AS orders_after
+  FROM orders AS o
+  LEFT JOIN views_after AS a USING (transaction_id)
+  LEFT JOIN next_order AS n USING (transaction_id)
+),
+
+unpivoted AS (
+  SELECT d.dimension, d.dimension_value, p.*
+  FROM per_order AS p,
+    UNNEST([
+      STRUCT('all' AS dimension, 'all' AS dimension_value),
+      STRUCT('payment_type', p.payment_type),
+      STRUCT('shipping_tier', p.shipping_tier),
+      STRUCT('geo_uf', p.geo_uf),
+      STRUCT('device_category', p.device_category),
+      STRUCT('order_type', p.order_type)
+    ]) AS d
+),
+
+aggregated AS (
+  SELECT
+    dimension,
+    dimension_value,
+    COUNT(*) AS orders,
+    SUM(revenue) AS revenue,
+    SAFE_DIVIDE(COUNTIF(sessions_after > 0), COUNT(*)) AS came_back_rate,
+    AVG(sessions_after) AS avg_sessions_after,
+    AVG(days_to_first_return) AS avg_days_to_come_back,
+    SAFE_DIVIDE(COUNTIF(tracking_views > 0), COUNT(*)) AS tracking_visit_rate,
+    SAFE_DIVIDE(SUM(tracking_views), COUNTIF(tracking_views > 0)) AS avg_tracking_views,
+    SAFE_DIVIDE(COUNTIF(support_views > 0), COUNT(*)) AS support_visit_rate,
+    AVG(days_to_first_support_visit) AS avg_days_to_first_support_visit,
+    SAFE_DIVIDE(COUNTIF(returns_views > 0), COUNT(*)) AS returns_visit_rate,
+    SAFE_DIVIDE(COUNTIF(orders_after > 0), COUNT(*)) AS repurchase_rate
+  FROM unpivoted
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= 20
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(support_visit_rate, MAX(IF(dimension = 'all', support_visit_rate, NULL)) OVER ()) AS anxiety_index,
+  ${pp.window_days} AS window_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregated

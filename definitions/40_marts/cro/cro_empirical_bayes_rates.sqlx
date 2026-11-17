@@ -1,0 +1,128 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/05/2024
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_empirical_bayes_rates",
+  description: "Conversion rates you can actually rank: the campaign with 2 sales in 9 sessions is not the best of the company. Each landing page, campaign, source / medium and city gets its rate pulled towards the average of its kind in proportion to how little data it has (empirical Bayes, the beta-binomial trick used to rank baseball players with few games). The prior is learned from the data itself. Ranking by the shrunk rate puts the truly good ones on top, with a credible interval for each (last 90 days)",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro" }
+  },
+  tags: ["marts", "cro", "daily", "labs", "stats"],
+  columns: Object.assign(docs.pick("sessions"), {
+    entity_type: "landing_page | campaign | source_medium | city",
+    entity: "The page path, campaign, source / medium or city",
+    raw_rate: "purchase sessions / sessions, as every report shows",
+    shrunk_rate: "(purchases + alpha) / (sessions + alpha + beta): the estimate of the true rate",
+    prior_strength: "alpha + beta of the entity type: how many sessions the average of the kind 'weighs'. An entity needs about this many sessions to speak for itself",
+    credible_low: "Lower bound of the 95% credible interval (normal approximation of the beta posterior)",
+    raw_rank: "Position by raw_rate inside the entity type",
+    shrunk_rank: "Position by shrunk_rate. Compare with raw_rank to see who was only lucky",
+    verdict: "truly_above_average (the whole interval above the prior mean) | truly_below_average | not_enough_evidence"
+  })
+}
+
+js {
+  const eb = cfg_labs.empirical_bayes;
+}
+
+WITH
+sessions AS (
+  SELECT
+    landing_page_path,
+    NULLIF(session_campaign, '(not set)') AS session_campaign,
+    session_source_medium,
+    IF(geo_city IS NULL OR geo_city = '(not set)', NULL, CONCAT(geo_city, COALESCE(CONCAT(' - ', geo_uf), ''))) AS city,
+    has_purchase,
+    revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(eb.window_days)}
+    ${helpers.martSessionFilter()}
+),
+
+entities AS (
+  SELECT d.entity_type, d.entity, COUNT(*) AS sessions, COUNTIF(s.has_purchase) AS purchases, SUM(s.revenue) AS revenue
+  FROM sessions AS s,
+    UNNEST([
+      STRUCT('landing_page' AS entity_type, s.landing_page_path AS entity),
+      STRUCT('campaign', s.session_campaign),
+      STRUCT('source_medium', s.session_source_medium),
+      STRUCT('city', s.city)
+    ]) AS d
+  WHERE d.entity IS NOT NULL
+  GROUP BY 1, 2
+),
+
+-- method of moments. the variance between the raw rates has the binomial noise inside it,
+-- so the average noise is taken out before turning it into alpha + beta
+moments AS (
+  SELECT
+    entity_type,
+    SAFE_DIVIDE(SUM(purchases), SUM(sessions)) AS prior_mean,
+    VAR_POP(SAFE_DIVIDE(purchases, sessions)) AS variance_of_raw_rates,
+    AVG(SAFE_DIVIDE(SAFE_DIVIDE(purchases, sessions) * (1 - SAFE_DIVIDE(purchases, sessions)), sessions)) AS avg_binomial_noise
+  FROM entities
+  WHERE sessions >= ${eb.min_sessions_for_prior}
+  GROUP BY entity_type
+),
+
+priors AS (
+  SELECT
+    entity_type,
+    prior_mean,
+    -- alpha + beta = m * (1 - m) / true variance - 1. kept between 10 and 100 thousand so a
+    -- degenerate variance (all rates equal, or almost no entity) does not break the table
+    LEAST(100000, GREATEST(10, COALESCE(
+      SAFE_DIVIDE(prior_mean * (1 - prior_mean), GREATEST(variance_of_raw_rates - avg_binomial_noise, 1e-9)) - 1,
+      100000
+    ))) AS prior_strength
+  FROM moments
+),
+
+posterior AS (
+  SELECT
+    e.*,
+    p.prior_mean,
+    p.prior_strength,
+    e.purchases + p.prior_mean * p.prior_strength AS alpha_post,
+    e.sessions - e.purchases + (1 - p.prior_mean) * p.prior_strength AS beta_post
+  FROM entities AS e
+  JOIN priors AS p USING (entity_type)
+),
+
+shrunk AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(purchases, sessions) AS raw_rate,
+    SAFE_DIVIDE(alpha_post, alpha_post + beta_post) AS shrunk_rate,
+    SQRT(SAFE_DIVIDE(alpha_post * beta_post, POW(alpha_post + beta_post, 2) * (alpha_post + beta_post + 1))) AS posterior_sd
+  FROM posterior
+)
+
+SELECT
+  entity_type,
+  entity,
+  sessions,
+  purchases,
+  revenue,
+  raw_rate,
+  shrunk_rate,
+  GREATEST(0, shrunk_rate - 1.96 * posterior_sd) AS credible_low,
+  LEAST(1, shrunk_rate + 1.96 * posterior_sd) AS credible_high,
+  prior_mean,
+  prior_strength,
+  -- how much of the estimate is the entity's own data (0 = all prior, 1 = all data)
+  SAFE_DIVIDE(sessions, sessions + prior_strength) AS own_data_weight,
+  RANK() OVER (PARTITION BY entity_type ORDER BY raw_rate DESC) AS raw_rank,
+  RANK() OVER (PARTITION BY entity_type ORDER BY shrunk_rate DESC) AS shrunk_rank,
+  CASE
+    WHEN shrunk_rate - 1.96 * posterior_sd > prior_mean THEN 'truly_above_average'
+    WHEN shrunk_rate + 1.96 * posterior_sd < prior_mean THEN 'truly_below_average'
+    ELSE 'not_enough_evidence'
+  END AS verdict,
+  -- sales that would exist if the entity converted like the average of its kind
+  GREATEST(0, sessions * (prior_mean - shrunk_rate)) AS purchases_missing_vs_average,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM shrunk
+WHERE sessions >= 5

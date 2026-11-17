@@ -1,0 +1,108 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/08/2019
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_freight_shock",
+  description: "The freight shock, state by state: in Brazil the shipping price kills more checkouts than any button color. Per UF and cart value band (last 90 days): checkouts that reached the shipping step and died right there, against the weight of the shipping in the orders that did close (shipping / order value, share with free shipping). Where the index is high the customer saw the freight and gave up: the map for regional free shipping, a new carrier or a distribution center",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "geo"],
+  columns: Object.assign(docs.pick("geo_uf"), {
+    cart_value_band: "Band of the checkout value of the session, property currency",
+    died_at_shipping_rate: "Checkout sessions that sent add_shipping_info and never reached the payment or the purchase / sessions that sent add_shipping_info",
+    shipping_share_of_order: "SUM(shipping) / SUM(revenue) of the paid orders of the UF and band",
+    freight_shock_index: "died_at_shipping_rate of the row / the national rate of the same value band. 1.4 = 40% more deaths at the shipping step than the country",
+    lost_checkouts_vs_national: "Checkouts that would not have died at the shipping step if the UF had the national rate of its band"
+  })
+}
+
+WITH
+checkout_sessions AS (
+  SELECT
+    COALESCE(geo_uf, '(outside BR / unknown)') AS geo_uf,
+    geo_macro_region,
+    CASE
+      WHEN COALESCE(checkout_value, cart_value) IS NULL THEN '(no value)'
+      WHEN COALESCE(checkout_value, cart_value) < 100 THEN '1. under 100'
+      WHEN COALESCE(checkout_value, cart_value) < 250 THEN '2. 100 to 250'
+      WHEN COALESCE(checkout_value, cart_value) < 500 THEN '3. 250 to 500'
+      WHEN COALESCE(checkout_value, cart_value) < 1000 THEN '4. 500 to 1000'
+      ELSE '5. 1000 or more'
+    END AS cart_value_band,
+    has_add_shipping_info,
+    has_add_payment_info,
+    has_purchase,
+    last_shipping_tier
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(90)}
+    AND has_begin_checkout
+    ${helpers.martSessionFilter()}
+),
+
+checkout_agg AS (
+  SELECT
+    geo_uf,
+    ANY_VALUE(geo_macro_region) AS geo_macro_region,
+    cart_value_band,
+    COUNT(*) AS checkout_sessions,
+    COUNTIF(has_add_shipping_info) AS reached_shipping,
+    COUNTIF(has_add_shipping_info AND NOT has_add_payment_info AND NOT has_purchase) AS died_at_shipping,
+    COUNTIF(has_purchase) AS purchase_sessions,
+    APPROX_TOP_COUNT(last_shipping_tier, 1)[SAFE_OFFSET(0)].value AS most_common_shipping_tier
+  FROM checkout_sessions
+  GROUP BY geo_uf, cart_value_band
+),
+
+orders AS (
+  SELECT
+    COALESCE(geo_uf, '(outside BR / unknown)') AS geo_uf,
+    CASE
+      WHEN revenue < 100 THEN '1. under 100'
+      WHEN revenue < 250 THEN '2. 100 to 250'
+      WHEN revenue < 500 THEN '3. 250 to 500'
+      WHEN revenue < 1000 THEN '4. 500 to 1000'
+      ELSE '5. 1000 or more'
+    END AS cart_value_band,
+    COUNT(*) AS orders,
+    SUM(revenue) AS revenue,
+    SUM(COALESCE(shipping_value, 0)) AS shipping_value,
+    COUNTIF(COALESCE(shipping_value, 0) = 0) AS free_shipping_orders,
+    AVG(IF(shipping_value > 0, shipping_value, NULL)) AS avg_paid_shipping
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.daysAgo(90)}
+  GROUP BY 1, 2
+),
+
+national AS (
+  SELECT cart_value_band, SAFE_DIVIDE(SUM(died_at_shipping), SUM(reached_shipping)) AS national_died_at_shipping_rate
+  FROM checkout_agg
+  GROUP BY cart_value_band
+)
+
+SELECT
+  c.geo_uf,
+  c.geo_macro_region,
+  c.cart_value_band,
+  c.checkout_sessions,
+  c.reached_shipping,
+  c.died_at_shipping,
+  SAFE_DIVIDE(c.died_at_shipping, c.reached_shipping) AS died_at_shipping_rate,
+  n.national_died_at_shipping_rate,
+  SAFE_DIVIDE(SAFE_DIVIDE(c.died_at_shipping, c.reached_shipping), n.national_died_at_shipping_rate) AS freight_shock_index,
+  GREATEST(0, c.died_at_shipping - c.reached_shipping * n.national_died_at_shipping_rate) AS lost_checkouts_vs_national,
+  SAFE_DIVIDE(c.purchase_sessions, c.checkout_sessions) AS checkout_to_purchase_rate,
+  c.most_common_shipping_tier,
+  o.orders,
+  o.revenue,
+  SAFE_DIVIDE(o.shipping_value, o.revenue) AS shipping_share_of_order,
+  o.avg_paid_shipping,
+  SAFE_DIVIDE(o.free_shipping_orders, o.orders) AS free_shipping_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checkout_agg AS c
+LEFT JOIN national AS n USING (cart_value_band)
+LEFT JOIN orders AS o ON o.geo_uf = c.geo_uf AND o.cart_value_band = c.cart_value_band
+WHERE c.checkout_sessions >= 30

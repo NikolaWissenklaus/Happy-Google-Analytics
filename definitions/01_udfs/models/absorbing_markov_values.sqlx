@@ -1,0 +1,74 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 12/10/2023
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "absorbing_markov_values",
+  description: "Absorbing Markov chain: for each state, the probability of ending in the success state (ex: purchase) instead of the failure state (ex: exit), and the expected number of steps until one of the two. Gives a value to every step of a journey",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "models", "labs"]
+}
+
+-- the same math of the attribution Markov, used the other way around: instead of "what happens
+-- if I remove this channel", it answers "how much is it worth to BE in this state right now".
+-- v(success) = 1, v(failure) = 0, v(s) = sum of P(s -> t) * v(t). Solved by iteration, so it does
+-- not need a matrix inversion (and survives loops like cart > product > cart).
+-- a state with no way out counts as failure (the journey ended there)
+CREATE OR REPLACE FUNCTION ${self()}(
+  transitions ARRAY<STRUCT<src STRING, dst STRING, weight FLOAT64>>,
+  success_state STRING,
+  failure_state STRING,
+  iterations FLOAT64
+)
+RETURNS ARRAY<STRUCT<state STRING, success_probability FLOAT64, expected_steps FLOAT64, visits FLOAT64>>
+LANGUAGE js AS r"""
+  var rounds = (iterations === null || iterations === undefined) ? 200 : Math.max(1, Math.round(iterations));
+  var list = transitions || [];
+  var index = {};
+  var names = [];
+  function idOf(name) {
+    if (index[name] === undefined) { index[name] = names.length; names.push(name); }
+    return index[name];
+  }
+  var src = [], dst = [], w = [];
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i];
+    if (!t || t.src === null || t.dst === null || t.src === undefined || t.dst === undefined) continue;
+    var weight = (t.weight === null || t.weight === undefined || isNaN(t.weight)) ? 1 : Number(t.weight);
+    if (weight <= 0) continue;
+    // nothing leaves an absorbing state
+    if (t.src === success_state || t.src === failure_state) continue;
+    src.push(idOf(t.src)); dst.push(idOf(t.dst)); w.push(weight);
+  }
+  var n = names.length;
+  if (n === 0) return [];
+  var outW = new Array(n), value = new Array(n), steps = new Array(n);
+  for (var k = 0; k < n; k++) { outW[k] = 0; value[k] = 0; steps[k] = 0; }
+  for (var j = 0; j < src.length; j++) outW[src[j]] += w[j];
+  var okId = index[success_state], failId = index[failure_state];
+  if (okId !== undefined) value[okId] = 1;
+  for (var it = 0; it < rounds; it++) {
+    var nextValue = new Array(n), nextSteps = new Array(n);
+    for (var a = 0; a < n; a++) { nextValue[a] = 0; nextSteps[a] = 0; }
+    for (var m = 0; m < src.length; m++) {
+      var p = w[m] / outW[src[m]];
+      nextValue[src[m]] += p * value[dst[m]];
+      nextSteps[src[m]] += p * steps[dst[m]];
+    }
+    var moved = 0;
+    for (var b = 0; b < n; b++) {
+      var isAbsorbing = (b === okId || b === failId || outW[b] === 0);
+      var v = isAbsorbing ? (b === okId ? 1 : 0) : nextValue[b];
+      var s = isAbsorbing ? 0 : 1 + nextSteps[b];
+      moved = Math.max(moved, Math.abs(v - value[b]), Math.abs(s - steps[b]) / 1000);
+      value[b] = v; steps[b] = s;
+    }
+    if (moved < 1e-10) break;
+  }
+  var out = [];
+  for (var c = 0; c < n; c++) out.push({ state: names[c], success_probability: value[c], expected_steps: steps[c], visits: outW[c] });
+  return out;
+"""
+OPTIONS (description = "Success probability and expected steps of each state of an absorbing Markov chain")

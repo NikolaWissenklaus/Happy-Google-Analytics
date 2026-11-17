@@ -1,0 +1,129 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 13/12/2024
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_simpson_paradox_watch",
+  description: "Is the conversion rate really worse, or did the mix change? Last 28 days against the 28 before, for each dimension (device, channel, new x returning, region, landing page type): the change of the total conversion rate split EXACTLY in mix effect (more traffic of the segments that convert less) and rate effect (the segments themselves converting worse). And the alarm for the Simpson paradox: the total falls while every segment improves, or the opposite. The meeting where somebody says 'conversion dropped 8%' and the truth is 'the campaign brought cheap mobile traffic and everything else got better'",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "labs", "alerts"],
+  columns: {
+    dimension: "device_category | channel | user_type | macro_region | landing_page_type",
+    segment: "Value of the dimension",
+    mix_effect: "(share now - share before) * (conversion of the segment before - total conversion before). Points of total conversion rate moved by the change of the size of the segment",
+    rate_effect: "share now * (conversion of the segment now - before). Points moved by the segment itself",
+    total_change: "Total conversion rate now - before. The mix and rate effects of the dimension sum exactly to it",
+    dimension_mix_effect: "Sum of the mix effects of the dimension",
+    dimension_rate_effect: "Sum of the rate effects of the dimension",
+    is_simpson_paradox: "TRUE when the total moved in one direction and the rate effect of the dimension points to the other: the segments say the opposite of the total",
+    reading: "One sentence for the dimension"
+  }
+}
+
+WITH
+sessions AS (
+  SELECT
+    IF(session_date >= ${helpers.daysAgo(28)}, 'now', 'before') AS period,
+    COALESCE(device_category, '(not set)') AS device_category,
+    COALESCE(session_default_channel_group, '(not set)') AS channel,
+    IF(is_new_user, 'new', 'returning') AS user_type,
+    COALESCE(geo_macro_region, '(outside BR / unknown)') AS macro_region,
+    COALESCE(landing_page_type, 'other') AS landing_page_type,
+    has_purchase
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(56)}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+unpivoted AS (
+  SELECT s.period, d.dimension, d.segment, s.has_purchase
+  FROM sessions AS s,
+    UNNEST([
+      STRUCT('device_category' AS dimension, s.device_category AS segment),
+      STRUCT('channel', s.channel),
+      STRUCT('user_type', s.user_type),
+      STRUCT('macro_region', s.macro_region),
+      STRUCT('landing_page_type', s.landing_page_type)
+    ]) AS d
+),
+
+per_segment AS (
+  SELECT
+    dimension,
+    segment,
+    COUNTIF(period = 'before') AS sessions_before,
+    COUNTIF(period = 'now') AS sessions_now,
+    COUNTIF(period = 'before' AND has_purchase) AS purchases_before,
+    COUNTIF(period = 'now' AND has_purchase) AS purchases_now
+  FROM unpivoted
+  GROUP BY 1, 2
+),
+
+with_shares AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(sessions_before, SUM(sessions_before) OVER (PARTITION BY dimension)) AS share_before,
+    SAFE_DIVIDE(sessions_now, SUM(sessions_now) OVER (PARTITION BY dimension)) AS share_now,
+    COALESCE(SAFE_DIVIDE(purchases_before, sessions_before), 0) AS rate_before,
+    -- a segment that disappeared keeps its old rate, so its whole change goes to the mix effect
+    COALESCE(SAFE_DIVIDE(purchases_now, sessions_now), SAFE_DIVIDE(purchases_before, sessions_before), 0) AS rate_now,
+    SAFE_DIVIDE(SUM(purchases_before) OVER (PARTITION BY dimension), SUM(sessions_before) OVER (PARTITION BY dimension)) AS total_rate_before,
+    SAFE_DIVIDE(SUM(purchases_now) OVER (PARTITION BY dimension), SUM(sessions_now) OVER (PARTITION BY dimension)) AS total_rate_now
+  FROM per_segment
+),
+
+effects AS (
+  SELECT
+    *,
+    (share_now - share_before) * (rate_before - total_rate_before) AS mix_effect,
+    share_now * (rate_now - rate_before) AS rate_effect
+  FROM with_shares
+),
+
+per_dimension AS (
+  SELECT
+    *,
+    total_rate_now - total_rate_before AS total_change,
+    SUM(mix_effect) OVER (PARTITION BY dimension) AS dimension_mix_effect,
+    SUM(rate_effect) OVER (PARTITION BY dimension) AS dimension_rate_effect,
+    -- only segments with some volume vote
+    COUNTIF(rate_now > rate_before AND sessions_now >= 200 AND sessions_before >= 200) OVER (PARTITION BY dimension) AS segments_improving,
+    COUNTIF(rate_now < rate_before AND sessions_now >= 200 AND sessions_before >= 200) OVER (PARTITION BY dimension) AS segments_worsening
+  FROM effects
+)
+
+SELECT
+  dimension,
+  segment,
+  sessions_before,
+  sessions_now,
+  share_before,
+  share_now,
+  rate_before,
+  rate_now,
+  mix_effect,
+  rate_effect,
+  total_rate_before,
+  total_rate_now,
+  total_change,
+  dimension_mix_effect,
+  dimension_rate_effect,
+  segments_improving,
+  segments_worsening,
+  COALESCE(SIGN(total_change) != 0 AND SIGN(dimension_rate_effect) != 0 AND SIGN(total_change) != SIGN(dimension_rate_effect), FALSE) AS is_simpson_paradox,
+  SAFE_DIVIDE(ABS(dimension_mix_effect), ABS(dimension_mix_effect) + ABS(dimension_rate_effect)) AS mix_share_of_change,
+  CASE
+    WHEN SIGN(total_change) != 0 AND SIGN(dimension_rate_effect) != 0 AND SIGN(total_change) != SIGN(dimension_rate_effect)
+      THEN CONCAT('PARADOX: total conversion ', IF(total_change < 0, 'fell', 'rose'), ' but inside the segments of ', dimension, ' it ', IF(dimension_rate_effect < 0, 'fell', 'rose'), '. The traffic mix explains the total')
+    WHEN SAFE_DIVIDE(ABS(dimension_mix_effect), ABS(dimension_mix_effect) + ABS(dimension_rate_effect)) >= 0.6
+      THEN CONCAT('Mostly mix: the change comes from the size of the segments of ', dimension, ', not from their conversion')
+    WHEN SAFE_DIVIDE(ABS(dimension_mix_effect), ABS(dimension_mix_effect) + ABS(dimension_rate_effect)) <= 0.2
+      THEN CONCAT('Real change: the segments of ', dimension, ' convert differently, the mix barely moved')
+    ELSE CONCAT('Both: mix and conversion of the segments of ', dimension, ' moved')
+  END AS reading,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_dimension

@@ -1,0 +1,159 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 07/03/2025
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_ui_vs_bigquery_explainer",
+  description: "'Why does BigQuery not match the GA4 screen?', answered with numbers instead of a shrug. Per day (last 60), the size of each known cause: events without cookie that the interface models and the export delivers anonymous, sessions that cross midnight and count in two days, sessions without session_start, the user count by device against the count by user_id the interface blends, purchases repeated with the same transaction id, duplicated rows, page urls above the limit that turns the tail into (other), and the HyperLogLog error margin of the interface itself. The table to open before the meeting about 'which number is right'",
+  bigquery: {
+    partitionBy: "event_date",
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "labs"],
+  columns: Object.assign(docs.pick("event_date"), {
+    cookieless_event_share: "Events with no user_pseudo_id (consent denied). The interface estimates users and sessions for them (behavioural modelling), BigQuery cannot: BigQuery shows LESS users and sessions",
+    sessions_crossing_midnight: "Sessions with events in this day that started the day before. The interface counts them in both days, a COUNT DISTINCT over a period counts once: daily sums in the interface are BIGGER",
+    sessions_without_session_start: "Sessions with no session_start event. Reports that count the event show LESS sessions than the distinct session ids",
+    users_by_device: "COUNT DISTINCT user_pseudo_id",
+    users_blended: "COUNT DISTINCT of user_id when it exists, else user_pseudo_id: closer to the 'blended' reporting identity of the interface",
+    repeated_purchase_events: "purchase events beyond the first of each transaction_id. The interface deduplicates per user, BigQuery raw sums double",
+    duplicated_rows_removed: "Identical rows of the export that staging dropped",
+    distinct_page_urls: "Different page_location values of the day. Above 50 thousand the interface starts to group rows in (other)",
+    hll_users_margin: "Around 1.6% of users_by_device: the interface counts users with HyperLogLog++, a difference this size is not a difference",
+    biggest_expected_cause: "The cause with the biggest relative weight on the day",
+    expected_direction: "What to expect when comparing users / sessions of the day"
+  })
+}
+
+WITH
+events AS (
+  SELECT
+    event_date,
+    event_name,
+    session_key,
+    user_pseudo_id,
+    user_id,
+    ga_session_id,
+    is_cookieless,
+    transaction_id,
+    duplicate_count,
+    page_location
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(60)}
+    ${helpers.noiseFilter()}
+),
+
+session_first_day AS (
+  SELECT session_key, MIN(event_date) AS first_event_date, LOGICAL_OR(event_name = 'session_start') AS has_session_start
+  FROM events
+  WHERE session_key IS NOT NULL
+  GROUP BY session_key
+),
+
+per_session_day AS (
+  SELECT
+    e.event_date,
+    e.session_key,
+    ANY_VALUE(f.first_event_date) < e.event_date AS started_before_today,
+    ANY_VALUE(f.has_session_start) AS has_session_start
+  FROM events AS e
+  JOIN session_first_day AS f USING (session_key)
+  GROUP BY 1, 2
+),
+
+sessions_daily AS (
+  SELECT
+    event_date,
+    COUNT(*) AS sessions_with_events,
+    COUNTIF(started_before_today) AS sessions_crossing_midnight,
+    COUNTIF(NOT started_before_today AND NOT has_session_start) AS sessions_without_session_start
+  FROM per_session_day
+  GROUP BY event_date
+),
+
+purchases AS (
+  SELECT event_date, COUNT(*) AS purchase_events, COUNT(DISTINCT transaction_id) AS distinct_transactions
+  FROM events
+  WHERE event_name = 'purchase'
+  GROUP BY event_date
+),
+
+events_daily AS (
+  SELECT
+    event_date,
+    COUNT(*) AS events,
+    COUNTIF(is_cookieless) AS cookieless_events,
+    COUNTIF(NOT is_cookieless AND ga_session_id IS NULL) AS events_without_session_id,
+    COUNT(DISTINCT user_pseudo_id) AS users_by_device,
+    COUNT(DISTINCT COALESCE(CONCAT('uid:', user_id), user_pseudo_id)) AS users_blended,
+    SUM(duplicate_count - 1) AS duplicated_rows_removed,
+    APPROX_COUNT_DISTINCT(page_location) AS distinct_page_urls
+  FROM events
+  GROUP BY event_date
+),
+
+joined AS (
+  SELECT
+    e.*,
+    s.sessions_with_events,
+    s.sessions_crossing_midnight,
+    s.sessions_without_session_start,
+    COALESCE(p.purchase_events, 0) AS purchase_events,
+    COALESCE(p.distinct_transactions, 0) AS distinct_transactions
+  FROM events_daily AS e
+  LEFT JOIN sessions_daily AS s USING (event_date)
+  LEFT JOIN purchases AS p USING (event_date)
+),
+
+shares AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(cookieless_events, events) AS cookieless_event_share,
+    SAFE_DIVIDE(sessions_crossing_midnight, sessions_with_events) AS midnight_session_share,
+    SAFE_DIVIDE(sessions_without_session_start, sessions_with_events) AS missing_session_start_share,
+    SAFE_DIVIDE(users_by_device - users_blended, users_by_device) AS user_id_dedup_share,
+    SAFE_DIVIDE(purchase_events - distinct_transactions, purchase_events) AS repeated_purchase_share
+  FROM joined
+)
+
+SELECT
+  event_date,
+  events,
+  cookieless_events,
+  cookieless_event_share,
+  events_without_session_id,
+  sessions_with_events,
+  sessions_crossing_midnight,
+  midnight_session_share,
+  sessions_without_session_start,
+  missing_session_start_share,
+  users_by_device,
+  users_blended,
+  user_id_dedup_share,
+  purchase_events,
+  distinct_transactions,
+  purchase_events - distinct_transactions AS repeated_purchase_events,
+  repeated_purchase_share,
+  duplicated_rows_removed,
+  distinct_page_urls,
+  distinct_page_urls > 50000 AS page_reports_will_show_other_row,
+  ROUND(users_by_device * 0.016) AS hll_users_margin,
+  CASE GREATEST(COALESCE(cookieless_event_share, 0), COALESCE(midnight_session_share, 0), COALESCE(missing_session_start_share, 0), COALESCE(user_id_dedup_share, 0), COALESCE(repeated_purchase_share, 0))
+    WHEN 0 THEN 'none'
+    WHEN COALESCE(cookieless_event_share, 0) THEN 'consent_mode_modelling'
+    WHEN COALESCE(midnight_session_share, 0) THEN 'sessions_crossing_midnight'
+    WHEN COALESCE(missing_session_start_share, 0) THEN 'missing_session_start'
+    WHEN COALESCE(user_id_dedup_share, 0) THEN 'user_id_reporting_identity'
+    ELSE 'repeated_purchases'
+  END AS biggest_expected_cause,
+  CONCAT(
+    IF(COALESCE(cookieless_event_share, 0) >= 0.02, 'Interface shows MORE users and sessions (modelled from cookieless hits). ', ''),
+    IF(COALESCE(user_id_dedup_share, 0) >= 0.02, 'Interface shows LESS users than COUNT DISTINCT user_pseudo_id (it merges devices by user_id). ', ''),
+    IF(COALESCE(midnight_session_share, 0) >= 0.01, 'Daily sessions of the interface summed over days are BIGGER than distinct sessions of the period. ', ''),
+    IF(COALESCE(repeated_purchase_share, 0) >= 0.01, 'Raw purchase counts are BIGGER than the interface (use fct_transactions). ', ''),
+    IF(distinct_page_urls > 50000, 'Page reports of the interface will have an (other) row. ', ''),
+    'Differences under ~2% in users are the HyperLogLog margin of the interface.'
+  ) AS expected_direction,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM shares

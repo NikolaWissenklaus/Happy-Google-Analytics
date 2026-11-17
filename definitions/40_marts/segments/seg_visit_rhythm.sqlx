@@ -1,0 +1,128 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 11/04/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_visit_rhythm",
+  description: "The habit of each user, one row per user_key (last 180 days): burstiness of the visits (clockwork, random or in bursts, the Goh-Barabasi index used to study human behaviour), favourite weekday and how loyal to it, longest and current streak of consecutive days, trend of the last 8 weeks and the date the next visit was expected. 'Broke the habit' (a regular user that is late) is a churn signal weeks before any recency rule",
+  bigquery: {
+    clusterBy: ["user_key"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "labs"],
+  columns: Object.assign(docs.pick("user_key"), {
+    burstiness: "(sd - mean) / (sd + mean) of the days between visits. -1 = perfectly regular, 0 = random, towards +1 = long silences and bursts",
+    rhythm_type: "clockwork | regular | random | bursty",
+    weekday_loyalty: "Share of the active days on the favourite weekday. 1/7 = no preference",
+    weekly_trend: "Slope of active days per week over the last 8 weeks (days per week, per week). Negative = fading",
+    expected_next_visit_date: "last active date + usual gap (median)",
+    habit_status: "on_track | late | broke_the_habit (late by more than cfg_labs.rhythm.overdue_gap_multiplier times the usual gap)"
+  })
+}
+
+js {
+  const rh = cfg_labs.rhythm;
+}
+
+WITH
+days AS (
+  SELECT
+    user_key,
+    activity_date,
+    sessions,
+    revenue,
+    DATE_DIFF(activity_date, LAG(activity_date) OVER (PARTITION BY user_key ORDER BY activity_date), DAY) AS gap_days,
+    -- consecutive days share the same value here (gaps and islands)
+    DATE_DIFF(activity_date, DATE '2000-01-01', DAY) - ROW_NUMBER() OVER (PARTITION BY user_key ORDER BY activity_date) AS streak_id
+  FROM ${ref("fct_user_daily")}
+  WHERE activity_date >= ${helpers.daysAgo(rh.window_days)}
+    AND activity_date < ${helpers.today()}
+),
+
+streaks AS (
+  SELECT user_key, streak_id, COUNT(*) AS streak_days, MAX(activity_date) AS streak_end
+  FROM days
+  GROUP BY 1, 2
+),
+
+streak_summary AS (
+  SELECT
+    user_key,
+    MAX(streak_days) AS longest_streak_days,
+    ARRAY_AGG(streak_days ORDER BY streak_end DESC LIMIT 1)[OFFSET(0)] AS last_streak_days
+  FROM streaks
+  GROUP BY user_key
+),
+
+weekdays AS (
+  SELECT user_key, MOD(EXTRACT(DAYOFWEEK FROM activity_date) + 5, 7) + 1 AS iso_weekday, COUNT(*) AS active_days
+  FROM days
+  GROUP BY 1, 2
+),
+
+favourite_weekday AS (
+  SELECT
+    user_key,
+    ARRAY_AGG(iso_weekday ORDER BY active_days DESC, iso_weekday LIMIT 1)[OFFSET(0)] AS favourite_iso_weekday,
+    SAFE_DIVIDE(MAX(active_days), SUM(active_days)) AS weekday_loyalty
+  FROM weekdays
+  GROUP BY user_key
+),
+
+rhythm AS (
+  SELECT
+    user_key,
+    COUNT(*) AS active_days,
+    SUM(sessions) AS sessions,
+    SUM(revenue) AS revenue,
+    MIN(activity_date) AS first_active_date,
+    MAX(activity_date) AS last_active_date,
+    AVG(gap_days) AS avg_gap_days,
+    STDDEV_POP(gap_days) AS sd_gap_days,
+    APPROX_QUANTILES(gap_days, 2 IGNORE NULLS)[OFFSET(1)] AS usual_gap_days,
+    -- slope of active days per week over the last 8 weeks, with the empty weeks counting as zero.
+    -- x = weeks ago (0..7, mean 3.5, variance 5.25), so no need to build the empty weeks:
+    -- cov(x, y) = sum(x * y) / 8 - 3.5 * sum(y) / 8. sign inverted to read "going forward"
+    -SAFE_DIVIDE(
+      SUM(IF(activity_date >= ${helpers.daysAgo(56)}, DIV(DATE_DIFF(DATE_SUB(${helpers.today()}, INTERVAL 1 DAY), activity_date, DAY), 7), 0)) / 8
+        - 3.5 * COUNTIF(activity_date >= ${helpers.daysAgo(56)}) / 8,
+      5.25
+    ) AS weekly_trend
+  FROM days
+  GROUP BY user_key
+  HAVING COUNT(*) >= ${rh.min_active_days}
+)
+
+SELECT
+  r.user_key,
+  r.active_days,
+  r.sessions,
+  r.revenue,
+  r.first_active_date,
+  r.last_active_date,
+  r.avg_gap_days,
+  r.usual_gap_days,
+  SAFE_DIVIDE(r.sd_gap_days - r.avg_gap_days, r.sd_gap_days + r.avg_gap_days) AS burstiness,
+  CASE
+    WHEN SAFE_DIVIDE(r.sd_gap_days - r.avg_gap_days, r.sd_gap_days + r.avg_gap_days) < -0.5 THEN 'clockwork'
+    WHEN SAFE_DIVIDE(r.sd_gap_days - r.avg_gap_days, r.sd_gap_days + r.avg_gap_days) < -0.15 THEN 'regular'
+    WHEN SAFE_DIVIDE(r.sd_gap_days - r.avg_gap_days, r.sd_gap_days + r.avg_gap_days) <= 0.15 THEN 'random'
+    ELSE 'bursty'
+  END AS rhythm_type,
+  f.favourite_iso_weekday,
+  f.weekday_loyalty,
+  s.longest_streak_days,
+  IF(r.last_active_date = DATE_SUB(${helpers.today()}, INTERVAL 1 DAY), s.last_streak_days, 0) AS current_streak_days,
+  r.weekly_trend,
+  DATE_ADD(r.last_active_date, INTERVAL CAST(r.usual_gap_days AS INT64) DAY) AS expected_next_visit_date,
+  DATE_DIFF(${helpers.today()}, DATE_ADD(r.last_active_date, INTERVAL CAST(r.usual_gap_days AS INT64) DAY), DAY) AS days_late,
+  CASE
+    WHEN DATE_DIFF(${helpers.today()}, r.last_active_date, DAY) > ${rh.overdue_gap_multiplier} * GREATEST(r.usual_gap_days, 1) + 1 THEN 'broke_the_habit'
+    WHEN DATE_DIFF(${helpers.today()}, r.last_active_date, DAY) > GREATEST(r.usual_gap_days, 1) + 1 THEN 'late'
+    ELSE 'on_track'
+  END AS habit_status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rhythm AS r
+LEFT JOIN favourite_weekday AS f USING (user_key)
+LEFT JOIN streak_summary AS s USING (user_key)

@@ -1,0 +1,109 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 27/09/2022
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_switching",
+  description: "Who steals the sale from whom: sessions where the customer opened product A, did not buy it, and bought product B instead (last 90 days). Per pair: how often A loses to B, the price difference and whether the customer traded up or down. Substitutes (the opposite of 'bought together'), the real competitors inside your own catalog, and the item to show when A is out of stock",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "merchandising"],
+  columns: {
+    viewed_item_id: "Item seen in the session and NOT bought",
+    purchased_item_id: "Item bought in the same session",
+    switch_sessions: "Sessions with this switch",
+    share_of_losses: "switch_sessions / sessions where the viewed item lost to any other item",
+    loss_rate_when_seen_together: "Among the sessions that saw BOTH and bought one of them, share that bought purchased_item_id",
+    price_gap_pct: "(price of the purchased - price of the viewed) / price of the viewed",
+    trade_direction: "trade_up (bought 10%+ more expensive) | trade_down (10%+ cheaper) | same_price_level"
+  }
+}
+
+WITH
+session_items AS (
+  SELECT
+    session_key,
+    item_id,
+    LOGICAL_OR(event_name = 'view_item') AS was_viewed,
+    LOGICAL_OR(event_name = 'purchase') AS was_purchased,
+    MAX(IF(event_name = 'view_item', price, NULL)) AS viewed_price,
+    MAX(IF(event_name = 'purchase', price, NULL)) AS purchased_price
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(90)}
+    AND event_name IN ('view_item', 'purchase')
+    AND item_id IS NOT NULL
+    AND session_has_purchase
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+  GROUP BY 1, 2
+),
+
+switches AS (
+  SELECT
+    v.session_key,
+    v.item_id AS viewed_item_id,
+    b.item_id AS purchased_item_id,
+    v.viewed_price,
+    b.purchased_price,
+    b.was_viewed AS purchased_was_also_viewed
+  FROM session_items AS v
+  JOIN session_items AS b
+    ON b.session_key = v.session_key AND b.item_id != v.item_id
+  WHERE v.was_viewed AND NOT v.was_purchased
+    AND b.was_purchased
+),
+
+-- sessions that saw both items of the pair and bought exactly one of them
+head_to_head AS (
+  SELECT
+    a.item_id AS item_a,
+    b.item_id AS item_b,
+    COUNTIF(b.was_purchased AND NOT a.was_purchased) AS b_won,
+    COUNTIF(a.was_purchased AND NOT b.was_purchased) AS a_won
+  FROM session_items AS a
+  JOIN session_items AS b
+    ON b.session_key = a.session_key AND b.item_id != a.item_id
+  WHERE a.was_viewed AND b.was_viewed
+  GROUP BY 1, 2
+),
+
+pairs AS (
+  SELECT
+    viewed_item_id,
+    purchased_item_id,
+    COUNT(DISTINCT session_key) AS switch_sessions,
+    AVG(viewed_price) AS viewed_price,
+    AVG(purchased_price) AS purchased_price
+  FROM switches
+  GROUP BY 1, 2
+  HAVING COUNT(DISTINCT session_key) >= 3
+)
+
+SELECT
+  p.viewed_item_id,
+  dv.item_name AS viewed_item_name,
+  dv.item_category AS viewed_item_category,
+  p.purchased_item_id,
+  dp.item_name AS purchased_item_name,
+  dp.item_category AS purchased_item_category,
+  COALESCE(dv.item_category = dp.item_category, FALSE) AS is_same_category,
+  COALESCE(dv.item_brand = dp.item_brand, FALSE) AS is_same_brand,
+  p.switch_sessions,
+  SAFE_DIVIDE(p.switch_sessions, SUM(p.switch_sessions) OVER (PARTITION BY p.viewed_item_id)) AS share_of_losses,
+  h.b_won + h.a_won AS head_to_head_sessions,
+  SAFE_DIVIDE(h.b_won, h.b_won + h.a_won) AS loss_rate_when_seen_together,
+  p.viewed_price,
+  p.purchased_price,
+  SAFE_DIVIDE(p.purchased_price - p.viewed_price, p.viewed_price) AS price_gap_pct,
+  CASE
+    WHEN SAFE_DIVIDE(p.purchased_price - p.viewed_price, p.viewed_price) >= 0.1 THEN 'trade_up'
+    WHEN SAFE_DIVIDE(p.purchased_price - p.viewed_price, p.viewed_price) <= -0.1 THEN 'trade_down'
+    ELSE 'same_price_level'
+  END AS trade_direction,
+  ROW_NUMBER() OVER (PARTITION BY p.viewed_item_id ORDER BY p.switch_sessions DESC) AS rank_among_substitutes,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+LEFT JOIN head_to_head AS h ON h.item_a = p.viewed_item_id AND h.item_b = p.purchased_item_id
+LEFT JOIN ${ref("dim_items")} AS dv ON dv.item_id = p.viewed_item_id
+LEFT JOIN ${ref("dim_items")} AS dp ON dp.item_id = p.purchased_item_id

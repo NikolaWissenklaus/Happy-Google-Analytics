@@ -1,0 +1,119 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 25/05/2019
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.governance,
+  name: "gov_url_parameter_inventory",
+  description: "Every query string parameter that ever showed up in a page url (last 30 days), with how often, how many different values, an example, where it appears and what it is: campaign tag, click id of an ad platform, parameter of the site, personal data by the name of the key, or a 'cardinality bomb' (unique per hit: session ids, timestamps, tokens) that shatters the page reports of GA4 into (other). The list for the 'exclude URL query parameters' setting, for the LGPD review and to find the tools that tag your urls without telling anybody",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "governance" }
+  },
+  tags: ["monitoring", "governance", "daily", "labs", "lgpd"],
+  columns: {
+    param_key: "Query string key, lower case",
+    param_class: "utm | click_id | sensitive_by_name (cfg_privacy.sensitive_url_keys) | cardinality_bomb | site_parameter",
+    distinct_values: "Approximate number of different values",
+    values_per_hit: "distinct_values / page views with the key. Near 1 = unique per hit",
+    example_value: "One value (after the PII masking of staging), cut at 80 characters",
+    recommended_action: "What to do about it"
+  }
+}
+
+js {
+  const up = cfg_labs.url_params;
+  const sensitive = helpers.sqlList(cfg_privacy.sensitive_url_keys);
+  const clickIds = helpers.sqlList(up.click_ids);
+}
+
+WITH
+page_views AS (
+  SELECT
+    event_date,
+    session_key,
+    page_path,
+    page_hostname,
+    page_query
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(up.window_days)}
+    AND event_name = 'page_view'
+    AND page_query IS NOT NULL
+    AND page_query != ''
+),
+
+pairs AS (
+  SELECT
+    p.event_date,
+    p.session_key,
+    p.page_path,
+    p.page_hostname,
+    LOWER(SPLIT(pair, '=')[SAFE_OFFSET(0)]) AS param_key,
+    NULLIF(SUBSTR(pair, STRPOS(pair, '=') + 1), pair) AS param_value
+  FROM page_views AS p,
+    UNNEST(SPLIT(p.page_query, '&')) AS pair
+  WHERE pair != ''
+),
+
+totals AS (
+  SELECT COUNT(*) AS page_views_with_query FROM page_views
+),
+
+per_key AS (
+  SELECT
+    param_key,
+    COUNT(*) AS page_views,
+    COUNT(DISTINCT session_key) AS sessions,
+    APPROX_COUNT_DISTINCT(param_value) AS distinct_values,
+    COUNTIF(param_value IS NULL OR param_value = '') AS empty_values,
+    SUBSTR(MAX(param_value), 1, 80) AS example_value,
+    MIN(event_date) AS first_seen_date,
+    MAX(event_date) AS last_seen_date,
+    COUNT(DISTINCT page_path) AS distinct_pages,
+    APPROX_TOP_COUNT(page_path, 1)[SAFE_OFFSET(0)].value AS most_common_page,
+    APPROX_TOP_COUNT(page_hostname, 1)[SAFE_OFFSET(0)].value AS most_common_hostname
+  FROM pairs
+  WHERE param_key IS NOT NULL AND param_key != ''
+  GROUP BY param_key
+),
+
+classified AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(distinct_values, page_views) AS values_per_hit,
+    CASE
+      WHEN STARTS_WITH(param_key, 'utm_') THEN 'utm'
+      WHEN param_key IN (${clickIds}) THEN 'click_id'
+      WHEN param_key IN (${sensitive}) THEN 'sensitive_by_name'
+      WHEN page_views >= 100 AND SAFE_DIVIDE(distinct_values, page_views) >= ${up.cardinality_bomb_ratio} THEN 'cardinality_bomb'
+      ELSE 'site_parameter'
+    END AS param_class
+  FROM per_key
+)
+
+SELECT
+  c.param_key,
+  c.param_class,
+  c.page_views,
+  SAFE_DIVIDE(c.page_views, t.page_views_with_query) AS share_of_page_views_with_query,
+  c.sessions,
+  c.distinct_values,
+  c.values_per_hit,
+  c.empty_values,
+  c.example_value,
+  c.distinct_pages,
+  c.most_common_page,
+  c.most_common_hostname,
+  c.first_seen_date,
+  c.last_seen_date,
+  c.first_seen_date >= ${helpers.daysAgo(7)} AS is_new_this_week,
+  CASE c.param_class
+    WHEN 'sensitive_by_name' THEN 'LGPD: the key name suggests personal data. Remove it from the url at the source and keep it in cfg_privacy.sensitive_url_keys'
+    WHEN 'cardinality_bomb' THEN 'Add to the GA4 list of excluded query parameters (or strip in GTM): one page becomes thousands of rows in the page reports'
+    WHEN 'click_id' THEN 'Expected. Check that the platform is linked, a click id alone does not name the campaign'
+    WHEN 'utm' THEN 'Expected. Quality of the values is in mkt_utm_linter'
+    ELSE IF(c.first_seen_date >= ${helpers.daysAgo(7)}, 'New parameter this week: find out which tool or deploy added it', 'Known site parameter, nothing to do')
+  END AS recommended_action,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM classified AS c
+CROSS JOIN totals AS t
+WHERE c.page_views >= 5

@@ -1,0 +1,124 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 05/12/2024
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_cookie_churn_inflation",
+  description: "How many of your 'users' are the same person with a new cookie? The logged in customers are the ruler: for each browser, how many GA4 cookies (user_pseudo_id) one known person burned in 90 days on the same kind of device, and how long a cookie lives before being replaced. Safari and the in-app browsers reset it all the time, so 'new users' and 'users' are inflated differently per browser. Gives the correction factor and the estimated real people behind the user count",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "labs", "identity"],
+  columns: {
+    cookies_per_person: "Average user_pseudo_ids of one logged in person on the same device category + OS + browser in 90 days. 1 = the cookie survives. 2.4 = each person counts as 2.4 users",
+    median_cookie_lifespan_days: "Days between the first and the last session of the cookies that were later replaced by a newer one of the same person and browser",
+    share_dead_within_7_days: "Replaced cookies that lived 7 days or less (the Safari ITP limit for script written cookies)",
+    reported_users_90d: "user_pseudo_ids of ALL the traffic of the browser in 90 days (what GA4 calls users)",
+    estimated_real_users_90d: "reported_users_90d / cookies_per_person. Assumes the anonymous visitors lose cookies like the logged in ones: read it as an order of magnitude",
+    new_user_inflation_pct: "1 - 1 / cookies_per_person: share of the 'users' of the browser that are probably somebody already counted"
+  }
+}
+
+WITH
+cookies AS (
+  SELECT
+    user_pseudo_id,
+    -- never NULL: the joins below are USING, and NULL does not match NULL
+    COALESCE(ANY_VALUE(device_category), '(not set)') AS device_category,
+    COALESCE(ANY_VALUE(device_os), '(not set)') AS device_os,
+    COALESCE(ANY_VALUE(device_browser), '(not set)') AS device_browser,
+    MIN(session_date) AS first_seen_date,
+    MAX(session_date) AS last_seen_date,
+    COUNT(*) AS sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(90)}
+    AND platform = 'WEB'
+    ${helpers.martSessionFilter()}
+  GROUP BY user_pseudo_id
+),
+
+-- only people identified by a real login: the links guessed by the identity graph would
+-- make the ruler measure itself
+known_people AS (
+  SELECT c.*, i.user_key
+  FROM cookies AS c
+  JOIN ${ref("dim_user_identity")} AS i USING (user_pseudo_id)
+  WHERE i.is_identified_by_login
+    AND NOT COALESCE(i.is_shared_device, FALSE)
+),
+
+sequenced AS (
+  SELECT
+    *,
+    LEAD(first_seen_date) OVER (
+      PARTITION BY user_key, device_category, device_os, device_browser
+      ORDER BY first_seen_date, user_pseudo_id
+    ) AS next_cookie_first_seen
+  FROM known_people
+),
+
+per_person AS (
+  SELECT
+    user_key,
+    device_category,
+    device_os,
+    device_browser,
+    COUNT(*) AS cookies
+  FROM known_people
+  GROUP BY 1, 2, 3, 4
+),
+
+inflation AS (
+  SELECT
+    device_category,
+    device_os,
+    device_browser,
+    COUNT(*) AS known_people,
+    SUM(cookies) AS cookies_of_known_people,
+    AVG(cookies) AS cookies_per_person,
+    SAFE_DIVIDE(COUNTIF(cookies > 1), COUNT(*)) AS share_of_people_with_many_cookies
+  FROM per_person
+  GROUP BY 1, 2, 3
+  HAVING COUNT(*) >= 50
+),
+
+-- a cookie "died" when the same person showed up later with another one in the same browser
+lifespans AS (
+  SELECT
+    device_category,
+    device_os,
+    device_browser,
+    COUNT(*) AS replaced_cookies,
+    APPROX_QUANTILES(DATE_DIFF(last_seen_date, first_seen_date, DAY), 2)[OFFSET(1)] AS median_cookie_lifespan_days,
+    SAFE_DIVIDE(COUNTIF(DATE_DIFF(last_seen_date, first_seen_date, DAY) <= 7), COUNT(*)) AS share_dead_within_7_days
+  FROM sequenced
+  WHERE next_cookie_first_seen > last_seen_date
+  GROUP BY 1, 2, 3
+),
+
+reported AS (
+  SELECT device_category, device_os, device_browser, COUNT(*) AS reported_users_90d, SUM(sessions) AS sessions_90d
+  FROM cookies
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  i.device_category,
+  i.device_os,
+  i.device_browser,
+  i.known_people,
+  i.cookies_of_known_people,
+  i.cookies_per_person,
+  i.share_of_people_with_many_cookies,
+  l.replaced_cookies,
+  l.median_cookie_lifespan_days,
+  l.share_dead_within_7_days,
+  r.reported_users_90d,
+  r.sessions_90d,
+  SAFE_DIVIDE(r.reported_users_90d, i.cookies_per_person) AS estimated_real_users_90d,
+  1 - SAFE_DIVIDE(1, i.cookies_per_person) AS new_user_inflation_pct,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM inflation AS i
+LEFT JOIN lifespans AS l USING (device_category, device_os, device_browser)
+LEFT JOIN reported AS r USING (device_category, device_os, device_browser)

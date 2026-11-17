@@ -1,0 +1,69 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 25/05/2022
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_in_app_browser_gap",
+  description: "The tax of the in-app browsers: a click on an Instagram, Facebook or TikTok ad opens the site inside the app, in a crippled browser with no saved passwords, no saved cards, no autofill, and a cookie that dies when the app closes. Per channel and device (last 90 days): the share of the sessions trapped there, their conversion against the same channel in a real browser and the revenue that gap costs. The reason social ads 'do not convert' is often the browser, not the audience",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "labs", "media_quality"],
+  columns: Object.assign(docs.pick("session_default_channel_group", "device_category", "sessions", "conversion_rate"), {
+    browser_environment: "in_app_browser (webview inside another app, cfg_labs.in_app_browser_pattern) | real_browser",
+    conversion_rate_real_browser: "Conversion rate of the same channel and device in real browsers",
+    conversion_gap_pct: "(conversion in-app - conversion real browser) / conversion real browser. Only on the in_app_browser rows",
+    estimated_lost_revenue: "sessions in-app * (revenue per session of the real browser - revenue per session in-app), when positive",
+    in_app_share_of_channel: "Sessions in in-app browsers / all the sessions of the channel and device"
+  })
+}
+
+WITH
+sessions AS (
+  SELECT
+    *,
+    IF(REGEXP_CONTAINS(LOWER(COALESCE(device_browser, '')), r'${cfg_labs.in_app_browser_pattern}'), 'in_app_browser', 'real_browser') AS browser_environment
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(90)}
+    AND platform = 'WEB'
+    AND device_category IN ('mobile', 'tablet')
+    ${helpers.martSessionFilter()}
+),
+
+aggregated AS (
+  SELECT
+    session_default_channel_group,
+    device_category,
+    browser_environment,
+    ${metrics.sessionMetrics()},
+    COUNTIF(has_begin_checkout) AS checkout_sessions,
+    COUNTIF(has_begin_checkout AND NOT has_purchase) AS abandoned_checkouts,
+    APPROX_TOP_COUNT(device_browser, 1)[SAFE_OFFSET(0)].value AS main_browser_name
+  FROM sessions
+  GROUP BY 1, 2, 3
+),
+
+with_ratios AS (
+  SELECT
+    *,
+    ${metrics.sessionRatios()},
+    SAFE_DIVIDE(abandoned_checkouts, checkout_sessions) AS checkout_abandonment_rate
+  FROM aggregated
+)
+
+SELECT
+  a.* EXCEPT (users_hll, active_users_hll),
+  SAFE_DIVIDE(a.sessions, SUM(a.sessions) OVER (PARTITION BY a.session_default_channel_group, a.device_category)) AS in_app_share_of_channel,
+  r.conversion_rate AS conversion_rate_real_browser,
+  r.revenue_per_session AS revenue_per_session_real_browser,
+  r.checkout_abandonment_rate AS checkout_abandonment_rate_real_browser,
+  IF(a.browser_environment = 'in_app_browser', ${helpers.pctChange("a.conversion_rate", "r.conversion_rate")}, NULL) AS conversion_gap_pct,
+  IF(a.browser_environment = 'in_app_browser', GREATEST(0, a.sessions * (r.revenue_per_session - a.revenue_per_session)), NULL) AS estimated_lost_revenue,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_ratios AS a
+LEFT JOIN with_ratios AS r
+  ON r.session_default_channel_group = a.session_default_channel_group
+  AND r.device_category = a.device_category
+  AND r.browser_environment = 'real_browser'
+WHERE a.sessions >= 30

@@ -1,0 +1,65 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 21/02/2021
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.product,
+  name: "prod_traffic_load_profile",
+  description: "GA4 as a capacity planning tool: per day, the busiest minute (events, page views and sessions active at the same time), the percentiles of the minute load and how far the peak is from a normal minute. The number the infra team asks before Black Friday ('how many simultaneous users did we really have at the peak last year?') and nobody thinks GA4 can answer",
+  bigquery: {
+    partitionBy: "event_date",
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs", "ops"],
+  columns: Object.assign(docs.pick("event_date"), {
+    peak_concurrent_sessions: "Most sessions with at least one event in the same minute. GA4 only sees who fires events, real concurrency is a bit higher",
+    peak_views_per_second: "Page / screen views of the busiest minute / 60. A floor for the requests per second (each view is many requests)",
+    peak_to_median_ratio: "Busiest minute / median minute of the day. The size of the spike the servers must survive",
+    peak_minute_local: "The busiest minute, property timezone"
+  })
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+-- staging on purpose, and with bots and internal traffic inside: the servers answer them too
+per_minute AS (
+  SELECT
+    event_date,
+    DATETIME_TRUNC(event_datetime_local, MINUTE) AS minute_local,
+    COUNT(*) AS events,
+    COUNTIF(event_name IN ('page_view', 'screen_view')) AS views,
+    COUNT(DISTINCT session_key) AS active_sessions,
+    COUNT(DISTINCT user_pseudo_id) AS active_devices
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= run_from
+  GROUP BY 1, 2
+)
+
+SELECT
+  event_date,
+  SUM(events) AS events,
+  SUM(views) AS views,
+  COUNT(*) AS minutes_with_traffic,
+  MAX(events) AS peak_events_per_minute,
+  MAX(views) AS peak_views_per_minute,
+  ROUND(MAX(views) / 60, 2) AS peak_views_per_second,
+  MAX(active_sessions) AS peak_concurrent_sessions,
+  MAX(active_devices) AS peak_concurrent_devices,
+  ARRAY_AGG(minute_local ORDER BY events DESC LIMIT 1)[OFFSET(0)] AS peak_minute_local,
+  EXTRACT(HOUR FROM ARRAY_AGG(minute_local ORDER BY events DESC LIMIT 1)[OFFSET(0)]) AS peak_hour,
+  APPROX_QUANTILES(events, 100)[OFFSET(50)] AS p50_events_per_minute,
+  APPROX_QUANTILES(events, 100)[OFFSET(95)] AS p95_events_per_minute,
+  APPROX_QUANTILES(events, 100)[OFFSET(99)] AS p99_events_per_minute,
+  APPROX_QUANTILES(active_sessions, 100)[OFFSET(50)] AS p50_concurrent_sessions,
+  APPROX_QUANTILES(active_sessions, 100)[OFFSET(95)] AS p95_concurrent_sessions,
+  SAFE_DIVIDE(MAX(events), APPROX_QUANTILES(events, 100)[OFFSET(50)]) AS peak_to_median_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_minute
+GROUP BY event_date
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

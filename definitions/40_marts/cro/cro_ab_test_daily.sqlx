@@ -1,4 +1,5 @@
 -- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 04/01/2023
 
 config {
   type: "table",

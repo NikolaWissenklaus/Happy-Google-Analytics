@@ -1,0 +1,109 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 24/09/2022
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_internal_pagerank",
+  description: "PageRank of the site calculated with the REAL navigation of the users (page A -> page B, last 30 days) instead of the links of the html. Shows the pages that hold the navigation together (hidden hubs), the front doors that are structurally isolated (people land and have nowhere to go) and the dead ends. The site architecture as people actually use it",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "labs", "data_science"],
+  columns: {
+    pagerank_share: "PageRank of the page, sums 1 over the pages analyzed",
+    structure_vs_traffic: "pagerank_share / views_share. Above 1 = the page matters more for the navigation than its traffic says",
+    structure_vs_entrances: "pagerank_share / entrance_share. Very low = front door without internal links (isolated landing page)",
+    page_role: "hidden_hub | isolated_front_door | dead_end | core_page | regular"
+  }
+}
+
+js {
+  const pr = cfg_labs.pagerank;
+}
+
+WITH
+views AS (
+  SELECT page_path, previous_page_path, page_type, is_entrance, is_exit, session_has_purchase
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(pr.window_days)}
+    AND page_path IS NOT NULL
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+),
+
+page_stats AS (
+  SELECT
+    page_path,
+    ANY_VALUE(page_type) AS page_type,
+    COUNT(*) AS views,
+    COUNTIF(is_entrance) AS entrances,
+    COUNTIF(is_exit) AS exits,
+    COUNTIF(session_has_purchase) AS views_in_purchase_sessions
+  FROM views
+  GROUP BY page_path
+),
+
+-- JS UDFs have a memory limit, the long tail of urls stays out
+top_pages AS (
+  SELECT * FROM page_stats
+  QUALIFY ROW_NUMBER() OVER (ORDER BY views DESC) <= ${pr.max_pages}
+),
+
+edges AS (
+  SELECT v.previous_page_path AS src, v.page_path AS dst, CAST(COUNT(*) AS FLOAT64) AS weight
+  FROM views AS v
+  JOIN top_pages AS a ON a.page_path = v.previous_page_path
+  JOIN top_pages AS b ON b.page_path = v.page_path
+  WHERE v.previous_page_path != v.page_path
+  GROUP BY 1, 2
+),
+
+ranked AS (
+  SELECT r.node AS page_path, r.pagerank, r.in_weight, r.out_weight
+  FROM UNNEST(${ref("pagerank")}((SELECT ARRAY_AGG(STRUCT(src, dst, weight)) FROM edges), ${pr.damping}, ${pr.iterations})) AS r
+),
+
+shares AS (
+  SELECT
+    p.page_path,
+    p.page_type,
+    p.views,
+    p.entrances,
+    p.exits,
+    r.in_weight AS navigations_in,
+    r.out_weight AS navigations_out,
+    SAFE_DIVIDE(r.pagerank, SUM(r.pagerank) OVER ()) AS pagerank_share,
+    SAFE_DIVIDE(p.views, SUM(p.views) OVER ()) AS views_share,
+    SAFE_DIVIDE(p.entrances, SUM(p.entrances) OVER ()) AS entrance_share,
+    SAFE_DIVIDE(p.exits, p.views) AS exit_rate,
+    SAFE_DIVIDE(p.views_in_purchase_sessions, p.views) AS share_of_views_in_purchase_sessions
+  FROM ranked AS r
+  JOIN top_pages AS p USING (page_path)
+)
+
+SELECT
+  page_path,
+  page_type,
+  RANK() OVER (ORDER BY pagerank_share DESC) AS pagerank_position,
+  RANK() OVER (ORDER BY views DESC) AS views_position,
+  pagerank_share,
+  views_share,
+  entrance_share,
+  SAFE_DIVIDE(pagerank_share, views_share) AS structure_vs_traffic,
+  SAFE_DIVIDE(pagerank_share, entrance_share) AS structure_vs_entrances,
+  views,
+  entrances,
+  exits,
+  exit_rate,
+  navigations_in,
+  navigations_out,
+  share_of_views_in_purchase_sessions,
+  CASE
+    WHEN pagerank_share >= 2 * views_share AND navigations_out > 0 THEN 'hidden_hub'
+    WHEN entrance_share >= 3 * pagerank_share AND entrances >= 50 THEN 'isolated_front_door'
+    WHEN exit_rate >= 0.7 AND navigations_in >= 50 AND page_type NOT IN ('thank_you') THEN 'dead_end'
+    WHEN PERCENT_RANK() OVER (ORDER BY pagerank_share) >= 0.95 THEN 'core_page'
+    ELSE 'regular'
+  END AS page_role,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM shares

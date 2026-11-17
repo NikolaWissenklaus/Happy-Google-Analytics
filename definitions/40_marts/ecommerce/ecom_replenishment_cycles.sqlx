@@ -1,0 +1,116 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 21/01/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_replenishment_cycles",
+  description: "The clock of each product: for items and categories that people buy again (coffee, pet food, contact lenses, printer ink, diapers), the usual number of days between two purchases of the same customer, how regular that cycle is, and how many customers are inside the buying window RIGHT NOW or already late. The reminder e-mail with the right date instead of '30 days after every order'",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "crm"],
+  columns: {
+    level: "item | category",
+    entity_id: "item_id or item_category",
+    repurchase_rate: "Buyers that bought the same item / category again on another day / buyers",
+    median_days_between: "Median days between two consecutive purchases of the same customer",
+    cycle_regularity: "(p75 - p25) / median. Under 0.5 = a real cycle, good for a reminder. Above 1 = no clock, do not automate",
+    customers_due_now: "Customers whose last purchase was between 0.8x and 1.5x the median cycle ago (cfg_labs.replenishment)",
+    customers_overdue: "Customers past 1.5x the cycle and up to 3x: probably buying somewhere else"
+  }
+}
+
+js {
+  const rp = cfg_labs.replenishment;
+}
+
+WITH
+purchases AS (
+  SELECT DISTINCT 'item' AS level, item_id AS entity_id, user_key, transaction_date
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue AND item_id IS NOT NULL
+  UNION DISTINCT
+  SELECT DISTINCT 'category' AS level, item_category AS entity_id, user_key, transaction_date
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue AND item_category IS NOT NULL
+),
+
+with_gaps AS (
+  SELECT
+    *,
+    DATE_DIFF(transaction_date, LAG(transaction_date) OVER (PARTITION BY level, entity_id, user_key ORDER BY transaction_date), DAY) AS days_since_previous
+  FROM purchases
+),
+
+per_buyer AS (
+  SELECT
+    level,
+    entity_id,
+    user_key,
+    COUNT(*) AS purchase_days,
+    MAX(transaction_date) AS last_purchase_date
+  FROM purchases
+  GROUP BY 1, 2, 3
+),
+
+cycles AS (
+  SELECT
+    level,
+    entity_id,
+    COUNT(*) AS repurchases,
+    COUNT(DISTINCT user_key) AS repeat_buyers,
+    APPROX_QUANTILES(days_since_previous, 4)[OFFSET(1)] AS p25_days_between,
+    APPROX_QUANTILES(days_since_previous, 4)[OFFSET(2)] AS median_days_between,
+    APPROX_QUANTILES(days_since_previous, 4)[OFFSET(3)] AS p75_days_between
+  FROM with_gaps
+  WHERE days_since_previous IS NOT NULL
+  GROUP BY 1, 2
+  HAVING COUNT(DISTINCT user_key) >= ${rp.min_repeat_buyers}
+),
+
+buyers AS (
+  SELECT
+    b.level,
+    b.entity_id,
+    COUNT(*) AS buyers,
+    COUNTIF(DATE_DIFF(${helpers.today()}, b.last_purchase_date, DAY)
+      BETWEEN c.median_days_between * ${rp.due_from} AND c.median_days_between * ${rp.due_to}) AS customers_due_now,
+    COUNTIF(DATE_DIFF(${helpers.today()}, b.last_purchase_date, DAY) > c.median_days_between * ${rp.due_to}
+      AND DATE_DIFF(${helpers.today()}, b.last_purchase_date, DAY) <= c.median_days_between * 3) AS customers_overdue
+  FROM per_buyer AS b
+  JOIN cycles AS c USING (level, entity_id)
+  GROUP BY 1, 2
+),
+
+item_names AS (
+  SELECT item_id, item_name, item_category FROM ${ref("dim_items")}
+)
+
+SELECT
+  c.level,
+  c.entity_id,
+  IF(c.level = 'item', n.item_name, c.entity_id) AS entity_name,
+  IF(c.level = 'item', n.item_category, c.entity_id) AS item_category,
+  b.buyers,
+  c.repeat_buyers,
+  SAFE_DIVIDE(c.repeat_buyers, b.buyers) AS repurchase_rate,
+  c.repurchases,
+  c.p25_days_between,
+  c.median_days_between,
+  c.p75_days_between,
+  SAFE_DIVIDE(c.p75_days_between - c.p25_days_between, c.median_days_between) AS cycle_regularity,
+  CASE
+    WHEN c.median_days_between < 3 THEN 'same_week_rebuy'
+    WHEN SAFE_DIVIDE(c.p75_days_between - c.p25_days_between, c.median_days_between) <= 0.5 THEN 'strong_cycle'
+    WHEN SAFE_DIVIDE(c.p75_days_between - c.p25_days_between, c.median_days_between) <= 1 THEN 'loose_cycle'
+    ELSE 'no_clear_cycle'
+  END AS cycle_type,
+  b.customers_due_now,
+  b.customers_overdue,
+  -- when to send the reminder: a bit before the customers that buy earlier
+  CAST(ROUND(c.p25_days_between * 0.9) AS INT64) AS suggested_reminder_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM cycles AS c
+JOIN buyers AS b USING (level, entity_id)
+LEFT JOIN item_names AS n ON c.level = 'item' AND n.item_id = c.entity_id

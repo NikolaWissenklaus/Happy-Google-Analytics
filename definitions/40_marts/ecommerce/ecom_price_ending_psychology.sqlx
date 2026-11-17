@@ -1,0 +1,102 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 05/07/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_price_ending_psychology",
+  description: "Does R$ 199,90 really sell more than R$ 200,00 in YOUR store? View to cart and view to purchase rates by the ending of the price the customer saw (,99 / ,90 / ,00 / other, and prices just below a round number), inside each price band so a cheap item is never compared with an expensive one. A pricing psychology study made of the prices GA4 collected without anybody asking",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "pricing"],
+  columns: {
+    price_band: "Band of the price seen in the product page, property currency",
+    price_ending: "cents ,99 | cents ,90 | cents ,95 | round (,00) | other cents",
+    is_just_below_round: "Price just below a round number of its size (9,90 / 49,99 / 199,00 / 1.999,00): the 'charm price'",
+    cart_rate_index: "view_to_cart_rate of the row / view_to_cart_rate of the whole price band. 1.15 = 15% better than the band",
+    cart_rate_low: "Lower bound of the Wilson interval (95%) of view_to_cart_rate. Compare this one when the row has few views"
+  }
+}
+
+WITH
+events AS (
+  SELECT
+    event_name,
+    item_id,
+    price,
+    COALESCE(quantity, 1) AS quantity,
+    -- MOD does not take FLOAT64 in BigQuery
+    MOD(CAST(ROUND(price * 100) AS INT64), 100) AS cents,
+    -- step = the round number of the size of the price: 10 up to 100, 100 up to 1000, 1000 above
+    CASE WHEN price < 100 THEN 10 WHEN price < 1000 THEN 100 ELSE 1000 END AS round_step
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.martWindowStart(180)}
+    AND event_name IN ('view_item', 'add_to_cart', 'purchase')
+    AND price > 0
+    AND NOT COALESCE(is_bot_suspect, FALSE)
+),
+
+classified AS (
+  SELECT
+    event_name,
+    item_id,
+    quantity,
+    CASE
+      WHEN price < 50 THEN '1. under 50'
+      WHEN price < 100 THEN '2. 50 to 100'
+      WHEN price < 250 THEN '3. 100 to 250'
+      WHEN price < 500 THEN '4. 250 to 500'
+      WHEN price < 1000 THEN '5. 500 to 1000'
+      ELSE '6. 1000 or more'
+    END AS price_band,
+    CASE
+      WHEN cents = 99 THEN 'cents ,99'
+      WHEN cents = 90 THEN 'cents ,90'
+      WHEN cents = 95 THEN 'cents ,95'
+      WHEN cents = 0 THEN 'round (,00)'
+      ELSE 'other cents'
+    END AS price_ending,
+    -- up to 2% (or 1 unit of currency) below the next round number: 9,90 / 49,99 / 199,00 / 1.999,00
+    MOD(CAST(price AS NUMERIC), round_step) > 0
+      AND (round_step - MOD(CAST(price AS NUMERIC), round_step)) <= GREATEST(price * 0.02, 1) AS is_just_below_round
+  FROM events
+),
+
+aggregated AS (
+  SELECT
+    price_band,
+    price_ending,
+    is_just_below_round,
+    COUNT(DISTINCT item_id) AS items,
+    COUNTIF(event_name = 'view_item') AS views,
+    COUNTIF(event_name = 'add_to_cart') AS add_to_carts,
+    SUM(IF(event_name = 'purchase', quantity, 0)) AS units_sold
+  FROM classified
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  price_band,
+  price_ending,
+  is_just_below_round,
+  items,
+  views,
+  add_to_carts,
+  units_sold,
+  SAFE_DIVIDE(add_to_carts, views) AS view_to_cart_rate,
+  ${helpers.wilsonLower("LEAST(add_to_carts, views)", "views")} AS cart_rate_low,
+  ${helpers.wilsonUpper("LEAST(add_to_carts, views)", "views")} AS cart_rate_high,
+  SAFE_DIVIDE(units_sold, views) AS units_per_view,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(add_to_carts, views),
+    SAFE_DIVIDE(SUM(add_to_carts) OVER (PARTITION BY price_band), SUM(views) OVER (PARTITION BY price_band))
+  ) AS cart_rate_index,
+  SAFE_DIVIDE(
+    SAFE_DIVIDE(units_sold, views),
+    SAFE_DIVIDE(SUM(units_sold) OVER (PARTITION BY price_band), SUM(views) OVER (PARTITION BY price_band))
+  ) AS units_per_view_index,
+  SAFE_DIVIDE(views, SUM(views) OVER (PARTITION BY price_band)) AS share_of_band_views,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregated
+WHERE views >= 100

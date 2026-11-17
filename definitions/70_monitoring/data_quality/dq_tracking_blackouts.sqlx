@@ -1,0 +1,138 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 01/05/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_tracking_blackouts",
+  description: "Blackouts: stretches of minutes with ZERO events in a stream at an hour of the week that always has traffic (last 14 days). Either the site was down or the tag was. With the events and the revenue that should have happened and the probability of that silence being just luck. Uptime monitoring made from analytics data, for the incidents that never reached the status page",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "labs", "alerts"],
+  columns: {
+    blackout_start_local: "First silent minute, property timezone",
+    silent_minutes: "Consecutive minutes without any event in the stream",
+    expected_events: "Events that the same hour of the week usually has in that many minutes (median of the baseline)",
+    chance_probability: "exp(-expected_events): probability of zero events by pure luck if the traffic were normal (Poisson). 0.000001 = it was not luck",
+    estimated_lost_revenue: "expected_events * average revenue per event of the stream. Lost if the site was down, only not measured if it was the tag",
+    severity: "critical (30+ minutes or 1000+ events expected) | high | medium"
+  }
+}
+
+js {
+  const bo = cfg_labs.blackouts;
+}
+
+WITH
+minute_counts AS (
+  SELECT
+    stream_id,
+    ANY_VALUE(platform) AS platform,
+    TIMESTAMP_TRUNC(event_ts, MINUTE) AS minute_ts,
+    COUNT(*) AS events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(bo.baseline_days)}
+  GROUP BY stream_id, minute_ts
+),
+
+stream_range AS (
+  SELECT stream_id, ANY_VALUE(platform) AS platform, MIN(minute_ts) AS first_minute, MAX(minute_ts) AS last_minute, SUM(events) AS events
+  FROM minute_counts
+  GROUP BY stream_id
+),
+
+-- usual events per minute of each hour of the week (median of the days, so one bad day does not move it)
+hourly AS (
+  SELECT stream_id, TIMESTAMP_TRUNC(minute_ts, HOUR) AS hour_ts, SUM(events) / 60 AS events_per_minute
+  FROM minute_counts
+  GROUP BY 1, 2
+),
+
+expected AS (
+  SELECT
+    stream_id,
+    EXTRACT(DAYOFWEEK FROM hour_ts) AS weekday_utc,
+    EXTRACT(HOUR FROM hour_ts) AS hour_utc,
+    APPROX_QUANTILES(events_per_minute, 2)[OFFSET(1)] AS expected_events_per_minute
+  FROM hourly
+  GROUP BY 1, 2, 3
+),
+
+-- every minute of the window, with or without events. it stops at the last event loaded,
+-- or the hours the export did not deliver yet would be the biggest blackout of all
+grid AS (
+  SELECT r.stream_id, r.platform, minute_ts
+  FROM stream_range AS r,
+    UNNEST(GENERATE_TIMESTAMP_ARRAY(
+      GREATEST(r.first_minute, TIMESTAMP(${helpers.daysAgo(bo.window_days)}, '${constants.TIMEZONE}')),
+      r.last_minute,
+      INTERVAL 1 MINUTE
+    )) AS minute_ts
+),
+
+silent AS (
+  SELECT
+    g.stream_id,
+    g.platform,
+    g.minute_ts,
+    x.expected_events_per_minute,
+    DIV(UNIX_SECONDS(g.minute_ts), 60) AS minute_index
+  FROM grid AS g
+  LEFT JOIN minute_counts AS c ON c.stream_id = g.stream_id AND c.minute_ts = g.minute_ts
+  JOIN expected AS x
+    ON x.stream_id = g.stream_id
+    AND x.weekday_utc = EXTRACT(DAYOFWEEK FROM g.minute_ts)
+    AND x.hour_utc = EXTRACT(HOUR FROM g.minute_ts)
+  WHERE c.minute_ts IS NULL
+    AND x.expected_events_per_minute >= ${bo.min_expected_events_per_minute}
+),
+
+islands AS (
+  SELECT *, minute_index - ROW_NUMBER() OVER (PARTITION BY stream_id ORDER BY minute_index) AS island_id
+  FROM silent
+),
+
+blackouts AS (
+  SELECT
+    stream_id,
+    ANY_VALUE(platform) AS platform,
+    MIN(minute_ts) AS blackout_start_ts,
+    TIMESTAMP_ADD(MAX(minute_ts), INTERVAL 1 MINUTE) AS blackout_end_ts,
+    COUNT(*) AS silent_minutes,
+    SUM(expected_events_per_minute) AS expected_events
+  FROM islands
+  GROUP BY stream_id, island_id
+  HAVING COUNT(*) >= ${bo.min_gap_minutes}
+),
+
+revenue_per_event AS (
+  SELECT
+    r.stream_id,
+    SAFE_DIVIDE(SUM(IF(t.is_valid_for_revenue, t.revenue, 0)), ANY_VALUE(r.events)) AS revenue_per_event
+  FROM stream_range AS r
+  LEFT JOIN ${ref("fct_transactions")} AS t
+    ON t.stream_id = r.stream_id AND t.transaction_date >= ${helpers.daysAgo(bo.baseline_days)}
+  GROUP BY r.stream_id
+)
+
+SELECT
+  b.stream_id,
+  b.platform,
+  DATE(b.blackout_start_ts, '${constants.TIMEZONE}') AS blackout_date,
+  DATETIME(b.blackout_start_ts, '${constants.TIMEZONE}') AS blackout_start_local,
+  DATETIME(b.blackout_end_ts, '${constants.TIMEZONE}') AS blackout_end_local,
+  b.blackout_start_ts,
+  b.blackout_end_ts,
+  b.silent_minutes,
+  b.expected_events,
+  EXP(-LEAST(b.expected_events, 700)) AS chance_probability,
+  b.expected_events * v.revenue_per_event AS estimated_lost_revenue,
+  CASE
+    WHEN b.silent_minutes >= 30 OR b.expected_events >= 1000 THEN 'critical'
+    WHEN b.silent_minutes >= 15 OR b.expected_events >= 300 THEN 'high'
+    ELSE 'medium'
+  END AS severity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM blackouts AS b
+LEFT JOIN revenue_per_event AS v USING (stream_id)

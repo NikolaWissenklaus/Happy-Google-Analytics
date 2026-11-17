@@ -1,0 +1,121 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 25/05/2020
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_item_momentum",
+  description: "The life cycle of every product, read from the demand and not from the sales: launch, rising, stable, declining or dead, comparing the last 14 days of product views with the 14 before and with the 8 weeks trend. Plus the hidden gems (products that convert way above the catalog and almost nobody sees) and the traffic eaters (lots of views, no carts). Rising demand shows up in the views days before it shows up in the revenue",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "labs", "merchandising"],
+  columns: {
+    views_growth: "(views of the last 14 days - views of the 14 before) / views of the 14 before",
+    weekly_views_trend_pct: "Slope of the weekly views over the last 8 weeks, as a share of the average week. 0.1 = growing 10% of an average week per week",
+    lifecycle_stage: "launch | rising | stable | declining | dead",
+    cart_rate_low: "Lower bound of the Wilson interval of add_to_carts / views in the last 28 days",
+    opportunity: "hidden_gem (converts well, few views) | traffic_eater (many views, converts badly) | none"
+  }
+}
+
+js {
+  const mo = cfg_labs.momentum;
+}
+
+WITH
+daily AS (
+  SELECT
+    item_id,
+    event_date,
+    views,
+    add_to_carts,
+    units_sold,
+    item_revenue,
+    DIV(DATE_DIFF(DATE_SUB(${helpers.today()}, INTERVAL 1 DAY), event_date, DAY), 7) AS weeks_ago
+  FROM ${ref("int_ga4__item_prices_daily")}
+  WHERE event_date >= ${helpers.daysAgo(180)}
+    AND event_date < ${helpers.today()}
+),
+
+per_item AS (
+  SELECT
+    item_id,
+    MIN(event_date) AS first_seen_in_window,
+    MAX(IF(views > 0, event_date, NULL)) AS last_view_date,
+    SUM(IF(event_date >= ${helpers.daysAgo(14)}, views, 0)) AS views_14d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)} AND event_date < ${helpers.daysAgo(14)}, views, 0)) AS views_previous_14d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)}, views, 0)) AS views_28d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)}, add_to_carts, 0)) AS add_to_carts_28d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)}, units_sold, 0)) AS units_sold_28d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)}, item_revenue, 0)) AS revenue_28d,
+    SUM(IF(event_date >= ${helpers.daysAgo(14)}, item_revenue, 0)) AS revenue_14d,
+    SUM(IF(event_date >= ${helpers.daysAgo(28)} AND event_date < ${helpers.daysAgo(14)}, item_revenue, 0)) AS revenue_previous_14d,
+    SUM(IF(weeks_ago <= 7, views, 0)) AS views_8_weeks,
+    -- slope over 8 weekly points with the empty weeks as zero: x = weeks ago (mean 3.5, var 5.25)
+    -SAFE_DIVIDE(SUM(IF(weeks_ago <= 7, views * weeks_ago, 0)) / 8 - 3.5 * SUM(IF(weeks_ago <= 7, views, 0)) / 8, 5.25) AS weekly_views_slope
+  FROM daily
+  GROUP BY item_id
+),
+
+catalog AS (
+  SELECT
+    SAFE_DIVIDE(SUM(add_to_carts_28d), SUM(views_28d)) AS catalog_cart_rate,
+    APPROX_QUANTILES(IF(views_28d > 0, views_28d, NULL), 4 IGNORE NULLS)[OFFSET(2)] AS median_views_28d,
+    APPROX_QUANTILES(IF(views_28d > 0, views_28d, NULL), 10 IGNORE NULLS)[OFFSET(9)] AS p90_views_28d
+  FROM per_item
+),
+
+scored AS (
+  SELECT
+    p.*,
+    c.catalog_cart_rate,
+    c.median_views_28d,
+    c.p90_views_28d,
+    ${helpers.pctChange("p.views_14d", "p.views_previous_14d")} AS views_growth,
+    ${helpers.pctChange("p.revenue_14d", "p.revenue_previous_14d")} AS revenue_growth,
+    SAFE_DIVIDE(p.weekly_views_slope, p.views_8_weeks / 8) AS weekly_views_trend_pct,
+    SAFE_DIVIDE(p.add_to_carts_28d, p.views_28d) AS cart_rate,
+    ${helpers.wilsonLower("LEAST(p.add_to_carts_28d, p.views_28d)", "p.views_28d")} AS cart_rate_low,
+    ${helpers.wilsonUpper("LEAST(p.add_to_carts_28d, p.views_28d)", "p.views_28d")} AS cart_rate_high
+  FROM per_item AS p
+  CROSS JOIN catalog AS c
+)
+
+SELECT
+  s.item_id,
+  d.item_name,
+  d.item_category,
+  d.item_brand,
+  d.current_price,
+  s.first_seen_in_window,
+  s.last_view_date,
+  s.views_14d,
+  s.views_previous_14d,
+  s.views_growth,
+  s.weekly_views_trend_pct,
+  s.views_28d,
+  s.add_to_carts_28d,
+  s.units_sold_28d,
+  s.revenue_28d,
+  s.revenue_growth,
+  s.cart_rate,
+  s.cart_rate_low,
+  s.cart_rate_high,
+  s.catalog_cart_rate,
+  CASE
+    WHEN s.first_seen_in_window >= ${helpers.daysAgo(mo.launch_days)} THEN 'launch'
+    WHEN s.views_14d = 0 AND s.views_previous_14d + s.views_8_weeks > 0 THEN 'dead'
+    WHEN s.views_14d + s.views_previous_14d < ${mo.min_views_for_trend} THEN 'stable'
+    WHEN s.views_growth >= 0.3 AND s.weekly_views_trend_pct > 0 THEN 'rising'
+    WHEN s.views_growth <= -0.3 AND s.weekly_views_trend_pct < 0 THEN 'declining'
+    ELSE 'stable'
+  END AS lifecycle_stage,
+  CASE
+    WHEN s.cart_rate_low > s.catalog_cart_rate * 1.3 AND s.views_28d <= s.median_views_28d THEN 'hidden_gem'
+    WHEN s.cart_rate_high < s.catalog_cart_rate * 0.5 AND s.views_28d >= s.p90_views_28d THEN 'traffic_eater'
+    ELSE 'none'
+  END AS opportunity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored AS s
+LEFT JOIN ${ref("dim_items")} AS d USING (item_id)

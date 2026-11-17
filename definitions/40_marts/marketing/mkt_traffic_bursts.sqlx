@@ -1,0 +1,159 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/12/2021
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_traffic_bursts",
+  description: "Every sudden burst of visits of the last 30 days, minute by minute and per channel: the e-mail and push blasts (with the exact time they went out and how fast the effect died), the TV spot or the influencer story that shows up as a spike of direct and brand search with no campaign behind, and the bot attacks. Each burst with the extra sessions over the baseline, the sales, the main source and landing page, and a probable cause. The offline media and the CRM calendar rebuilt from the timestamps",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "labs", "alerts"],
+  columns: {
+    channel: "Channel of the session itself (no carry over), the burst is detected inside each channel",
+    burst_start_local: "First minute above the baseline, property timezone",
+    baseline_sessions_per_minute: "Average session starts per minute of the channel in the hour before the burst",
+    peak_z_score: "(sessions - baseline) / sqrt(baseline) of the highest minute. Poisson z score",
+    incremental_sessions: "Sessions of the burst above what the baseline would bring in the same minutes",
+    minutes_to_half_peak: "Minutes from the peak until the sessions per minute fall under half of it. Small = a push notification, long = TV or a post going viral",
+    probable_cause: "bot_burst | crm_blast | offline_or_viral_spike | paid_spike | organic_or_referral_spike"
+  }
+}
+
+js {
+  const bu = cfg_labs.bursts;
+}
+
+WITH
+-- bots stay: a burst of bots is something you want to see, and it gets its own label
+session_starts AS (
+  SELECT
+    session_key,
+    COALESCE(session_channel_only, session_default_channel_group, '(not set)') AS channel,
+    TIMESTAMP_TRUNC(session_start_ts, MINUTE) AS minute_ts,
+    DIV(UNIX_SECONDS(session_start_ts), 60) AS minute_index,
+    COALESCE(session_source_only, session_source) AS source,
+    COALESCE(session_medium_only, session_medium) AS medium,
+    session_campaign,
+    landing_page_path,
+    is_new_user,
+    is_bot_suspect,
+    has_purchase,
+    transactions,
+    revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(bu.window_days)}
+),
+
+per_minute AS (
+  SELECT channel, minute_index, ANY_VALUE(minute_ts) AS minute_ts, COUNT(*) AS sessions
+  FROM session_starts
+  GROUP BY 1, 2
+),
+
+-- baseline = the hour before, skipping the last 5 minutes so the start of the burst is not inside it.
+-- minutes without sessions have no row, that is why it is SUM / 60 and not AVG
+with_baseline AS (
+  SELECT
+    *,
+    COALESCE(SUM(sessions) OVER (PARTITION BY channel ORDER BY minute_index RANGE BETWEEN 65 PRECEDING AND 6 PRECEDING), 0) / 60 AS baseline
+  FROM per_minute
+),
+
+hot_minutes AS (
+  SELECT
+    *,
+    (sessions - baseline) / SQRT(GREATEST(baseline, 1)) AS z_score,
+    minute_index - LAG(minute_index) OVER (PARTITION BY channel ORDER BY minute_index) AS minutes_since_previous_hot
+  FROM with_baseline
+  WHERE sessions >= ${bu.min_sessions_per_minute}
+    AND (sessions - baseline) / SQRT(GREATEST(baseline, 1)) >= ${bu.min_z}
+),
+
+numbered AS (
+  SELECT
+    *,
+    SUM(IF(minutes_since_previous_hot IS NULL OR minutes_since_previous_hot > ${bu.merge_gap_minutes}, 1, 0))
+      OVER (PARTITION BY channel ORDER BY minute_index) AS burst_number
+  FROM hot_minutes
+),
+
+bursts AS (
+  SELECT
+    channel,
+    burst_number,
+    MIN(minute_index) AS start_index,
+    MAX(minute_index) AS end_index,
+    MIN(minute_ts) AS burst_start_ts,
+    ARRAY_AGG(STRUCT(minute_index, minute_ts, sessions, z_score) ORDER BY sessions DESC LIMIT 1)[OFFSET(0)] AS peak,
+    ARRAY_AGG(baseline ORDER BY minute_index LIMIT 1)[OFFSET(0)] AS baseline_sessions_per_minute
+  FROM numbered
+  GROUP BY 1, 2
+),
+
+-- how long the effect lasts: first minute after the peak under half of it (looking 3 hours ahead)
+decay AS (
+  SELECT
+    b.channel,
+    b.burst_number,
+    MIN(IF(m.sessions < b.peak.sessions / 2, m.minute_index, NULL)) - b.peak.minute_index AS minutes_to_half_peak
+  FROM bursts AS b
+  JOIN per_minute AS m
+    ON m.channel = b.channel AND m.minute_index BETWEEN b.peak.minute_index + 1 AND b.peak.minute_index + 180
+  GROUP BY 1, 2
+),
+
+burst_sessions AS (
+  SELECT
+    b.channel,
+    b.burst_number,
+    COUNT(*) AS sessions,
+    COUNTIF(s.is_new_user) AS new_user_sessions,
+    COUNTIF(s.is_bot_suspect) AS bot_sessions,
+    COUNTIF(s.has_purchase) AS sessions_with_purchase,
+    SUM(s.transactions) AS transactions,
+    SUM(s.revenue) AS revenue,
+    APPROX_TOP_COUNT(CONCAT(COALESCE(s.source, '(direct)'), ' / ', COALESCE(s.medium, '(none)')), 1)[SAFE_OFFSET(0)] AS top_source_medium,
+    APPROX_TOP_COUNT(s.session_campaign, 1)[SAFE_OFFSET(0)] AS top_campaign,
+    APPROX_TOP_COUNT(s.landing_page_path, 1)[SAFE_OFFSET(0)] AS top_landing_page
+  FROM bursts AS b
+  JOIN session_starts AS s
+    ON s.channel = b.channel AND s.minute_index BETWEEN b.start_index AND b.end_index
+  GROUP BY 1, 2
+)
+
+SELECT
+  b.channel,
+  DATE(b.burst_start_ts, '${constants.TIMEZONE}') AS burst_date,
+  DATETIME(b.burst_start_ts, '${constants.TIMEZONE}') AS burst_start_local,
+  DATETIME(b.peak.minute_ts, '${constants.TIMEZONE}') AS peak_minute_local,
+  b.burst_start_ts,
+  b.end_index - b.start_index + 1 AS burst_minutes,
+  b.baseline_sessions_per_minute,
+  b.peak.sessions AS peak_sessions_per_minute,
+  b.peak.z_score AS peak_z_score,
+  s.sessions,
+  s.sessions - b.baseline_sessions_per_minute * (b.end_index - b.start_index + 1) AS incremental_sessions,
+  d.minutes_to_half_peak,
+  SAFE_DIVIDE(s.new_user_sessions, s.sessions) AS new_user_share,
+  SAFE_DIVIDE(s.bot_sessions, s.sessions) AS bot_share,
+  s.transactions,
+  s.revenue,
+  SAFE_DIVIDE(s.sessions_with_purchase, s.sessions) AS conversion_rate,
+  s.top_source_medium.value AS top_source_medium,
+  SAFE_DIVIDE(s.top_source_medium.count, s.sessions) AS top_source_medium_share,
+  s.top_campaign.value AS top_campaign,
+  s.top_landing_page.value AS top_landing_page,
+  SAFE_DIVIDE(s.top_landing_page.count, s.sessions) AS top_landing_page_share,
+  CASE
+    WHEN SAFE_DIVIDE(s.bot_sessions, s.sessions) >= 0.5 THEN 'bot_burst'
+    WHEN REGEXP_CONTAINS(LOWER(b.channel), r'email|e-mail|sms|push|whatsapp|notification') THEN 'crm_blast'
+    WHEN REGEXP_CONTAINS(LOWER(b.channel), r'^direct$|organic search|brand') THEN 'offline_or_viral_spike'
+    WHEN REGEXP_CONTAINS(LOWER(b.channel), r'paid|display|cross-network|affiliates|video') THEN 'paid_spike'
+    ELSE 'organic_or_referral_spike'
+  END AS probable_cause,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM bursts AS b
+JOIN burst_sessions AS s USING (channel, burst_number)
+LEFT JOIN decay AS d USING (channel, burst_number)

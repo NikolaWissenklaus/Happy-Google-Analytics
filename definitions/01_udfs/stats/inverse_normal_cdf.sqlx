@@ -1,0 +1,39 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "inverse_normal_cdf",
+  description: "Quantile of the standard normal (the z of a probability): inverse_normal_cdf(0.975) = 1.96. Acklam's rational approximation, relative error below 1.2e-9. The inverse of normal_cdf, needed for sample sizes, MDE and intervals of any confidence",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "insights"]
+}
+
+-- Excel has NORM.S.INV, BigQuery has nothing. Without it every confidence level other than 95%
+-- becomes a hardcoded 1.96 copied around. NULL outside (0, 1). The LN arguments are clamped
+-- because the subquery computes every branch before the CASE picks one
+CREATE OR REPLACE FUNCTION ${self()}(p FLOAT64) RETURNS FLOAT64 AS ((
+  SELECT
+    CASE
+      WHEN p IS NULL OR p <= 0 OR p >= 1 THEN NULL
+      WHEN p < 0.02425 THEN
+        (((((-7.784894002430293e-03 * q_low - 3.223964580411365e-01) * q_low - 2.400758277161838e+00) * q_low - 2.549732539343734e+00) * q_low + 4.374664141464968e+00) * q_low + 2.938163982698783e+00)
+        / ((((7.784695709041462e-03 * q_low + 3.224671290700398e-01) * q_low + 2.445134137142996e+00) * q_low + 3.754408661907416e+00) * q_low + 1)
+      WHEN p <= 0.97575 THEN
+        (((((-3.969683028665376e+01 * r + 2.209460984245205e+02) * r - 2.759285104469687e+02) * r + 1.383577518672690e+02) * r - 3.066479806614716e+01) * r + 2.506628277459239e+00) * q_mid
+        / (((((-5.447609879822406e+01 * r + 1.615858368580409e+02) * r - 1.556989798598866e+02) * r + 6.680131188771972e+01) * r - 1.328068155288572e+01) * r + 1)
+      ELSE
+        -(((((-7.784894002430293e-03 * q_high - 3.223964580411365e-01) * q_high - 2.400758277161838e+00) * q_high - 2.549732539343734e+00) * q_high + 4.374664141464968e+00) * q_high + 2.938163982698783e+00)
+        / ((((7.784695709041462e-03 * q_high + 3.224671290700398e-01) * q_high + 2.445134137142996e+00) * q_high + 3.754408661907416e+00) * q_high + 1)
+    END
+  FROM (
+    SELECT
+      SQRT(-2 * LN(LEAST(GREATEST(p, 1e-300), 1))) AS q_low,
+      p - 0.5 AS q_mid,
+      (p - 0.5) * (p - 0.5) AS r,
+      SQRT(-2 * LN(LEAST(GREATEST(1 - p, 1e-300), 1))) AS q_high
+  )
+))
+OPTIONS (description = "Inverse of the standard normal CDF (Acklam)")

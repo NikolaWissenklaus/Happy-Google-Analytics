@@ -15,6 +15,7 @@ The day to day of the pipeline.
    - `daily` every day after the export (GA4 finishes the daily shard around 9h BRT, schedule at 10h);
    - `assertions` right after;
    - `weekly` on sunday (BQML training, only with `enable_bqml`);
+   - `weekly` also refreshes 6 heavier `insights` models (`docs/insights.md`): schedule it even without `enable_bqml`;
    - `hourly` every hour (only with `include_intraday`);
    - `tools/alerts/send_alerts.py` after the assertions.
 

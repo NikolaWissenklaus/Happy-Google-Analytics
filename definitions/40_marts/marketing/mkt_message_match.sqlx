@@ -1,0 +1,148 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_message_match",
+  description: "Does the landing page talk about what the person searched? 'Message match' is the oldest rule of paid search and nobody measures it: for every session with a term (utm_term / keyword, the session's own, no carry over), the share of the words of the search found in the title and the url of the landing page (ga4_udf.token_overlap, accents and plurals handled), last 30 days. Engagement and conversion by match bucket, and the term x landing page pairs with traffic and bad match, with the money they would bring converting like the fully matched sessions of the same channel",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing", level: "mid" }
+  },
+  tags: ["marts", "marketing", "daily", "insights", "media_quality"],
+  columns: {
+    row_type: "bucket (one row per channel x match bucket) | term_page (one row per term x landing page)",
+    match_bucket: "Share of the words of the term found on the landing page (title + url)",
+    term_coverage: "term_page rows: share of the words of the term found on the landing page",
+    reference_revenue_per_session: "Revenue per session of the fully matched sessions of the same channel",
+    revenue_opportunity: "term_page rows: sessions x (reference - own revenue per session), when positive"
+  }
+}
+
+js {
+  const mm = cfg_insights.message_match;
+}
+
+WITH
+sessions AS (
+  SELECT
+    COALESCE(session_default_channel_group, '(not set)') AS channel,
+    LOWER(TRIM(session_term)) AS term,
+    landing_page_path,
+    landing_page_title,
+    is_engaged,
+    has_purchase,
+    COALESCE(transactions, 0) AS transactions,
+    COALESCE(revenue, 0) AS revenue,
+    ${ref("token_overlap")}(session_term, CONCAT(COALESCE(landing_page_title, ''), ' ', COALESCE(landing_page_path, ''))) AS overlap
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(mm.window_days)}
+    AND session_date < ${helpers.today()}
+    AND session_term IS NOT NULL
+    AND NOT COALESCE(is_carried_over, FALSE)
+    -- ValueTrack placeholders that were never replaced ({keyword}) and '(not provided)' say nothing
+    AND NOT REGEXP_CONTAINS(session_term, r'[{}]|not provided|not set')
+    ${helpers.martSessionFilter()}
+),
+
+bucketed AS (
+  SELECT
+    *,
+    CASE
+      WHEN overlap.coverage_a IS NULL THEN 'term without words'
+      WHEN overlap.coverage_a = 0 THEN '0%: the page does not mention the search'
+      WHEN overlap.coverage_a < 0.5 THEN '1-49%'
+      WHEN overlap.coverage_a < 1 THEN '50-99%'
+      ELSE '100%: every word of the search is on the page'
+    END AS match_bucket
+  FROM sessions
+),
+
+reference AS (
+  SELECT channel, SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS reference_revenue_per_session, SAFE_DIVIDE(COUNTIF(has_purchase), COUNT(*)) AS reference_conversion
+  FROM bucketed
+  WHERE overlap.coverage_a = 1
+  GROUP BY 1
+),
+
+buckets AS (
+  SELECT
+    channel,
+    match_bucket,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    COUNTIF(has_purchase) AS sessions_with_purchase,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    AVG(overlap.coverage_a) AS avg_coverage
+  FROM bucketed
+  GROUP BY 1, 2
+),
+
+term_pages AS (
+  SELECT
+    channel,
+    term,
+    landing_page_path,
+    ANY_VALUE(landing_page_title) AS landing_page_title,
+    ANY_VALUE(overlap.coverage_a) AS term_coverage,
+    ANY_VALUE(overlap.jaccard) AS term_jaccard,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    COUNTIF(has_purchase) AS sessions_with_purchase,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM bucketed
+  GROUP BY 1, 2, 3
+  HAVING COUNT(*) >= ${mm.min_sessions}
+)
+
+SELECT
+  'bucket' AS row_type,
+  b.channel,
+  b.match_bucket,
+  CAST(NULL AS STRING) AS term,
+  CAST(NULL AS STRING) AS landing_page_path,
+  CAST(NULL AS STRING) AS landing_page_title,
+  b.avg_coverage AS term_coverage,
+  CAST(NULL AS FLOAT64) AS term_jaccard,
+  b.sessions,
+  SAFE_DIVIDE(b.engaged_sessions, b.sessions) AS engagement_rate,
+  SAFE_DIVIDE(b.sessions_with_purchase, b.sessions) AS conversion_rate,
+  b.transactions,
+  b.revenue,
+  SAFE_DIVIDE(b.revenue, b.sessions) AS revenue_per_session,
+  r.reference_revenue_per_session,
+  CAST(NULL AS FLOAT64) AS revenue_opportunity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM buckets AS b
+LEFT JOIN reference AS r USING (channel)
+
+UNION ALL
+
+SELECT
+  'term_page',
+  t.channel,
+  CASE
+    WHEN t.term_coverage IS NULL THEN 'term without words'
+    WHEN t.term_coverage = 0 THEN '0%: the page does not mention the search'
+    WHEN t.term_coverage < 0.5 THEN '1-49%'
+    WHEN t.term_coverage < 1 THEN '50-99%'
+    ELSE '100%: every word of the search is on the page'
+  END,
+  t.term,
+  t.landing_page_path,
+  t.landing_page_title,
+  t.term_coverage,
+  t.term_jaccard,
+  t.sessions,
+  SAFE_DIVIDE(t.engaged_sessions, t.sessions),
+  SAFE_DIVIDE(t.sessions_with_purchase, t.sessions),
+  t.transactions,
+  t.revenue,
+  SAFE_DIVIDE(t.revenue, t.sessions),
+  r.reference_revenue_per_session,
+  IF(t.term_coverage < 1, GREATEST(0, t.sessions * (r.reference_revenue_per_session - SAFE_DIVIDE(t.revenue, t.sessions))), NULL),
+  CURRENT_TIMESTAMP()
+FROM term_pages AS t
+LEFT JOIN reference AS r USING (channel)

@@ -43,6 +43,14 @@ more, the model is not worth the bytes, use the heuristic.
 | `ds_geo_experiment_did` | geo experiments by UF, difference in differences |
 | `ds_search_term_ngrams` | what people search (n-grams, pt stopwords, no accents) and how it converts |
 | `cro_ab_test_results` (marts) | A/B tests: z-test, Wilson intervals, Bayesian P(B > A), SRM check |
+| `ds_kpi_regimes` (insights) | when did the level of each KPI change? PELT change points on the deseasonalized series |
+| `ds_kpi_decomposition` (insights) | trend x weekday index x residual of every KPI, seasonally adjusted values |
+| `ds_kpi_forecast_holt_winters` (insights) | forecast without BQML, damped Holt-Winters with backtest and intervals |
+| `ds_bootstrap_channel_metrics` (insights) | Poisson bootstrap intervals per channel, and of the difference vs the site |
+| `ds_conversion_drivers_information` (insights) | which dimension explains the purchase (mutual information, Theil's U, Cramer's V) |
+| `ds_second_purchase_cox` (insights) | Cox regression: what in the first order speeds up the second one |
+| `ds_feature_impact_cem` (insights) | effect of a feature after coarsened exact matching, vs the naive difference |
+| `ds_geo_synthetic_control` (insights) | geo experiments with a synthetic control state and placebo inference |
 
 ## math inside the UDFs
 
@@ -51,6 +59,11 @@ more, the model is not worth the bytes, use the heuristic.
 `bg_nbd_predict`, `fit_gamma_gamma`, `gamma_gamma_expected_value`, `markov_removal_effects`,
 `shapley_values`, `cusum`. They are persistent functions in `ga4_udf`, analysts can call them in
 any query. The JS ones have tests with synthetic data (`npm run test:udfs`).
+
+The `insights` tier added `pelt_changepoints`, `holt_winters_forecast`, `gaussian_mixture_1d`,
+`fit_cox_ph`, `synthetic_control_weights`, `fit_bass_diffusion`, `louvain_communities`,
+`inverse_normal_cdf`, `sample_size_proportions`, `mde_proportions`, `poisson_bootstrap_weight` and
+`token_overlap` (`docs/insights.md`), tested in `tools/tests/test_insights_udfs.js`.
 
 ## costs
 

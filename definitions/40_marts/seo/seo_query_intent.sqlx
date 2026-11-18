@@ -1,0 +1,90 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_query_intent",
+  disabled: !constants.ENABLE.search_console,
+  description: "What the organic searches WANT, month by month: every query of the Search Console property export classified by intent with portuguese patterns (brand, navigational, transactional, commercial investigation, informational, local, product / generic, cfg_insights.query_intent), with impressions, clicks, CTR, impression weighted position, the share of the clicks of the month and the top queries of each intent. The content plan and the AI answers strategy start here: informational demand is the one the AI Overviews take, transactional is the one that pays",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo", level: "mid" }
+  },
+  tags: ["marts", "seo", "daily", "insights", "search_console", "optional"],
+  columns: {
+    intent: "brand | navigational | transactional | commercial | informational | local | product_or_generic",
+    avg_position: "Impression weighted average position",
+    click_share_of_month: "Clicks of the intent / clicks of the month",
+    ctr_change_vs_previous_month: "CTR of the month / CTR of the previous month - 1",
+    top_queries: "The 5 queries of the intent with more clicks in the month"
+  }
+}
+
+js {
+  const qi = cfg_insights.query_intent;
+  const normalized = "REGEXP_REPLACE(NORMALIZE(LOWER(query), NFD), r'\\p{M}', '')";
+  const intentCase = "CASE\n      WHEN is_brand_query THEN 'brand'\n" + qi.intents.map(i => `      WHEN REGEXP_CONTAINS(${normalized}, r'${i.pattern}') THEN '${i.intent}'`).join("\n") + "\n      ELSE 'product_or_generic'\n    END";
+}
+
+WITH
+queries AS (
+  SELECT
+    DATE_TRUNC(data_date, MONTH) AS month,
+    query,
+    is_brand_query,
+    impressions,
+    clicks,
+    avg_position
+  FROM ${ref("stg_gsc__site_impressions")}
+  WHERE data_date >= ${helpers.daysAgo(qi.window_days)}
+    AND search_type = 'WEB'
+    AND NOT COALESCE(is_anonymized_query, FALSE)
+    AND query IS NOT NULL
+),
+
+classified AS (
+  SELECT
+    *,
+    ${intentCase} AS intent
+  FROM queries
+),
+
+per_query AS (
+  SELECT
+    month,
+    intent,
+    query,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SUM(avg_position * impressions) AS weighted_position
+  FROM classified
+  GROUP BY 1, 2, 3
+),
+
+per_intent AS (
+  SELECT
+    month,
+    intent,
+    COUNT(*) AS queries,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SAFE_DIVIDE(SUM(weighted_position), SUM(impressions)) AS avg_position,
+    ARRAY_AGG(STRUCT(query, clicks, impressions) ORDER BY clicks DESC, impressions DESC LIMIT 5) AS top_queries
+  FROM per_query
+  GROUP BY 1, 2
+)
+
+SELECT
+  month,
+  intent,
+  queries,
+  impressions,
+  clicks,
+  SAFE_DIVIDE(clicks, impressions) AS ctr,
+  avg_position,
+  SAFE_DIVIDE(clicks, SUM(clicks) OVER (PARTITION BY month)) AS click_share_of_month,
+  SAFE_DIVIDE(impressions, SUM(impressions) OVER (PARTITION BY month)) AS impression_share_of_month,
+  SAFE_DIVIDE(SAFE_DIVIDE(clicks, impressions), LAG(SAFE_DIVIDE(clicks, impressions)) OVER (PARTITION BY intent ORDER BY month)) - 1 AS ctr_change_vs_previous_month,
+  top_queries,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_intent

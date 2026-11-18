@@ -1,0 +1,221 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_ab_test_segments",
+  description: "Did the test work the same for everybody? For every A/B test of cfg_experiments.js: the effect of each variant per segment of the first exposure (device, new x returning, channel), the z test of each segment with Benjamini-Hochberg q values (slice enough and something is always 'significant') and Cochran's Q heterogeneity test per segment type: 'the effect on mobile is different from desktop' only when the segments disagree more than chance. Read with cro_ab_test_results: the decision is still the overall one, this says where to look",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro", level: "senior" }
+  },
+  tags: ["marts", "cro", "daily", "insights", "experiments", "stats"],
+  columns: {
+    segment_type: "device | user_type | channel (of the session of the first exposure)",
+    absolute_effect: "Conversion of the variant - conversion of the control, inside the segment",
+    q_value: "Benjamini-Hochberg adjusted p value among the segment tests of the experiment and variant",
+    cochran_q: "Heterogeneity statistic of the segment type: sum of (effect - pooled effect)^2 / variance",
+    heterogeneity_p_value: "Chi-square p value of Cochran's Q (df = segments - 1). Below 0.05 = the effect really changes by segment",
+    i_squared: "Share of the variation between segments that is not chance (0 to 1)",
+    segment_verdict: "winner_here | loser_here | no_difference | too_small"
+  }
+}
+
+js {
+  const exp = cfg_experiments.exposure;
+  const ab = cfg_insights.ab_segments;
+}
+
+WITH
+tests AS (
+  SELECT * FROM ${ref("seed_ab_tests")}
+),
+
+exposure_events AS (
+  SELECT
+    ${ga4.paramAny(exp.experiment_param)} AS experiment_id,
+    ${ga4.paramAny(exp.variant_param)} AS variant_id,
+    e.user_pseudo_id,
+    e.session_key,
+    e.event_ts
+  FROM ${ref("stg_ga4__events")} AS e
+  WHERE e.event_date >= (SELECT MIN(start_date) FROM tests)
+    AND e.event_name = '${exp.event_name}'
+    ${helpers.noiseFilter("e")}
+),
+
+assignments AS (
+  SELECT
+    x.experiment_id,
+    COALESCE(id.user_key, CONCAT('dev:', x.user_pseudo_id)) AS user_key,
+    ARRAY_AGG(STRUCT(x.variant_id, x.session_key, x.event_ts) ORDER BY x.event_ts LIMIT 1)[OFFSET(0)] AS first_exposure,
+    COUNT(DISTINCT x.variant_id) > 1 AS saw_multiple_variants
+  FROM exposure_events AS x
+  LEFT JOIN ${ref("int_ga4__user_stitching")} AS id USING (user_pseudo_id)
+  JOIN tests AS t USING (experiment_id)
+  WHERE x.variant_id IS NOT NULL
+    AND DATE(x.event_ts, '${constants.TIMEZONE}') BETWEEN t.start_date AND COALESCE(t.end_date, ${helpers.today()})
+  GROUP BY 1, 2
+),
+
+-- people that saw more than one variant cannot be put in one segment cell, they stay out here
+with_segment AS (
+  SELECT
+    a.experiment_id,
+    a.user_key,
+    a.first_exposure.variant_id AS variant_id,
+    a.first_exposure.event_ts AS first_exposure_ts,
+    COALESCE(s.device_category, '(unknown)') AS device_category,
+    CASE WHEN s.is_new_user THEN 'new' WHEN s.is_new_user IS NULL THEN '(unknown)' ELSE 'returning' END AS user_type,
+    COALESCE(s.session_default_channel_group, '(unknown)') AS channel
+  FROM assignments AS a
+  LEFT JOIN ${ref("fct_sessions")} AS s ON s.session_key = a.first_exposure.session_key
+  WHERE NOT a.saw_multiple_variants
+    ${constants.EXCLUDE_BOTS_IN_MARTS ? "AND NOT COALESCE(s.is_bot_suspect, FALSE)" : ""}
+),
+
+outcomes AS (
+  SELECT
+    w.experiment_id,
+    w.user_key,
+    w.variant_id,
+    w.device_category,
+    w.user_type,
+    w.channel,
+    COUNT(k.key_event_id) > 0 AS converted
+  FROM with_segment AS w
+  JOIN tests AS t USING (experiment_id)
+  LEFT JOIN ${ref("fct_key_events")} AS k
+    ON k.user_key = w.user_key
+    AND k.key_event_name = t.goal_key_event
+    AND k.event_ts >= w.first_exposure_ts
+    AND k.event_date <= COALESCE(t.end_date, ${helpers.today()})
+  GROUP BY 1, 2, 3, 4, 5, 6
+),
+
+segmented AS (
+  SELECT o.experiment_id, o.variant_id, o.converted, seg.segment_type, seg.segment_value
+  FROM outcomes AS o
+  CROSS JOIN UNNEST([
+    STRUCT('device' AS segment_type, o.device_category AS segment_value),
+    STRUCT('user_type', o.user_type),
+    STRUCT('channel', o.channel)
+  ]) AS seg
+),
+
+cells AS (
+  SELECT experiment_id, segment_type, segment_value, variant_id, COUNT(*) AS users, COUNTIF(converted) AS conversions
+  FROM segmented
+  GROUP BY 1, 2, 3, 4
+),
+
+compared AS (
+  SELECT
+    v.experiment_id,
+    t.experiment_name,
+    v.segment_type,
+    v.segment_value,
+    v.variant_id,
+    v.users,
+    v.conversions,
+    c.users AS control_users,
+    c.conversions AS control_conversions,
+    ${ref("z_test_proportions")}(c.conversions, c.users, v.conversions, v.users) AS z
+  FROM cells AS v
+  JOIN tests AS t USING (experiment_id)
+  JOIN cells AS c
+    ON c.experiment_id = v.experiment_id
+    AND c.segment_type = v.segment_type
+    AND c.segment_value = v.segment_value
+    AND c.variant_id = t.control_variant
+  WHERE v.variant_id != t.control_variant
+),
+
+with_effects AS (
+  SELECT
+    *,
+    z.rate_b - z.rate_a AS effect,
+    SAFE_DIVIDE(z.rate_a * (1 - z.rate_a), control_users) + SAFE_DIVIDE(z.rate_b * (1 - z.rate_b), users) AS effect_variance,
+    users >= ${ab.min_users_per_cell} AND control_users >= ${ab.min_users_per_cell} AS is_big_enough
+  FROM compared
+),
+
+-- fixed effect pooling, then Cochran's Q: do the segments disagree more than chance?
+pooled AS (
+  SELECT
+    experiment_id,
+    variant_id,
+    segment_type,
+    COUNT(*) AS segments,
+    SUM(effect / effect_variance) / SUM(1 / effect_variance) AS pooled_effect
+  FROM with_effects
+  WHERE is_big_enough AND effect_variance > 0
+  GROUP BY 1, 2, 3
+),
+
+heterogeneity AS (
+  SELECT
+    p.experiment_id,
+    p.variant_id,
+    p.segment_type,
+    ANY_VALUE(p.segments) AS segments,
+    ANY_VALUE(p.pooled_effect) AS pooled_effect,
+    SUM(POW(e.effect - p.pooled_effect, 2) / e.effect_variance) AS cochran_q
+  FROM pooled AS p
+  JOIN with_effects AS e USING (experiment_id, variant_id, segment_type)
+  WHERE e.is_big_enough AND e.effect_variance > 0
+  GROUP BY 1, 2, 3
+),
+
+ranked AS (
+  SELECT
+    *,
+    IF(is_big_enough, z.p_value, NULL) AS segment_p_value,
+    COUNTIF(is_big_enough AND z.p_value IS NOT NULL) OVER (PARTITION BY experiment_id, variant_id) AS tests,
+    ROW_NUMBER() OVER (PARTITION BY experiment_id, variant_id ORDER BY IF(is_big_enough, z.p_value, NULL) ASC NULLS LAST, segment_type, segment_value) AS p_rank
+  FROM with_effects
+),
+
+adjusted AS (
+  SELECT
+    *,
+    IF(
+      segment_p_value IS NULL,
+      NULL,
+      LEAST(1, MIN(SAFE_DIVIDE(segment_p_value * tests, p_rank)) OVER (PARTITION BY experiment_id, variant_id ORDER BY p_rank DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+    ) AS q_value
+  FROM ranked
+)
+
+SELECT
+  a.experiment_id,
+  a.experiment_name,
+  a.variant_id,
+  a.segment_type,
+  a.segment_value,
+  a.users,
+  a.conversions,
+  SAFE_DIVIDE(a.conversions, a.users) AS conversion_rate,
+  a.control_users,
+  a.control_conversions,
+  a.z.rate_a AS control_conversion_rate,
+  a.effect AS absolute_effect,
+  a.z.rel_uplift AS relative_uplift,
+  a.segment_p_value AS p_value,
+  a.q_value,
+  a.is_big_enough,
+  h.segments AS segments_compared,
+  h.pooled_effect,
+  h.cochran_q,
+  ${ref("chi_square_pvalue")}(h.cochran_q, h.segments - 1) AS heterogeneity_p_value,
+  IF(h.cochran_q > 0, GREATEST(0, (h.cochran_q - (h.segments - 1)) / h.cochran_q), NULL) AS i_squared,
+  CASE
+    WHEN NOT a.is_big_enough THEN 'too_small'
+    WHEN a.q_value < ${ab.fdr} AND a.effect > 0 THEN 'winner_here'
+    WHEN a.q_value < ${ab.fdr} AND a.effect < 0 THEN 'loser_here'
+    ELSE 'no_difference'
+  END AS segment_verdict,
+  COALESCE(${ref("chi_square_pvalue")}(h.cochran_q, h.segments - 1) < 0.05, FALSE) AS effect_differs_by_segment_type,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM adjusted AS a
+LEFT JOIN heterogeneity AS h USING (experiment_id, variant_id, segment_type)

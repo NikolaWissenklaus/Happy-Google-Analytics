@@ -1,0 +1,242 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_geo_synthetic_control",
+  description: "The geo experiments of cfg_experiments.js measured with a synthetic control (Abadie et al. 2010) instead of an average of control states: the test states are rebuilt as the mix of other states that walked exactly like them BEFORE the campaign (ga4_udf.synthetic_control_weights), and after the start the gap between the real and the synthetic series is the effect, day by day and cumulative. Inference by placebos in space: every donor state is treated as if it were the test and the real effect must stand out (placebo p value). Read next to ds_geo_experiment_did: when both agree, believe it",
+  bigquery: {
+    labels: { layer: "data_science", domain: "experiments", level: "specialist" }
+  },
+  tags: ["data_science", "statistics", "daily", "insights", "experiments"],
+  columns: {
+    metric: "revenue | sessions (cfg_insights.synthetic_control.metrics)",
+    actual: "Value of the test states (sum) on the day",
+    synthetic: "What the test states would have done without the campaign, according to the synthetic control",
+    gap: "actual - synthetic (the daily effect)",
+    cumulative_gap: "Sum of the gap since the test started",
+    pre_rmspe: "Root mean squared error of the fit before the test, relative to the pre period mean (0.05 = 5%)",
+    rmspe_ratio: "post RMSPE / pre RMSPE of the test states. The bigger, the more the test period broke the pattern",
+    placebo_p_value: "(1 + placebos with a ratio at least as big) / (1 + placebos). The smallest possible is 1 / (donors + 1)",
+    donor_weights: "The states that make the synthetic control and their weights"
+  }
+}
+
+js {
+  const sc = cfg_insights.synthetic_control;
+  const metricStructs = sc.metrics.map(m => `STRUCT('${m}' AS metric, CAST(${m} AS FLOAT64) AS value)`).join(", ");
+  const metricList = sc.metrics.map(m => `'${m}'`).join(", ");
+}
+
+WITH
+experiments AS (
+  SELECT * FROM ${ref("seed_geo_experiments")}
+),
+
+daily_uf AS (
+  SELECT session_date, geo_uf, COUNT(*) AS sessions, SUM(revenue) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE geo_uf IS NOT NULL
+    AND session_date >= (SELECT MIN(pre_start) FROM experiments)
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2
+),
+
+metric_long AS (
+  SELECT d.session_date, d.geo_uf, m.metric, m.value
+  FROM daily_uf AS d
+  CROSS JOIN UNNEST([${metricStructs}]) AS m
+),
+
+-- the calendar of each experiment, so a state without sessions on a day counts 0 (same length for every series)
+experiment_days AS (
+  SELECT e.experiment_id, d AS metric_date, d <= e.pre_end AS is_pre, d >= e.test_start AS is_post
+  FROM experiments AS e
+  CROSS JOIN UNNEST(GENERATE_DATE_ARRAY(e.pre_start, LEAST(e.test_end, DATE_SUB(${helpers.today()}, INTERVAL 1 DAY)))) AS d
+  WHERE d <= e.pre_end OR d >= e.test_start
+),
+
+units AS (
+  SELECT e.experiment_id, '(test states)' AS unit, TRUE AS is_treated, e.test_ufs AS ufs
+  FROM experiments AS e
+  UNION ALL
+  SELECT e.experiment_id, s.uf, FALSE, [s.uf]
+  FROM experiments AS e
+  CROSS JOIN ${ref("seed_br_states")} AS s
+  WHERE s.uf NOT IN UNNEST(e.test_ufs)
+    ${sc.donor_pool === "control_ufs" ? "AND s.uf IN UNNEST(e.control_ufs)" : ""}
+),
+
+unit_ufs AS (
+  SELECT u.experiment_id, u.unit, uf
+  FROM units AS u
+  CROSS JOIN UNNEST(u.ufs) AS uf
+),
+
+unit_values AS (
+  SELECT uu.experiment_id, uu.unit, ml.session_date AS metric_date, ml.metric, SUM(ml.value) AS value
+  FROM unit_ufs AS uu
+  JOIN metric_long AS ml ON ml.geo_uf = uu.uf
+  GROUP BY 1, 2, 3, 4
+),
+
+unit_series AS (
+  SELECT u.experiment_id, u.unit, u.is_treated, ed.metric_date, ed.is_pre, ed.is_post, metric_name AS metric, COALESCE(v.value, 0) AS value
+  FROM units AS u
+  JOIN experiment_days AS ed USING (experiment_id)
+  CROSS JOIN UNNEST([${metricList}]) AS metric_name
+  LEFT JOIN unit_values AS v
+    ON v.experiment_id = u.experiment_id
+    AND v.unit = u.unit
+    AND v.metric_date = ed.metric_date
+    AND v.metric = metric_name
+),
+
+unit_volume AS (
+  SELECT uu.experiment_id, uu.unit, SUM(d.sessions) / ANY_VALUE(DATE_DIFF(e.pre_end, e.pre_start, DAY) + 1) AS pre_daily_sessions
+  FROM unit_ufs AS uu
+  JOIN experiments AS e USING (experiment_id)
+  JOIN daily_uf AS d ON d.geo_uf = uu.uf AND d.session_date BETWEEN e.pre_start AND e.pre_end
+  GROUP BY 1, 2
+),
+
+pre_stats AS (
+  SELECT experiment_id, unit, metric, AVG(IF(is_pre, value, NULL)) AS pre_mean
+  FROM unit_series
+  GROUP BY 1, 2, 3
+),
+
+-- every series divided by its own pre period mean: Sao Paulo and Acre can be compared by shape
+normalized AS (
+  SELECT s.*, p.pre_mean, SAFE_DIVIDE(s.value, p.pre_mean) AS norm_value
+  FROM unit_series AS s
+  JOIN pre_stats AS p USING (experiment_id, unit, metric)
+  JOIN unit_volume AS v USING (experiment_id, unit)
+  WHERE p.pre_mean > 0
+    AND (s.is_treated OR v.pre_daily_sessions >= ${sc.min_pre_daily_sessions})
+),
+
+-- run 1 = the real test, the other runs = every donor pretending to be the test (placebos in space)
+runs AS (
+  SELECT DISTINCT experiment_id, metric, unit AS run_unit, is_treated AS is_real_run
+  FROM normalized
+),
+
+run_target AS (
+  SELECT r.experiment_id, r.metric, r.run_unit, r.is_real_run, ARRAY_AGG(n.norm_value ORDER BY n.metric_date) AS target_pre
+  FROM runs AS r
+  JOIN normalized AS n ON n.experiment_id = r.experiment_id AND n.metric = r.metric AND n.unit = r.run_unit
+  WHERE n.is_pre
+  GROUP BY 1, 2, 3, 4
+),
+
+run_donor_series AS (
+  SELECT r.experiment_id, r.metric, r.run_unit, n.unit AS donor, ARRAY_AGG(n.norm_value ORDER BY n.metric_date) AS series
+  FROM runs AS r
+  JOIN normalized AS n ON n.experiment_id = r.experiment_id AND n.metric = r.metric
+  WHERE n.is_pre
+    AND NOT n.is_treated
+    AND n.unit != r.run_unit
+  GROUP BY 1, 2, 3, 4
+),
+
+run_donors AS (
+  SELECT experiment_id, metric, run_unit, ARRAY_AGG(STRUCT(donor, series)) AS donors
+  FROM run_donor_series
+  GROUP BY 1, 2, 3
+),
+
+run_weights AS (
+  SELECT t.experiment_id, t.metric, t.run_unit, t.is_real_run, ${ref("synthetic_control_weights")}(t.target_pre, d.donors, ${sc.iterations}) AS weights
+  FROM run_target AS t
+  JOIN run_donors AS d USING (experiment_id, metric, run_unit)
+),
+
+weights_flat AS (
+  SELECT rw.experiment_id, rw.metric, rw.run_unit, rw.is_real_run, w.donor, w.weight
+  FROM run_weights AS rw
+  CROSS JOIN UNNEST(rw.weights) AS w
+),
+
+synthetic AS (
+  SELECT wf.experiment_id, wf.metric, wf.run_unit, wf.is_real_run, n.metric_date, SUM(wf.weight * n.norm_value) AS synthetic_norm
+  FROM weights_flat AS wf
+  JOIN normalized AS n ON n.experiment_id = wf.experiment_id AND n.metric = wf.metric AND n.unit = wf.donor
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+gaps AS (
+  SELECT s.*, a.is_pre, a.is_post, a.value AS actual_value, a.pre_mean, a.norm_value - s.synthetic_norm AS gap_norm
+  FROM synthetic AS s
+  JOIN normalized AS a
+    ON a.experiment_id = s.experiment_id
+    AND a.metric = s.metric
+    AND a.unit = s.run_unit
+    AND a.metric_date = s.metric_date
+),
+
+fit_quality AS (
+  SELECT
+    experiment_id,
+    metric,
+    run_unit,
+    is_real_run,
+    SQRT(AVG(IF(is_pre, POW(gap_norm, 2), NULL))) AS pre_rmspe,
+    SQRT(AVG(IF(is_post, POW(gap_norm, 2), NULL))) AS post_rmspe
+  FROM gaps
+  GROUP BY 1, 2, 3, 4
+),
+
+inference AS (
+  SELECT
+    r.experiment_id,
+    r.metric,
+    ANY_VALUE(r.pre_rmspe) AS pre_rmspe,
+    ANY_VALUE(r.post_rmspe) AS post_rmspe,
+    ANY_VALUE(SAFE_DIVIDE(r.post_rmspe, r.pre_rmspe)) AS rmspe_ratio,
+    COUNT(p.run_unit) AS placebos,
+    (1 + COUNTIF(SAFE_DIVIDE(p.post_rmspe, p.pre_rmspe) >= SAFE_DIVIDE(r.post_rmspe, r.pre_rmspe))) / (1 + COUNT(p.run_unit)) AS placebo_p_value
+  FROM fit_quality AS r
+  LEFT JOIN fit_quality AS p
+    ON p.experiment_id = r.experiment_id
+    AND p.metric = r.metric
+    AND NOT p.is_real_run
+  WHERE r.is_real_run
+  GROUP BY 1, 2
+),
+
+donor_weights AS (
+  SELECT experiment_id, metric, ARRAY_AGG(STRUCT(donor AS uf, weight) ORDER BY weight DESC LIMIT 10) AS donor_weights
+  FROM weights_flat
+  WHERE is_real_run AND weight > 0.001
+  GROUP BY 1, 2
+)
+
+SELECT
+  g.experiment_id,
+  e.experiment_name,
+  g.metric,
+  g.metric_date,
+  IF(g.is_pre, 'pre', 'test') AS period,
+  g.actual_value AS actual,
+  g.synthetic_norm * g.pre_mean AS synthetic,
+  g.actual_value - g.synthetic_norm * g.pre_mean AS gap,
+  SUM(IF(g.is_post, g.actual_value - g.synthetic_norm * g.pre_mean, 0)) OVER (PARTITION BY g.experiment_id, g.metric ORDER BY g.metric_date) AS cumulative_gap,
+  SAFE_DIVIDE(
+    SUM(IF(g.is_post, g.actual_value - g.synthetic_norm * g.pre_mean, 0)) OVER (PARTITION BY g.experiment_id, g.metric),
+    SUM(IF(g.is_post, g.synthetic_norm * g.pre_mean, 0)) OVER (PARTITION BY g.experiment_id, g.metric)
+  ) AS relative_effect_test_period,
+  i.pre_rmspe,
+  i.post_rmspe,
+  i.rmspe_ratio,
+  i.placebos,
+  i.placebo_p_value,
+  dw.donor_weights,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM gaps AS g
+JOIN experiments AS e USING (experiment_id)
+LEFT JOIN inference AS i USING (experiment_id, metric)
+LEFT JOIN donor_weights AS dw USING (experiment_id, metric)
+WHERE g.is_real_run

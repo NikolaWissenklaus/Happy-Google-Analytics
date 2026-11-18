@@ -1,0 +1,155 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "holt_winters_forecast",
+  description: "Additive Holt-Winters with damped trend (triple exponential smoothing) fitted by grid search inside BigQuery: one step ahead fit, a backtest on the last N points (holdout MAPE and bias) and the forecast of the next steps with approximate 80% / 95% prediction intervals. Works without BQML",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "models", "insights"]
+}
+
+-- ARIMA_PLUS needs enable_bqml (and a budget). Holt-Winters is the forecast every retailer used
+-- before machine learning and it is still hard to beat on daily KPIs with a weekly cycle:
+--   level   l(t) = a (y(t) - s(t-m)) + (1 - a)(l(t-1) + phi b(t-1))
+--   trend   b(t) = beta (l(t) - l(t-1)) + (1 - beta) phi b(t-1)
+--   season  s(t) = g (y(t) - l(t)) + (1 - g) s(t-m)
+--   forecast y(t+h) = l(t) + (phi + ... + phi^h) b(t) + s(t+h-m)
+-- alpha / beta / gamma / phi are chosen by the smallest one step squared error on the training part
+-- (the first season is not scored, it was used to initialize). The holdout points are forecast from
+-- the end of the training part, like the real use, so holdout_mape is the error to believe. The
+-- intervals use the variance multipliers of the additive model (Hyndman et al. 2008), approximate
+-- with the damped trend. Send the series without NULLs, oldest first
+CREATE OR REPLACE FUNCTION ${self()}(series ARRAY<FLOAT64>, season_length FLOAT64, horizon FLOAT64, holdout FLOAT64)
+RETURNS STRUCT<
+  alpha FLOAT64, beta FLOAT64, gamma FLOAT64, phi FLOAT64,
+  residual_sd FLOAT64, holdout_mape FLOAT64, holdout_bias FLOAT64, holdout_points FLOAT64,
+  points ARRAY<STRUCT<step FLOAT64, is_forecast BOOL, actual FLOAT64, fitted FLOAT64, low_80 FLOAT64, high_80 FLOAT64, low_95 FLOAT64, high_95 FLOAT64>>
+>
+LANGUAGE js AS r"""
+  var y = [];
+  var raw = series || [];
+  var prev = 0;
+  for (var i = 0; i < raw.length; i++) {
+    var v = raw[i];
+    if (v === null || v === undefined || isNaN(v) || !isFinite(v)) v = prev;
+    y.push(Number(v));
+    prev = Number(v);
+  }
+  var m = (season_length === null || season_length === undefined) ? 7 : Math.max(1, Math.round(season_length));
+  var h = (horizon === null || horizon === undefined) ? 28 : Math.max(1, Math.round(horizon));
+  var hold = (holdout === null || holdout === undefined) ? 0 : Math.max(0, Math.round(holdout));
+  var n = y.length;
+  if (n < 2 * m + hold + 2) return null;
+  if (n - hold < 2 * m + 2) hold = Math.max(0, n - 2 * m - 2);
+
+  function init(data) {
+    var seasons = Math.min(Math.floor(data.length / m), 4);
+    var means = [];
+    for (var j = 0; j < seasons; j++) {
+      var acc = 0;
+      for (var k = 0; k < m; k++) acc += data[j * m + k];
+      means.push(acc / m);
+    }
+    var season = new Array(m);
+    for (var p = 0; p < m; p++) {
+      var dev = 0;
+      for (var q = 0; q < seasons; q++) dev += data[q * m + p] - means[q];
+      season[p] = dev / seasons;
+    }
+    return {
+      level: means[0],
+      trend: seasons > 1 ? (means[seasons - 1] - means[0]) / ((seasons - 1) * m) : 0,
+      season: season
+    };
+  }
+
+  function run(data, a, b, g, phi, steps) {
+    var st = init(data);
+    var l = st.level, tr = st.trend, s = st.season.slice();
+    var fitted = new Array(data.length);
+    var sse = 0, cnt = 0;
+    for (var t = 0; t < data.length; t++) {
+      var idx = t % m;
+      var f = l + phi * tr + s[idx];
+      fitted[t] = f;
+      var e = data[t] - f;
+      if (t >= m) { sse += e * e; cnt++; }
+      var lPrev = l;
+      l = a * (data[t] - s[idx]) + (1 - a) * (l + phi * tr);
+      tr = b * (l - lPrev) + (1 - b) * phi * tr;
+      s[idx] = g * (data[t] - l) + (1 - g) * s[idx];
+    }
+    var forecast = [];
+    var damp = 0;
+    for (var k2 = 1; k2 <= steps; k2++) {
+      damp += Math.pow(phi, k2);
+      forecast.push(l + damp * tr + s[(data.length + k2 - 1) % m]);
+    }
+    return { sse: sse, cnt: cnt, fitted: fitted, forecast: forecast };
+  }
+
+  var train = y.slice(0, n - hold);
+  var alphas = [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8];
+  var betas = [0, 0.01, 0.03, 0.05, 0.1, 0.2];
+  var gammas = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5];
+  var phis = [0.8, 0.9, 0.95, 0.98, 1];
+  var best = null;
+  for (var ia = 0; ia < alphas.length; ia++) {
+    for (var ib = 0; ib < betas.length; ib++) {
+      for (var ig = 0; ig < gammas.length; ig++) {
+        for (var ip = 0; ip < phis.length; ip++) {
+          if (betas[ib] === 0 && ip > 0) continue;
+          var fit = run(train, alphas[ia], betas[ib], gammas[ig], phis[ip], 0);
+          if (best === null || fit.sse < best.sse) best = { sse: fit.sse, a: alphas[ia], b: betas[ib], g: gammas[ig], phi: betas[ib] === 0 ? 1 : phis[ip] };
+        }
+      }
+    }
+  }
+
+  var mape = null, bias = null;
+  if (hold > 0) {
+    var back = run(train, best.a, best.b, best.g, best.phi, hold);
+    var ape = 0, apeCount = 0, err = 0, level = 0;
+    for (var j = 0; j < hold; j++) {
+      var actual = y[n - hold + j];
+      var fc = back.forecast[j];
+      if (actual !== 0) { ape += Math.abs(actual - fc) / Math.abs(actual); apeCount++; }
+      err += fc - actual;
+      level += actual;
+    }
+    mape = apeCount > 0 ? ape / apeCount : null;
+    bias = level !== 0 ? err / level : null;
+  }
+
+  var full = run(y, best.a, best.b, best.g, best.phi, h);
+  var sd = full.cnt > 0 ? Math.sqrt(full.sse / full.cnt) : 0;
+  var points = [];
+  for (var t2 = 0; t2 < n; t2++) {
+    points.push({ step: t2, is_forecast: false, actual: y[t2], fitted: full.fitted[t2], low_80: null, high_80: null, low_95: null, high_95: null });
+  }
+  var multiplier = 1;
+  var dampSum = 0;
+  for (var k3 = 1; k3 <= h; k3++) {
+    if (k3 > 1) {
+      dampSum += Math.pow(best.phi, k3 - 1);
+      var c = best.a * (1 + best.b * dampSum) + ((k3 - 1) % m === 0 ? best.g : 0);
+      multiplier += c * c;
+    }
+    var sdK = sd * Math.sqrt(multiplier);
+    var f2 = full.forecast[k3 - 1];
+    points.push({
+      step: n - 1 + k3, is_forecast: true, actual: null, fitted: f2,
+      low_80: f2 - 1.2815515655446004 * sdK, high_80: f2 + 1.2815515655446004 * sdK,
+      low_95: f2 - 1.959963984540054 * sdK, high_95: f2 + 1.959963984540054 * sdK
+    });
+  }
+  return {
+    alpha: best.a, beta: best.b, gamma: best.g, phi: best.phi,
+    residual_sd: sd, holdout_mape: mape, holdout_bias: bias, holdout_points: hold,
+    points: points
+  };
+"""
+OPTIONS (description = "Additive damped Holt-Winters forecast with backtest and prediction intervals")

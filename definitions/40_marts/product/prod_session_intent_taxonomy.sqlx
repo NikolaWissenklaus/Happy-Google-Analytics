@@ -1,0 +1,156 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_session_intent_taxonomy",
+  description: "What was the visit FOR? Broder's taxonomy of web searches (navigational, informational, transactional, 2002) applied to every session, plus the intents an e-commerce has and a search engine does not: cart building, checkout abandoned, comparison research, post purchase service. Per day, channel and device: sessions of each intent, conversion, revenue and, for the visits that did not buy, how many bought in the next days (research sessions are an investment, not a failure). Rules in cfg_insights.session_intent, first match wins",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["intent", "session_default_channel_group"],
+    labels: { layer: "marts", domain: "product", level: "mid" }
+  },
+  tags: ["marts", "product", "daily", "insights"],
+  columns: Object.assign(docs.pick("session_date", "sessions"), {
+    intent: "Intent of the session (cfg_insights.session_intent.intents)",
+    intent_family: "transactional | commercial | informational | navigational | service | unknown",
+    share_of_day: "Sessions of this row / all sessions of the day",
+    later_purchase_rate: "Sessions without purchase whose person bought within later_purchase_days: the delayed value of the intent",
+    avg_distinct_products: "Distinct products viewed per session"
+  })
+}
+
+js {
+  const si = cfg_insights.session_intent;
+  const pp = cfg_labs.post_purchase;
+  const servicePattern = `${pp.order_tracking_pattern}|${pp.support_pattern}|${pp.returns_pattern}`;
+  const intentCase = "CASE\n" + si.intents.map(i => `      WHEN ${i.condition} THEN '${i.intent}'`).join("\n") + "\n      ELSE 'other'\n    END";
+  const familyCase = "CASE\n" + si.intents.map(i => `      WHEN ${i.condition} THEN '${i.family}'`).join("\n") + "\n      ELSE 'unknown'\n    END";
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_key,
+    session_date,
+    session_start_ts,
+    user_key,
+    COALESCE(device_category, '(not set)') AS device_category,
+    COALESCE(session_default_channel_group, '(not set)') AS session_default_channel_group,
+    landing_page_type,
+    is_new_user,
+    is_engaged,
+    has_purchase,
+    has_begin_checkout,
+    has_add_to_cart,
+    COALESCE(page_views, 0) + COALESCE(screen_views, 0) AS views,
+    COALESCE(engagement_time_sec, 0) AS engagement_time_sec,
+    transactions,
+    revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(si.window_days)}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+page_mix AS (
+  SELECT
+    session_key,
+    COUNTIF(page_type = 'category') AS category_views,
+    COUNTIF(page_type = 'search') AS search_views,
+    COUNTIF(page_type IN (${helpers.sqlList(si.content_page_types)})) AS content_views,
+    COUNTIF(page_type = 'account') AS account_views,
+    COUNTIF(page_type = 'home') AS home_views,
+    COUNTIF(page_type = 'cart') AS cart_views,
+    COUNTIF(REGEXP_CONTAINS(COALESCE(page_path, ''), r'${servicePattern}')) AS service_views
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(si.window_days)}
+    AND event_date < ${helpers.today()}
+  GROUP BY 1
+),
+
+products AS (
+  SELECT session_key, COUNT(DISTINCT item_id) AS distinct_products
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(si.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+  GROUP BY 1
+),
+
+features AS (
+  SELECT
+    s.*,
+    COALESCE(pm.category_views, 0) AS category_views,
+    COALESCE(pm.search_views, 0) AS search_views,
+    COALESCE(pm.content_views, 0) AS content_views,
+    COALESCE(pm.account_views, 0) AS account_views,
+    COALESCE(pm.home_views, 0) AS home_views,
+    COALESCE(pm.cart_views, 0) AS cart_views,
+    COALESCE(pm.service_views, 0) AS service_views,
+    COALESCE(p.distinct_products, 0) AS distinct_products
+  FROM sessions AS s
+  LEFT JOIN page_mix AS pm USING (session_key)
+  LEFT JOIN products AS p USING (session_key)
+),
+
+classified AS (
+  SELECT
+    *,
+    ${intentCase} AS intent,
+    ${familyCase} AS intent_family
+  FROM features
+),
+
+purchases AS (
+  SELECT user_key, transaction_ts
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${helpers.daysAgo(si.window_days)}
+    AND is_valid_for_revenue
+),
+
+-- the visit did not buy, but did the same person buy in the next days? (another session, another device of the same user_key)
+later_purchase AS (
+  SELECT c.session_key
+  FROM classified AS c
+  JOIN purchases AS pu
+    ON pu.user_key = c.user_key
+    AND pu.transaction_ts > c.session_start_ts
+    AND pu.transaction_ts <= TIMESTAMP_ADD(c.session_start_ts, INTERVAL ${si.later_purchase_days} DAY)
+  WHERE NOT c.has_purchase
+  GROUP BY 1
+),
+
+aggregated AS (
+  SELECT
+    c.session_date,
+    c.intent,
+    c.intent_family,
+    c.device_category,
+    c.session_default_channel_group,
+    COUNT(*) AS sessions,
+    COUNTIF(c.is_new_user) AS new_user_sessions,
+    COUNTIF(c.is_engaged) AS engaged_sessions,
+    COUNTIF(c.has_purchase) AS sessions_with_purchase,
+    SUM(c.transactions) AS transactions,
+    SUM(c.revenue) AS revenue,
+    COUNTIF(lp.session_key IS NOT NULL) AS sessions_bought_later,
+    AVG(c.engagement_time_sec) AS avg_engagement_sec,
+    AVG(c.views) AS avg_views,
+    AVG(c.distinct_products) AS avg_distinct_products
+  FROM classified AS c
+  LEFT JOIN later_purchase AS lp USING (session_key)
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(sessions, SUM(sessions) OVER (PARTITION BY session_date)) AS share_of_day,
+  SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+  SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+  SAFE_DIVIDE(revenue, sessions) AS revenue_per_session,
+  SAFE_DIVIDE(sessions_bought_later, sessions - sessions_with_purchase) AS later_purchase_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregated

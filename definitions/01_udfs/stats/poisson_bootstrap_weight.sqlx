@@ -1,0 +1,37 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "poisson_bootstrap_weight",
+  description: "Deterministic Poisson(1) bootstrap weight of a unit in a replicate (0, 1, 2... with the Poisson probabilities), from a hash. Bootstrap confidence intervals in plain SQL: SUM(x * weight) per replicate, no resampling, no random seed, same result on every run",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "insights"]
+}
+
+-- The classic bootstrap draws n units with replacement, which SQL cannot do cheaply. The Poisson
+-- bootstrap gives every unit an independent Poisson(1) weight instead (Hanley & MacGibbon 2006,
+-- the one used by the big experimentation platforms): same intervals for large n, and it is a
+-- simple SUM. The weight comes from FARM_FINGERPRINT(unit + replicate), so a replicate is the same
+-- on every run and units can be sessions, users or hash buckets. Inverse CDF of Poisson(1)
+CREATE OR REPLACE FUNCTION ${self()}(unit_key STRING, replicate INT64) RETURNS INT64 AS ((
+  SELECT
+    CASE
+      WHEN u < 0.36787944117144233 THEN 0
+      WHEN u < 0.7357588823428847 THEN 1
+      WHEN u < 0.9196986029286058 THEN 2
+      WHEN u < 0.9810118431238462 THEN 3
+      WHEN u < 0.9963401531726563 THEN 4
+      WHEN u < 0.9994058151824183 THEN 5
+      WHEN u < 0.9999167588507119 THEN 6
+      WHEN u < 0.9999897508033813 THEN 7
+      WHEN u < 0.9999988747974926 THEN 8
+      ELSE 9
+    END
+  FROM (
+    SELECT (ABS(MOD(FARM_FINGERPRINT(CONCAT(COALESCE(unit_key, ''), '#', CAST(replicate AS STRING))), 1000000000)) + 0.5) / 1000000000 AS u
+  )
+))
+OPTIONS (description = "Poisson(1) bootstrap weight from a hash")

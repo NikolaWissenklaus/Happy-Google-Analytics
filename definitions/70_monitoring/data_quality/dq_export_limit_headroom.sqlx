@@ -1,0 +1,112 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.dq,
+  name: "dq_export_limit_headroom",
+  description: "Will the GA4 export stop? Standard GA4 properties export at most 1 million events per day to BigQuery (daily export), and Google pauses the export when a property keeps going over it. Per day of the last 8 weeks: events exported against the limit, the trend of the last 28 days and the projected date the limit will be crossed, plus every event name with its daily volume and whether it is a key event, planned in the tracking plan or automatic, so the team knows which events to drop or move to the streaming export BEFORE the data stops arriving",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "data_quality", level: "mid" }
+  },
+  tags: ["monitoring", "data_quality", "daily", "insights", "ops"],
+  columns: {
+    daily_event_limit: "cfg_insights.export_limit.daily_event_limit (1M for standard properties)",
+    avg_events_last_7_days: "Average events per day of the daily export in the last 7 complete days (duplicates included, the export counts them)",
+    headroom_share: "1 - avg_events_last_7_days / limit",
+    days_over_limit: "Days of the window above the limit",
+    trend_events_per_day: "OLS slope of the daily events of the last trend_days days",
+    projected_limit_date: "Day the trend crosses the limit (NULL when flat or falling)",
+    status: "over_limit | crossing_soon (within insights_feed.export_limit_warn_days) | growing | ok",
+    event_share: "Share of the event in the export of the last 7 days",
+    is_drop_candidate: "Not a key event, not in the tracking plan, not automatic: nobody asked for it"
+  }
+}
+
+js {
+  const el = cfg_insights.export_limit;
+  const warnDays = cfg_insights.insights_feed.export_limit_warn_days;
+}
+
+WITH
+daily AS (
+  SELECT event_date, SUM(duplicate_count) AS exported_events
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(el.window_days)}
+    AND event_date < ${helpers.today()}
+    AND source_table_type = 'daily'
+  GROUP BY 1
+),
+
+property AS (
+  SELECT
+    ${el.daily_event_limit} AS daily_event_limit,
+    AVG(IF(event_date >= ${helpers.daysAgo(7)}, exported_events, NULL)) AS avg_events_last_7_days,
+    MAX(exported_events) AS max_events_in_a_day,
+    COUNTIF(exported_events > ${el.daily_event_limit}) AS days_over_limit,
+    SAFE_DIVIDE(
+      COVAR_SAMP(IF(event_date >= ${helpers.daysAgo(el.trend_days)}, UNIX_DATE(event_date), NULL), IF(event_date >= ${helpers.daysAgo(el.trend_days)}, exported_events, NULL)),
+      VAR_SAMP(IF(event_date >= ${helpers.daysAgo(el.trend_days)}, UNIX_DATE(event_date), NULL))
+    ) AS trend_events_per_day,
+    MAX(event_date) AS last_day
+  FROM daily
+),
+
+projected AS (
+  SELECT
+    *,
+    1 - SAFE_DIVIDE(avg_events_last_7_days, daily_event_limit) AS headroom_share,
+    IF(trend_events_per_day > 0 AND avg_events_last_7_days < daily_event_limit,
+      DATE_ADD(last_day, INTERVAL CAST(CEIL((daily_event_limit - avg_events_last_7_days) / trend_events_per_day) AS INT64) DAY),
+      NULL) AS projected_limit_date
+  FROM property
+),
+
+events_mix AS (
+  SELECT event_name, SUM(duplicate_count) / 7 AS events_per_day
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(7)}
+    AND event_date < ${helpers.today()}
+    AND source_table_type = 'daily'
+  GROUP BY 1
+),
+
+flags AS (
+  SELECT
+    m.event_name,
+    m.events_per_day,
+    k.event_name IS NOT NULL AS is_key_event,
+    tp.event_name IS NOT NULL AS is_in_tracking_plan,
+    au.event_name IS NOT NULL AS is_automatic_event
+  FROM events_mix AS m
+  LEFT JOIN (SELECT DISTINCT event_name FROM ${ref("seed_key_events")}) AS k USING (event_name)
+  LEFT JOIN (SELECT DISTINCT event_name FROM ${ref("seed_tracking_plan")}) AS tp USING (event_name)
+  LEFT JOIN (SELECT DISTINCT event_name FROM ${ref("seed_automatic_events")}) AS au USING (event_name)
+)
+
+SELECT
+  f.event_name,
+  f.events_per_day,
+  SAFE_DIVIDE(f.events_per_day, SUM(f.events_per_day) OVER ()) AS event_share,
+  SAFE_DIVIDE(SUM(f.events_per_day) OVER (ORDER BY f.events_per_day DESC, f.event_name ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), SUM(f.events_per_day) OVER ()) AS cumulative_share,
+  f.is_key_event,
+  f.is_in_tracking_plan,
+  f.is_automatic_event,
+  NOT f.is_key_event AND NOT f.is_in_tracking_plan AND NOT f.is_automatic_event AS is_drop_candidate,
+  p.daily_event_limit,
+  p.avg_events_last_7_days,
+  p.max_events_in_a_day,
+  p.headroom_share,
+  p.days_over_limit,
+  p.trend_events_per_day,
+  p.projected_limit_date,
+  DATE_DIFF(p.projected_limit_date, ${helpers.today()}, DAY) AS days_to_limit,
+  CASE
+    WHEN p.avg_events_last_7_days >= p.daily_event_limit THEN 'over_limit'
+    WHEN DATE_DIFF(p.projected_limit_date, ${helpers.today()}, DAY) <= ${warnDays} THEN 'crossing_soon'
+    WHEN p.trend_events_per_day > 0 THEN 'growing'
+    ELSE 'ok'
+  END AS status,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM flags AS f
+CROSS JOIN projected AS p

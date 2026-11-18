@@ -1,0 +1,114 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_test_capacity_planner",
+  description: "Before the A/B test, not after two weeks of 'it is almost significant': for the site, each landing page type, the top landing pages, each device and each step of the funnel, the traffic it has, its conversion today, the smallest change a 50/50 test can detect in 14 / 28 / 56 days (MDE, alpha 5%, power 80%) and how many days it takes to detect a 5%, 10% and 20% relative lift. Pages that can only detect +40% should get bold redesigns or be tested together, never 'change the button color'",
+  bigquery: {
+    labels: { layer: "marts", domain: "cro", level: "mid" }
+  },
+  tags: ["marts", "cro", "daily", "insights", "experiments"],
+  columns: {
+    scope: "site | landing_page_type | landing_page | device | funnel_step",
+    target: "What would be tested (the page, the type, the device or the step)",
+    units: "Sessions in the window (for funnel steps: sessions that reached the step before)",
+    baseline_rate: "Conversion of the units (purchase, or the next step for funnel steps)",
+    mde_in_14_days: "Smallest relative lift a 50/50 test detects in 14 days (0.12 = +12%). Same idea for the other mde_in_N_days",
+    days_for_10pct_lift: "Days of traffic (all units, split 50/50) to detect +10% relative. Same idea for the other lifts",
+    annual_value_of_1pct_lift: "Revenue of a year of these units x 1%: what each point of relative lift is worth",
+    verdict: "test_small_changes_in_2_weeks | test_small_changes_in_a_month | only_bold_changes | not_testable_use_other_methods | no_conversions_to_measure"
+  }
+}
+
+js {
+  const tc = cfg_insights.test_capacity;
+  const daily = `units / ${tc.window_days}`;
+  const daysFor = lift => `CEIL(SAFE_DIVIDE(2 * ${ref("sample_size_proportions")}(SAFE_DIVIDE(successes, units), ${lift}, ${tc.alpha}, ${tc.power}), ${daily}))`;
+}
+
+WITH
+sessions AS (
+  SELECT
+    landing_page_path,
+    COALESCE(landing_page_type, '(not set)') AS landing_page_type,
+    COALESCE(device_category, '(not set)') AS device_category,
+    has_view_item,
+    has_add_to_cart,
+    has_begin_checkout,
+    has_purchase,
+    COALESCE(revenue, 0) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(tc.window_days)}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+top_landings AS (
+  SELECT landing_page_path
+  FROM sessions
+  WHERE landing_page_path IS NOT NULL
+  GROUP BY 1
+  ORDER BY COUNT(*) DESC
+  LIMIT ${tc.top_landing_pages}
+),
+
+-- every place where a test could run, with its population (units) and its success
+populations AS (
+  SELECT 'site' AS scope, '(all)' AS target, COUNT(*) AS units, COUNTIF(has_purchase) AS successes, SUM(revenue) AS revenue
+  FROM sessions
+  UNION ALL
+  SELECT 'landing_page_type', landing_page_type, COUNT(*), COUNTIF(has_purchase), SUM(revenue)
+  FROM sessions
+  GROUP BY 2
+  UNION ALL
+  SELECT 'landing_page', s.landing_page_path, COUNT(*), COUNTIF(s.has_purchase), SUM(s.revenue)
+  FROM sessions AS s
+  JOIN top_landings USING (landing_page_path)
+  GROUP BY 2
+  UNION ALL
+  SELECT 'device', device_category, COUNT(*), COUNTIF(has_purchase), SUM(revenue)
+  FROM sessions
+  GROUP BY 2
+  UNION ALL
+  SELECT 'funnel_step', 'product view -> add to cart', COUNTIF(has_view_item), COUNTIF(has_view_item AND has_add_to_cart), SUM(IF(has_view_item, revenue, 0))
+  FROM sessions
+  UNION ALL
+  SELECT 'funnel_step', 'add to cart -> checkout', COUNTIF(has_add_to_cart), COUNTIF(has_add_to_cart AND has_begin_checkout), SUM(IF(has_add_to_cart, revenue, 0))
+  FROM sessions
+  UNION ALL
+  SELECT 'funnel_step', 'checkout -> purchase', COUNTIF(has_begin_checkout), COUNTIF(has_begin_checkout AND has_purchase), SUM(IF(has_begin_checkout, revenue, 0))
+  FROM sessions
+),
+
+planned AS (
+  SELECT
+    scope,
+    target,
+    units,
+    successes,
+    revenue,
+    ${daily} AS daily_units,
+    SAFE_DIVIDE(successes, units) AS baseline_rate,
+    ${tc.test_days.map(d => `${ref("mde_proportions")}(SAFE_DIVIDE(successes, units), ${daily} * ${d} / 2, ${tc.alpha}, ${tc.power}) AS mde_in_${d}_days`).join(",\n    ")},
+    ${tc.relative_lifts.map(l => `${daysFor(l)} AS days_for_${Math.round(l * 100)}pct_lift`).join(",\n    ")},
+    -- fixed references for the verdict, whatever relative_lifts says
+    ${daysFor(0.1)} AS days_for_verdict_10,
+    ${daysFor(0.2)} AS days_for_verdict_20,
+    revenue / ${tc.window_days} * 365 * 0.01 AS annual_value_of_1pct_lift
+  FROM populations
+  WHERE ${daily} >= ${tc.min_daily_sessions}
+)
+
+SELECT
+  * EXCEPT (days_for_verdict_10, days_for_verdict_20),
+  CASE
+    WHEN baseline_rate IS NULL OR successes = 0 THEN 'no_conversions_to_measure'
+    WHEN days_for_verdict_10 <= 14 THEN 'test_small_changes_in_2_weeks'
+    WHEN days_for_verdict_10 <= 28 THEN 'test_small_changes_in_a_month'
+    WHEN days_for_verdict_20 <= 56 THEN 'only_bold_changes'
+    ELSE 'not_testable_use_other_methods'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM planned

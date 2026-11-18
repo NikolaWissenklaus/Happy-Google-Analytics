@@ -1,0 +1,33 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "sample_size_proportions",
+  description: "Units per group (users or sessions per variant) needed to detect a relative change of a conversion rate in a two sided test: sample_size_proportions(0.02, 0.10, 0.05, 0.8) = how many per variant to see 2.0% -> 2.2% with alpha 5% and power 80%",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "insights"]
+}
+
+-- n = (z(1 - alpha/2) sqrt(2 pbar (1 - pbar)) + z(power) sqrt(p1 (1 - p1) + p2 (1 - p2)))^2 / (p2 - p1)^2
+-- with p2 = p1 (1 + mde) and pbar = (p1 + p2) / 2 (Fleiss). The number the CRO team should check
+-- BEFORE starting a test, not after two weeks of "it is almost significant"
+CREATE OR REPLACE FUNCTION ${self()}(baseline_rate FLOAT64, relative_mde FLOAT64, alpha FLOAT64, power FLOAT64) RETURNS FLOAT64 AS ((
+  SELECT
+    IF(
+      p1 IS NULL OR relative_mde IS NULL OR p1 <= 0 OR p1 >= 1 OR p2 <= 0 OR p2 >= 1 OR p2 = p1,
+      NULL,
+      CEIL(POW(za * SQRT(2 * pbar * (1 - pbar)) + zb * SQRT(p1 * (1 - p1) + p2 * (1 - p2)), 2) / POW(p2 - p1, 2))
+    )
+  FROM (
+    SELECT
+      baseline_rate AS p1,
+      baseline_rate * (1 + relative_mde) AS p2,
+      LEAST(GREATEST(baseline_rate * (1 + relative_mde / 2), 0), 1) AS pbar,
+      ${ref("inverse_normal_cdf")}(1 - COALESCE(alpha, 0.05) / 2) AS za,
+      ${ref("inverse_normal_cdf")}(COALESCE(power, 0.8)) AS zb
+  )
+))
+OPTIONS (description = "Sample size per group for a two proportions test")

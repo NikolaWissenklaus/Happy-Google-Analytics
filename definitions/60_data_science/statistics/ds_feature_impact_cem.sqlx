@@ -1,0 +1,192 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_feature_impact_cem",
+  description: "'People who use the wishlist buy 3x more' is mostly 'people who were going to buy use the wishlist'. Coarsened exact matching (Iacus, King & Porro 2012) for every feature of cfg_project.features: users that used the feature in a 30 day window are compared only with users of the SAME stratum that did not (same first channel, first device, tenure, activity in the window, sessions and purchases before it), and the outcome is the purchase in the 30 days AFTER the window. Average effect on the treated (ATT) for purchase rate and revenue per user, with a 95% interval, next to the naive difference: what is left is much closer to the truth (it is still observational: only a holdout proves causality)",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics", level: "specialist" }
+  },
+  tags: ["data_science", "statistics", "weekly", "insights", "lifts"],
+  columns: {
+    naive_diff_purchase_rate: "Purchase rate of users of the feature - of the others, no adjustment (what the dashboard shows)",
+    att_purchase_rate: "Average effect on the treated after matching: purchase rate of the users minus the rate of similar non users, weighted by the users in each stratum",
+    att_relative: "att_purchase_rate / counterfactual purchase rate of the treated",
+    selection_bias_removed: "naive - att: how much of the naive difference was 'who uses it' and not 'what it does'",
+    matched_treated_share: "Share of the users of the feature that found similar non users (the rest is left out)",
+    verdict: "likely_helps | likely_hurts | no_clear_effect | too_few_users"
+  }
+}
+
+js {
+  const cm = cfg_insights.cem;
+  const features = cm.features || cfg_project.features;
+  const expStart = helpers.daysAgo(cm.outcome_days + cm.exposure_days);
+  const expEnd = helpers.daysAgo(cm.outcome_days);
+  const priorStart = helpers.daysAgo(cm.outcome_days + cm.exposure_days + cm.prior_days);
+}
+
+WITH
+feature_list AS (
+  ${helpers.seedSql([{ name: "feature", type: "STRING" }, { name: "event_name", type: "STRING" }], features.map(f => ({ feature: f.feature, event_name: f.event_name })))}
+),
+
+active AS (
+  SELECT user_key, COUNT(*) AS window_sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${expStart}
+    AND session_date < ${expEnd}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+usage AS (
+  SELECT user_key, event_name, COUNT(*) AS uses
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${expStart}
+    AND event_date < ${expEnd}
+    AND event_name IN (SELECT event_name FROM feature_list)
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2
+),
+
+prior AS (
+  SELECT user_key, COUNT(*) AS prior_sessions, SUM(transactions) AS prior_transactions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${priorStart}
+    AND session_date < ${expStart}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+outcome AS (
+  SELECT user_key, COUNT(*) AS orders, SUM(revenue) AS revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${expEnd}
+    AND transaction_date < ${helpers.today()}
+  GROUP BY 1
+),
+
+users AS (
+  SELECT
+    a.user_key,
+    -- the strata: coarse versions of everything that makes people use a feature AND buy
+    CONCAT(
+      COALESCE(d.first_channel, '(not set)'), '|',
+      COALESCE(d.first_device_category, '(not set)'), '|',
+      CASE
+        WHEN d.first_seen_date IS NULL OR DATE_DIFF(${expStart}, d.first_seen_date, DAY) < 0 THEN 'new_in_window'
+        WHEN DATE_DIFF(${expStart}, d.first_seen_date, DAY) < 30 THEN 'tenure_lt_30d'
+        WHEN DATE_DIFF(${expStart}, d.first_seen_date, DAY) < 180 THEN 'tenure_lt_180d'
+        ELSE 'tenure_180d_plus'
+      END, '|',
+      CASE WHEN a.window_sessions = 1 THEN 's1' WHEN a.window_sessions <= 3 THEN 's2_3' WHEN a.window_sessions <= 7 THEN 's4_7' ELSE 's8_plus' END, '|',
+      CASE WHEN COALESCE(p.prior_sessions, 0) = 0 THEN 'p0' WHEN p.prior_sessions <= 3 THEN 'p1_3' ELSE 'p4_plus' END, '|',
+      IF(COALESCE(p.prior_transactions, 0) > 0, 'prior_buyer', 'prior_non_buyer')
+    ) AS stratum,
+    IF(COALESCE(o.orders, 0) > 0, 1, 0) AS purchased,
+    COALESCE(o.revenue, 0) AS revenue
+  FROM active AS a
+  LEFT JOIN ${ref("dim_users")} AS d USING (user_key)
+  LEFT JOIN prior AS p USING (user_key)
+  LEFT JOIN outcome AS o USING (user_key)
+),
+
+treatment AS (
+  SELECT
+    f.feature,
+    u.user_key,
+    u.stratum,
+    u.purchased,
+    u.revenue,
+    IF(us.user_key IS NOT NULL, 1, 0) AS treated
+  FROM users AS u
+  CROSS JOIN feature_list AS f
+  LEFT JOIN usage AS us ON us.user_key = u.user_key AND us.event_name = f.event_name
+),
+
+naive AS (
+  SELECT
+    feature,
+    COUNTIF(treated = 1) AS treated_users,
+    COUNTIF(treated = 0) AS control_users,
+    AVG(IF(treated = 1, purchased, NULL)) AS treated_purchase_rate_all,
+    AVG(IF(treated = 0, purchased, NULL)) AS control_purchase_rate_all,
+    AVG(IF(treated = 1, purchased, NULL)) - AVG(IF(treated = 0, purchased, NULL)) AS naive_diff_purchase_rate,
+    AVG(IF(treated = 1, revenue, NULL)) - AVG(IF(treated = 0, revenue, NULL)) AS naive_diff_revenue_per_user
+  FROM treatment
+  GROUP BY 1
+),
+
+strata AS (
+  SELECT
+    feature,
+    stratum,
+    COUNTIF(treated = 1) AS n_t,
+    COUNTIF(treated = 0) AS n_c,
+    AVG(IF(treated = 1, purchased, NULL)) AS p_t,
+    AVG(IF(treated = 0, purchased, NULL)) AS p_c,
+    AVG(IF(treated = 1, revenue, NULL)) AS r_t,
+    AVG(IF(treated = 0, revenue, NULL)) AS r_c,
+    COALESCE(VAR_SAMP(IF(treated = 1, revenue, NULL)), 0) AS v_t,
+    COALESCE(VAR_SAMP(IF(treated = 0, revenue, NULL)), 0) AS v_c
+  FROM treatment
+  GROUP BY 1, 2
+),
+
+-- ATT: every stratum with users AND non users, weighted by its users
+att AS (
+  SELECT
+    feature,
+    COUNT(*) AS matched_strata,
+    SUM(n_t) AS matched_treated,
+    SUM(n_c) AS matched_controls,
+    SUM(n_t * p_t) / SUM(n_t) AS treated_purchase_rate,
+    SUM(n_t * p_c) / SUM(n_t) AS counterfactual_purchase_rate,
+    SUM(n_t * (p_t - p_c)) / SUM(n_t) AS att_purchase_rate,
+    SUM(n_t * (r_t - r_c)) / SUM(n_t) AS att_revenue_per_user,
+    SQRT(SUM(n_t * p_t * (1 - p_t) + POW(n_t, 2) * p_c * (1 - p_c) / n_c)) / SUM(n_t) AS se_purchase_rate,
+    SQRT(SUM(n_t * v_t + POW(n_t, 2) * v_c / n_c)) / SUM(n_t) AS se_revenue_per_user
+  FROM strata
+  WHERE n_t > 0 AND n_c > 0
+  GROUP BY 1
+)
+
+SELECT
+  n.feature,
+  f.event_name,
+  n.treated_users,
+  n.control_users,
+  n.treated_purchase_rate_all,
+  n.control_purchase_rate_all,
+  n.naive_diff_purchase_rate,
+  n.naive_diff_revenue_per_user,
+  a.matched_strata,
+  a.matched_treated,
+  a.matched_controls,
+  SAFE_DIVIDE(a.matched_treated, n.treated_users) AS matched_treated_share,
+  a.treated_purchase_rate,
+  a.counterfactual_purchase_rate,
+  a.att_purchase_rate,
+  a.att_purchase_rate - 1.96 * a.se_purchase_rate AS att_purchase_rate_low,
+  a.att_purchase_rate + 1.96 * a.se_purchase_rate AS att_purchase_rate_high,
+  SAFE_DIVIDE(a.att_purchase_rate, a.counterfactual_purchase_rate) AS att_relative,
+  a.att_revenue_per_user,
+  a.att_revenue_per_user - 1.96 * a.se_revenue_per_user AS att_revenue_low,
+  a.att_revenue_per_user + 1.96 * a.se_revenue_per_user AS att_revenue_high,
+  n.naive_diff_purchase_rate - a.att_purchase_rate AS selection_bias_removed,
+  CASE
+    WHEN COALESCE(a.matched_treated, 0) < ${cm.min_treated} THEN 'too_few_users'
+    WHEN a.att_purchase_rate - 1.96 * a.se_purchase_rate > 0 THEN 'likely_helps'
+    WHEN a.att_purchase_rate + 1.96 * a.se_purchase_rate < 0 THEN 'likely_hurts'
+    ELSE 'no_clear_effect'
+  END AS verdict,
+  ${expStart} AS exposure_window_start,
+  DATE_SUB(${expEnd}, INTERVAL 1 DAY) AS exposure_window_end,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM naive AS n
+JOIN feature_list AS f USING (feature)
+LEFT JOIN att AS a USING (feature)

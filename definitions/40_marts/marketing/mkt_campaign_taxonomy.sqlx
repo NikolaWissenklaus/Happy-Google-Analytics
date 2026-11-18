@@ -1,0 +1,192 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_campaign_taxonomy",
+  description: "The naming convention of the campaigns as code: every utm_campaign of the last 90 days is split by the delimiter of cfg_insights.campaign_taxonomy into its fields (objective, funnel stage, audience, offer, geo, launch...), each field checked against its allowed values, and the campaign marked compliant or not with the list of problems. Then the performance BY FIELD over the compliant campaigns: 'remarketing converts 4x prospecting', 'the frete-gratis offer has the best ROAS' without a spreadsheet. row_type = campaign (one per campaign) | field_value (one per field x value) | summary (compliance of the window)",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing", level: "mid" }
+  },
+  tags: ["marts", "marketing", "daily", "insights", "media_quality"],
+  columns: {
+    row_type: "campaign | field_value | summary",
+    campaign: "utm_campaign as the session itself received it (no carry over), lower case",
+    field_name: "For field_value rows: the field of the convention",
+    field_value: "For field_value rows: the value of the field",
+    is_compliant: "Every required field present and valid, every optional field valid when present, no extra parts",
+    problems: "Fields that failed (missing_<field> / invalid_<field> / too_many_parts)",
+    compliant_session_share: "summary row: share of the campaign sessions in compliant campaigns"
+  }
+}
+
+js {
+  const tx = cfg_insights.campaign_taxonomy;
+  const fields = tx.fields;
+  const fieldCols = fields.map((f, i) => `NULLIF(parts[SAFE_OFFSET(${i})], '') AS field_${f.name}`);
+  const validCols = fields.map(f => `COALESCE(REGEXP_CONTAINS(field_${f.name}, r'${f.allowed}'), ${f.required ? "FALSE" : "TRUE"}) AS field_${f.name}_is_valid`);
+  const problems = fields.map(f => `IF(field_${f.name} IS NULL AND ${f.required ? "TRUE" : "FALSE"}, ['missing_${f.name}'], IF(field_${f.name} IS NOT NULL AND NOT COALESCE(REGEXP_CONTAINS(field_${f.name}, r'${f.allowed}'), FALSE), ['invalid_${f.name}'], CAST([] AS ARRAY<STRING>)))`);
+  const nullFields = fields.map(f => `CAST(NULL AS STRING) AS field_${f.name}`).join(",\n    ");
+}
+
+WITH
+sessions AS (
+  SELECT
+    LOWER(TRIM(session_campaign_only)) AS campaign,
+    CONCAT(COALESCE(session_source_only, '(none)'), ' / ', COALESCE(session_medium_only, '(none)')) AS source_medium,
+    is_engaged,
+    transactions,
+    revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(tx.window_days)}
+    AND session_date < ${helpers.today()}
+    AND session_campaign_only IS NOT NULL
+    AND LOWER(TRIM(session_campaign_only)) NOT IN ('', '(not set)', '(organic)', '(referral)', '(direct)', '(none)')
+    ${helpers.martSessionFilter()}
+),
+
+campaigns AS (
+  SELECT
+    campaign,
+    ARRAY_AGG(DISTINCT source_medium IGNORE NULLS ORDER BY source_medium LIMIT 5) AS source_mediums,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue
+  FROM sessions
+  GROUP BY 1
+  HAVING COUNT(*) >= ${tx.min_sessions}
+),
+
+costs AS (
+  SELECT LOWER(campaign) AS campaign, SUM(cost) AS cost
+  FROM ${ref("mkt_paid_media_performance")}
+  WHERE metric_date >= ${helpers.daysAgo(tx.window_days)}
+    AND metric_date < ${helpers.today()}
+  GROUP BY 1
+),
+
+parsed AS (
+  SELECT
+    c.*,
+    COALESCE(co.cost, 0) AS cost,
+    SPLIT(c.campaign, ${helpers.sqlString(tx.delimiter)}) AS parts
+  FROM campaigns AS c
+  LEFT JOIN costs AS co USING (campaign)
+),
+
+fields AS (
+  SELECT
+    *,
+    ARRAY_LENGTH(parts) AS part_count,
+    ${fieldCols.join(",\n    ")}
+  FROM parsed
+),
+
+validated AS (
+  SELECT
+    *,
+    ${validCols.join(",\n    ")},
+    ARRAY_CONCAT(
+      ${problems.join(",\n      ")},
+      IF(part_count > ${fields.length}, ['too_many_parts'], CAST([] AS ARRAY<STRING>))
+    ) AS problems
+  FROM fields
+),
+
+campaign_rows AS (
+  SELECT
+    *,
+    ARRAY_LENGTH(problems) = 0 AS is_compliant
+  FROM validated
+),
+
+field_values AS (
+  SELECT
+    f.field_name,
+    f.field_value,
+    COUNT(*) AS campaigns,
+    SUM(c.sessions) AS sessions,
+    SUM(c.engaged_sessions) AS engaged_sessions,
+    SUM(c.transactions) AS transactions,
+    SUM(c.revenue) AS revenue,
+    SUM(c.cost) AS cost
+  FROM campaign_rows AS c
+  CROSS JOIN UNNEST([
+    ${fields.map(f => `STRUCT('${f.name}' AS field_name, c.field_${f.name} AS field_value)`).join(",\n    ")}
+  ]) AS f
+  WHERE c.is_compliant
+    AND f.field_value IS NOT NULL
+  GROUP BY 1, 2
+)
+
+SELECT
+  'campaign' AS row_type,
+  campaign,
+  CAST(NULL AS STRING) AS field_name,
+  CAST(NULL AS STRING) AS field_value,
+  1 AS campaigns,
+  sessions,
+  engaged_sessions,
+  transactions,
+  revenue,
+  cost,
+  SAFE_DIVIDE(revenue, NULLIF(cost, 0)) AS roas,
+  SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+  SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+  is_compliant,
+  problems,
+  source_mediums,
+  CAST(NULL AS FLOAT64) AS compliant_session_share,
+  ${fields.map(f => `field_${f.name}`).join(",\n  ")},
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM campaign_rows
+
+UNION ALL
+
+SELECT
+  'field_value',
+  CAST(NULL AS STRING),
+  field_name,
+  field_value,
+  campaigns,
+  sessions,
+  engaged_sessions,
+  transactions,
+  revenue,
+  cost,
+  SAFE_DIVIDE(revenue, NULLIF(cost, 0)),
+  SAFE_DIVIDE(transactions, sessions),
+  SAFE_DIVIDE(engaged_sessions, sessions),
+  TRUE,
+  CAST([] AS ARRAY<STRING>),
+  CAST([] AS ARRAY<STRING>),
+  CAST(NULL AS FLOAT64),
+  ${nullFields},
+  CURRENT_TIMESTAMP()
+FROM field_values
+
+UNION ALL
+
+SELECT
+  'summary',
+  CAST(NULL AS STRING),
+  CAST(NULL AS STRING),
+  CAST(NULL AS STRING),
+  COUNT(*),
+  SUM(sessions),
+  SUM(engaged_sessions),
+  SUM(transactions),
+  SUM(revenue),
+  SUM(cost),
+  SAFE_DIVIDE(SUM(revenue), NULLIF(SUM(cost), 0)),
+  SAFE_DIVIDE(SUM(transactions), SUM(sessions)),
+  SAFE_DIVIDE(SUM(engaged_sessions), SUM(sessions)),
+  NULL,
+  CAST([] AS ARRAY<STRING>),
+  CAST([] AS ARRAY<STRING>),
+  SAFE_DIVIDE(SUM(IF(is_compliant, sessions, 0)), SUM(sessions)),
+  ${nullFields},
+  CURRENT_TIMESTAMP()
+FROM campaign_rows

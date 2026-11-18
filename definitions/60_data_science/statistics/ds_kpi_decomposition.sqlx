@@ -1,0 +1,129 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_kpi_decomposition",
+  description: "Every daily KPI split in the three things that move it: the trend (centered 7 day moving average), the weekday effect (multiplicative index, 1.15 = this weekday sells 15% above the trend) and what is left (the residual, with a robust z score). Plus the seasonally adjusted value, the only fair way to compare a monday with a saturday, and the slope of the trend in the last 28 days. Classical decomposition, the first thing a statistician does with a series: simple, explainable, no model to train",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["kpi"],
+    labels: { layer: "data_science", domain: "statistics", level: "junior" }
+  },
+  tags: ["data_science", "statistics", "daily", "insights"],
+  columns: {
+    trend: "Centered 7 day moving average (NULL for the 3 first and last days: the window is not complete)",
+    weekday_index: "Average of value / trend for the weekday, normalized so the 7 indexes average 1",
+    seasonally_adjusted: "value / weekday_index",
+    residual: "value / (trend x weekday_index). 1.0 = exactly what trend and weekday explain",
+    residual_robust_z: "(residual - median) / (1.4826 MAD) of the KPI",
+    is_unusual_day: "|residual_robust_z| above decomposition.unusual_residual_z",
+    trend_slope_28d_relative: "OLS slope of the trend in the last 28 days with a trend, per day, relative to its mean (0.002 = +0.2% a day)"
+  }
+}
+
+js {
+  const dc = cfg_insights.decomposition;
+}
+
+WITH
+daily AS (
+  SELECT
+    w.metric_date,
+    MOD(EXTRACT(DAYOFWEEK FROM w.metric_date) + 5, 7) + 1 AS iso_weekday,
+    k.kpi,
+    k.value
+  FROM ${ref("ds_daily_metrics_wide")} AS w
+  CROSS JOIN UNNEST([
+    ${dc.kpis.map(k => `STRUCT('${k}' AS kpi, CAST(${k} AS FLOAT64) AS value)`).join(",\n    ")}
+  ]) AS k
+),
+
+with_trend AS (
+  SELECT
+    *,
+    AVG(value) OVER (PARTITION BY kpi ORDER BY metric_date ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS moving_average,
+    COUNT(value) OVER (PARTITION BY kpi ORDER BY metric_date ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS window_points
+  FROM daily
+),
+
+ratios AS (
+  SELECT
+    *,
+    IF(window_points = 7, moving_average, NULL) AS trend,
+    SAFE_DIVIDE(value, IF(window_points = 7, moving_average, NULL)) AS ratio_to_trend
+  FROM with_trend
+),
+
+weekday_raw AS (
+  SELECT kpi, iso_weekday, AVG(ratio_to_trend) AS raw_index
+  FROM ratios
+  WHERE ratio_to_trend IS NOT NULL
+  GROUP BY 1, 2
+),
+
+weekday_index AS (
+  SELECT kpi, iso_weekday, SAFE_DIVIDE(raw_index, AVG(raw_index) OVER (PARTITION BY kpi)) AS weekday_index
+  FROM weekday_raw
+),
+
+decomposed AS (
+  SELECT
+    r.metric_date,
+    r.iso_weekday,
+    r.kpi,
+    r.value,
+    r.trend,
+    w.weekday_index,
+    SAFE_DIVIDE(r.value, w.weekday_index) AS seasonally_adjusted,
+    SAFE_DIVIDE(r.value, r.trend * w.weekday_index) AS residual
+  FROM ratios AS r
+  LEFT JOIN weekday_index AS w USING (kpi, iso_weekday)
+),
+
+residual_scale AS (
+  SELECT kpi, APPROX_QUANTILES(residual, 2 IGNORE NULLS)[OFFSET(1)] AS median_residual
+  FROM decomposed
+  GROUP BY 1
+),
+
+residual_mad AS (
+  SELECT d.kpi, ANY_VALUE(s.median_residual) AS median_residual, APPROX_QUANTILES(ABS(d.residual - s.median_residual), 2 IGNORE NULLS)[OFFSET(1)] AS mad
+  FROM decomposed AS d
+  JOIN residual_scale AS s USING (kpi)
+  GROUP BY 1
+),
+
+trend_slope AS (
+  SELECT
+    kpi,
+    SAFE_DIVIDE(COVAR_SAMP(UNIX_DATE(metric_date), trend), VAR_SAMP(UNIX_DATE(metric_date))) AS slope_per_day,
+    AVG(trend) AS mean_trend
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY kpi ORDER BY metric_date DESC) AS recency
+    FROM decomposed
+    WHERE trend IS NOT NULL
+  )
+  WHERE recency <= 28
+  GROUP BY 1
+)
+
+SELECT
+  d.metric_date,
+  d.iso_weekday,
+  d.kpi,
+  d.value,
+  d.trend,
+  d.weekday_index,
+  d.seasonally_adjusted,
+  d.residual,
+  SAFE_DIVIDE(d.residual - m.median_residual, 1.4826 * m.mad) AS residual_robust_z,
+  COALESCE(ABS(SAFE_DIVIDE(d.residual - m.median_residual, 1.4826 * m.mad)) > ${dc.unusual_residual_z}, FALSE) AS is_unusual_day,
+  AVG(d.seasonally_adjusted) OVER (PARTITION BY d.kpi ORDER BY d.metric_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS seasonally_adjusted_7d,
+  t.slope_per_day AS trend_slope_28d,
+  SAFE_DIVIDE(t.slope_per_day, t.mean_trend) AS trend_slope_28d_relative,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM decomposed AS d
+LEFT JOIN residual_mad AS m USING (kpi)
+LEFT JOIN trend_slope AS t USING (kpi)

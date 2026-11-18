@@ -1,0 +1,47 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "token_overlap",
+  description: "How much two texts talk about the same thing: words of 3+ letters (lower case, no accents, final plural 's' removed), Jaccard similarity and the coverage of the first text (share of its words found in the second). token_overlap('tênis de corrida', '/tenis-corrida-masculino').coverage_a = 1",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "urls_text", "insights"]
+}
+
+-- Made for "message match": the keyword (text_a) against the landing page title / path (text_b).
+-- coverage_a is the one to read for that (did the page say what the person searched?), jaccard is
+-- symmetric and good to compare two titles. Plurals: 'camisetas' and 'camiseta' become the same
+-- token (only a final 's' after 3+ letters, cheap and good enough in portuguese and english)
+CREATE OR REPLACE FUNCTION ${self()}(text_a STRING, text_b STRING)
+RETURNS STRUCT<jaccard FLOAT64, coverage_a FLOAT64, shared_tokens INT64, tokens_a INT64, tokens_b INT64> AS ((
+  SELECT
+    STRUCT(
+      SAFE_DIVIDE(shared, union_size) AS jaccard,
+      SAFE_DIVIDE(shared, na) AS coverage_a,
+      shared AS shared_tokens,
+      na AS tokens_a,
+      nb AS tokens_b
+    )
+  FROM (
+    SELECT
+      (SELECT COUNT(*) FROM UNNEST(ta) AS t WHERE t IN UNNEST(tb)) AS shared,
+      ARRAY_LENGTH(ta) AS na,
+      ARRAY_LENGTH(tb) AS nb,
+      (SELECT COUNT(DISTINCT t) FROM UNNEST(ARRAY_CONCAT(ta, tb)) AS t) AS union_size
+    FROM (
+      SELECT
+        ARRAY(
+          SELECT DISTINCT REGEXP_REPLACE(t, r'^([a-z0-9]{3,})s$', r'\1')
+          FROM UNNEST(REGEXP_EXTRACT_ALL(REGEXP_REPLACE(NORMALIZE(LOWER(COALESCE(text_a, '')), NFD), r'\p{M}', ''), r'[a-z0-9]{3,}')) AS t
+        ) AS ta,
+        ARRAY(
+          SELECT DISTINCT REGEXP_REPLACE(t, r'^([a-z0-9]{3,})s$', r'\1')
+          FROM UNNEST(REGEXP_EXTRACT_ALL(REGEXP_REPLACE(NORMALIZE(LOWER(COALESCE(text_b, '')), NFD), r'\p{M}', ''), r'[a-z0-9]{3,}')) AS t
+        ) AS tb
+    )
+  )
+))
+OPTIONS (description = "Token overlap (Jaccard and coverage) of two texts")

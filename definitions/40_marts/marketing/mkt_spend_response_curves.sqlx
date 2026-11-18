@@ -1,0 +1,124 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_spend_response_curves",
+  description: "The average ROAS says how the money spent so far did. The decision is about the NEXT real: the marginal ROAS. Per platform and campaign, a diminishing returns curve revenue = a + b ln(1 + spend) fitted on the days of the last 180 (mkt_paid_media_performance, GA4 revenue), with the marginal ROAS at the current spend, the spend where the marginal ROAS hits the target (break even on gross margin by default), the headroom, what the next R$ 1000 a day would bring and a recommendation (scale / hold / cut). Needs spend that varied: a campaign at the same budget every day has no curve to learn",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing", level: "senior" }
+  },
+  tags: ["marts", "marketing", "daily", "insights", "costs"],
+  columns: {
+    campaign: "Campaign, or '(all campaigns)' for the platform as a whole",
+    b_revenue: "Slope of revenue on ln(1 + daily spend): revenue of one more unit of ln(spend)",
+    marginal_roas_at_current_spend: "b / (1 + average daily spend): revenue of the next real at the current level",
+    average_roas: "Revenue / cost of the window (the number everybody looks at)",
+    target_marginal_roas: "response_curves.target_marginal_roas, or 1 / assumed_gross_margin",
+    spend_at_target_marginal_roas: "Daily spend where the marginal ROAS falls to the target: b / target - 1",
+    headroom_daily_spend: "spend_at_target_marginal_roas - current average daily spend (negative = above the efficient level)",
+    revenue_of_next_increment: "Daily revenue of response_curves.test_increment_per_day more a day, according to the curve",
+    is_reliable: "Enough days, enough variation of the spend, positive slope with t >= 2",
+    recommendation: "scale | hold | cut | not_enough_signal"
+  }
+}
+
+js {
+  const rc = cfg_insights.response_curves;
+  const target = rc.target_marginal_roas || (1 / cfg_project.assumed_gross_margin);
+}
+
+WITH
+daily AS (
+  SELECT metric_date, platform, campaign, cost, revenue, transactions
+  FROM ${ref("mkt_paid_media_performance")}
+  WHERE metric_date >= ${helpers.daysAgo(rc.window_days)}
+    AND metric_date < ${helpers.today()}
+    AND cost > 0
+),
+
+levels AS (
+  SELECT metric_date, platform, campaign, cost, revenue, transactions
+  FROM daily
+  UNION ALL
+  SELECT metric_date, platform, '(all campaigns)', SUM(cost), SUM(revenue), SUM(transactions)
+  FROM daily
+  GROUP BY 1, 2
+),
+
+fits AS (
+  SELECT
+    platform,
+    campaign,
+    COUNT(*) AS days_with_spend,
+    AVG(cost) AS avg_daily_spend,
+    SAFE_DIVIDE(STDDEV_SAMP(cost), AVG(cost)) AS spend_cv,
+    SUM(cost) AS cost,
+    SUM(revenue) AS revenue,
+    SUM(transactions) AS transactions,
+    AVG(LN(1 + cost)) AS mean_x,
+    AVG(revenue) AS mean_revenue,
+    VAR_SAMP(LN(1 + cost)) AS var_x,
+    VAR_SAMP(revenue) AS var_revenue,
+    SAFE_DIVIDE(COVAR_SAMP(LN(1 + cost), revenue), VAR_SAMP(LN(1 + cost))) AS b_revenue,
+    POW(CORR(LN(1 + cost), revenue), 2) AS r2_revenue,
+    SAFE_DIVIDE(COVAR_SAMP(LN(1 + cost), transactions), VAR_SAMP(LN(1 + cost))) AS b_transactions
+  FROM levels
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${rc.min_days}
+),
+
+scored AS (
+  SELECT
+    *,
+    mean_revenue - b_revenue * mean_x AS a_revenue,
+    -- standard error of an OLS slope: sqrt((1 - R2) var(y) / ((n - 2) var(x)))
+    SAFE_DIVIDE(b_revenue, SQRT(SAFE_DIVIDE(GREATEST(1 - r2_revenue, 0) * var_revenue, (days_with_spend - 2) * var_x))) AS t_revenue,
+    SAFE_DIVIDE(b_revenue, 1 + avg_daily_spend) AS marginal_roas_at_current_spend,
+    SAFE_DIVIDE(revenue, cost) AS average_roas,
+    ${target} AS target_marginal_roas,
+    IF(b_revenue > 0, GREATEST(b_revenue / ${target} - 1, 0), NULL) AS spend_at_target_marginal_roas,
+    b_revenue * (LN(1 + avg_daily_spend + ${rc.test_increment_per_day}) - LN(1 + avg_daily_spend)) AS revenue_of_next_increment,
+    SAFE_DIVIDE(b_transactions, 1 + avg_daily_spend) AS marginal_transactions_per_real
+  FROM fits
+),
+
+checked AS (
+  SELECT
+    *,
+    COALESCE(spend_cv >= ${rc.min_spend_cv} AND b_revenue > 0 AND t_revenue >= 2, FALSE) AS is_reliable
+  FROM scored
+)
+
+SELECT
+  platform,
+  campaign,
+  days_with_spend,
+  avg_daily_spend,
+  spend_cv,
+  cost,
+  revenue,
+  transactions,
+  average_roas,
+  a_revenue,
+  b_revenue,
+  r2_revenue,
+  t_revenue,
+  marginal_roas_at_current_spend,
+  marginal_transactions_per_real,
+  SAFE_DIVIDE(1, marginal_transactions_per_real) AS marginal_cost_per_transaction,
+  target_marginal_roas,
+  spend_at_target_marginal_roas,
+  spend_at_target_marginal_roas - avg_daily_spend AS headroom_daily_spend,
+  ${rc.test_increment_per_day} AS test_increment_per_day,
+  revenue_of_next_increment,
+  is_reliable,
+  CASE
+    WHEN NOT is_reliable THEN 'not_enough_signal'
+    WHEN marginal_roas_at_current_spend >= 1.2 * target_marginal_roas THEN 'scale'
+    WHEN marginal_roas_at_current_spend < 0.8 * target_marginal_roas THEN 'cut'
+    ELSE 'hold'
+  END AS recommendation,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM checked

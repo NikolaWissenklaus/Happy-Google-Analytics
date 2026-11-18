@@ -1,0 +1,78 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_kpi_forecast_holt_winters",
+  description: "Forecast of the next 28 days for sessions, transactions, revenue and new users that works WITHOUT BQML: additive Holt-Winters with damped trend and weekly season fitted inside BigQuery (ga4_udf.holt_winters_forecast), with 80% / 95% prediction intervals and an honest backtest (the last 28 days are forecast from the past and compared with what happened: holdout_mape). Same shape of ds_kpi_forecast (row_type actual / forecast), so the same chart works for both. Actual rows say if the day fell outside the 95% band of the one step ahead forecast",
+  bigquery: {
+    clusterBy: ["kpi", "row_type"],
+    labels: { layer: "data_science", domain: "forecasting", level: "mid" }
+  },
+  tags: ["data_science", "forecasting", "daily", "insights"],
+  columns: {
+    row_type: "actual (history, with the one step ahead fit) | forecast",
+    forecast_value: "Forecast for forecast rows, one step ahead fit for actual rows (never below 0)",
+    holdout_mape: "Mean absolute percentage error of the backtest (last holt_winters.holdout_days forecast from the days before). The number to show next to the forecast",
+    holdout_bias: "Sum of (forecast - actual) / sum of actual in the backtest. Positive = the model is optimistic",
+    is_outside_95: "Actual rows: the day was outside the 95% band of the one step ahead forecast"
+  }
+}
+
+js {
+  const hwc = cfg_insights.holt_winters;
+}
+
+WITH
+daily AS (
+  SELECT w.metric_date, k.kpi, k.value
+  FROM ${ref("ds_daily_metrics_wide")} AS w
+  CROSS JOIN UNNEST([
+    ${hwc.kpis.map(k => `STRUCT('${k}' AS kpi, CAST(${k} AS FLOAT64) AS value)`).join(",\n    ")}
+  ]) AS k
+  WHERE w.metric_date >= DATE_SUB(${helpers.today()}, INTERVAL ${hwc.history_days} DAY)
+    AND w.metric_date < ${helpers.today()}
+),
+
+series AS (
+  SELECT
+    kpi,
+    ARRAY_AGG(COALESCE(value, 0) ORDER BY metric_date) AS ys,
+    ARRAY_AGG(metric_date ORDER BY metric_date) AS dates,
+    MAX(metric_date) AS last_date
+  FROM daily
+  GROUP BY 1
+),
+
+fitted AS (
+  SELECT kpi, dates, last_date, ${ref("holt_winters_forecast")}(ys, 7, ${hwc.horizon_days}, ${hwc.holdout_days}) AS hw
+  FROM series
+)
+
+SELECT
+  f.kpi,
+  IF(p.is_forecast, 'forecast', 'actual') AS row_type,
+  IF(
+    p.is_forecast,
+    DATE_ADD(f.last_date, INTERVAL CAST(p.step AS INT64) - ARRAY_LENGTH(f.dates) + 1 DAY),
+    f.dates[OFFSET(CAST(p.step AS INT64))]
+  ) AS metric_date,
+  p.actual,
+  GREATEST(p.fitted, 0) AS forecast_value,
+  GREATEST(p.low_80, 0) AS low_80,
+  GREATEST(p.high_80, 0) AS high_80,
+  GREATEST(p.low_95, 0) AS low_95,
+  GREATEST(p.high_95, 0) AS high_95,
+  IF(p.is_forecast, NULL, ABS(p.actual - p.fitted) > 1.96 * f.hw.residual_sd) AS is_outside_95,
+  f.hw.alpha,
+  f.hw.beta,
+  f.hw.gamma,
+  f.hw.phi,
+  f.hw.residual_sd,
+  f.hw.holdout_mape,
+  f.hw.holdout_bias,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fitted AS f
+CROSS JOIN UNNEST(f.hw.points) AS p
+WHERE f.hw IS NOT NULL

@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cohorts,
+  name: "coh_user_funnel_by_cohort",
+  description: "The funnel of PEOPLE, not of sessions: new users grouped by the week they arrived (and by first channel / first device), and the share of them that reached each step (product view, cart, checkout, purchase) on the same day, in 1, 7, 14 and 30 days, in any session and on any device of the stitched user. A session funnel says 'the checkout converts 40%', this one says 'of the people Paid Social brings, 3% buy in 30 days, and they take 9 days'. Horizons a cohort did not live yet are NULL (no fake drop in the last weeks)",
+  bigquery: {
+    partitionBy: "cohort_week",
+    clusterBy: ["segment_type", "step"],
+    labels: { layer: "marts", domain: "cohorts", level: "mid" }
+  },
+  tags: ["marts", "cohorts", "daily", "insights"],
+  columns: {
+    cohort_week: "Monday of the week of the first visit of the user (dim_users.first_seen_date)",
+    segment_type: "all | first_channel | first_device",
+    cohort_users: "New users of the cohort with a non bot session on the first day",
+    reached_d0: "Share of the cohort that reached the step on the first day. Other reached_dN columns: within N days. NULL = the cohort is younger than that",
+    median_days_to_step: "Median days from the first visit to the step, among the ones that reached it so far"
+  }
+}
+
+js {
+  const uf = cfg_insights.user_funnel;
+}
+
+WITH
+cohort_users AS (
+  SELECT
+    user_key,
+    first_seen_date,
+    DATE_TRUNC(first_seen_date, WEEK(MONDAY)) AS cohort_week,
+    COALESCE(first_channel, '(not set)') AS first_channel,
+    COALESCE(first_device_category, '(not set)') AS first_device
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(DATE_TRUNC(${helpers.today()}, WEEK(MONDAY)), INTERVAL ${uf.cohort_weeks * 7} DAY)
+    AND first_seen_date < DATE_TRUNC(${helpers.today()}, WEEK(MONDAY))
+),
+
+sessions AS (
+  SELECT
+    s.user_key,
+    s.session_date,
+    ${uf.steps.map(st => `COALESCE(s.${st.flag}, FALSE) AS did_${st.step}`).join(",\n    ")}
+  FROM ${ref("fct_sessions")} AS s
+  WHERE s.session_date >= DATE_SUB(DATE_TRUNC(${helpers.today()}, WEEK(MONDAY)), INTERVAL ${uf.cohort_weeks * 7} DAY)
+    AND s.session_date < ${helpers.today()}
+    ${helpers.martSessionFilter("s")}
+),
+
+-- dim_users keeps everybody, bots included: the cohort needs a real session on the first day
+real_people AS (
+  SELECT DISTINCT c.user_key
+  FROM cohort_users AS c
+  JOIN sessions AS s ON s.user_key = c.user_key AND s.session_date = c.first_seen_date
+),
+
+first_time_per_step AS (
+  SELECT
+    c.user_key,
+    c.cohort_week,
+    c.first_channel,
+    c.first_device,
+    ${uf.steps.map(st => `MIN(IF(s.did_${st.step}, DATE_DIFF(s.session_date, c.first_seen_date, DAY), NULL)) AS days_to_${st.step}`).join(",\n    ")}
+  FROM cohort_users AS c
+  JOIN real_people USING (user_key)
+  LEFT JOIN sessions AS s ON s.user_key = c.user_key AND s.session_date >= c.first_seen_date
+  GROUP BY 1, 2, 3, 4
+),
+
+segmented AS (
+  SELECT f.*, seg.segment_type, seg.segment_value
+  FROM first_time_per_step AS f
+  CROSS JOIN UNNEST([
+    STRUCT('all' AS segment_type, '(all)' AS segment_value),
+    STRUCT('first_channel', f.first_channel),
+    STRUCT('first_device', f.first_device)
+  ]) AS seg
+),
+
+steps_long AS (
+  SELECT s.cohort_week, s.segment_type, s.segment_value, st.step_number, st.step, st.days_to_step
+  FROM segmented AS s
+  CROSS JOIN UNNEST([
+    ${uf.steps.map((st, k) => `STRUCT(${k + 1} AS step_number, '${st.step}' AS step, s.days_to_${st.step} AS days_to_step)`).join(",\n    ")}
+  ]) AS st
+)
+
+SELECT
+  cohort_week,
+  segment_type,
+  segment_value,
+  step_number,
+  step,
+  COUNT(*) AS cohort_users,
+  -- the youngest user of the cohort arrived on sunday: a horizon is complete when sunday + N days is over
+  DATE_DIFF(${helpers.today()}, DATE_ADD(cohort_week, INTERVAL 6 DAY), DAY) - 1 AS complete_days_of_youngest,
+  ${uf.horizons_days.map(h => `IF(DATE_DIFF(${helpers.today()}, DATE_ADD(cohort_week, INTERVAL 6 DAY), DAY) > ${h}, SAFE_DIVIDE(COUNTIF(days_to_step <= ${h}), COUNT(*)), NULL) AS reached_d${h}`).join(",\n  ")},
+  COUNTIF(days_to_step IS NOT NULL) AS reached_so_far,
+  SAFE_DIVIDE(COUNTIF(days_to_step IS NOT NULL), COUNT(*)) AS reached_so_far_rate,
+  APPROX_QUANTILES(days_to_step, 2 IGNORE NULLS)[OFFSET(1)] AS median_days_to_step,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM steps_long
+GROUP BY 1, 2, 3, 4, 5

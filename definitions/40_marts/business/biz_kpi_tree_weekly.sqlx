@@ -1,0 +1,151 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_kpi_tree_weekly",
+  description: "The revenue tree, every week: revenue = users x sessions per user x conversion x items per order x price per item, and EXACTLY how much of the change vs last week and vs the same week last year came from each branch (LMDI decomposition, the effects add up to the change, no residual). biz_revenue_bridge splits traffic / conversion / ticket; this one goes deeper: 'revenue -8% YoY, of which -R$ 40k because people came less often and -R$ 12k because the price per item fell, while conversion helped +R$ 9k'. Property and per device",
+  bigquery: {
+    partitionBy: "week_start",
+    clusterBy: ["segment", "comparison"],
+    labels: { layer: "marts", domain: "business", level: "mid" }
+  },
+  tags: ["marts", "business", "daily", "insights"],
+  columns: {
+    comparison: "wow (vs the previous week) | yoy (vs the same ISO week 52 weeks before)",
+    segment: "'(all)' or the device category",
+    revenue_change: "revenue - base_revenue = sum of the five effects",
+    effect_users: "Change explained by the number of active users",
+    effect_frequency: "Change explained by sessions per user",
+    effect_conversion: "Change explained by transactions per session",
+    effect_items_per_order: "Change explained by items per order",
+    effect_price_per_item: "Change explained by revenue per item",
+    biggest_driver: "The effect with the largest absolute value"
+  }
+}
+
+js {
+  const kt = cfg_insights.kpi_tree;
+  const factors = ["users", "frequency", "conversion", "items_per_order", "price_per_item"];
+}
+
+WITH
+anchor AS (
+  SELECT DATE_SUB(DATE_TRUNC(${helpers.today()}, WEEK(MONDAY)), INTERVAL 7 DAY) AS last_week
+),
+
+sessions AS (
+  SELECT s.session_week AS week_start, segment, s.user_key
+  FROM ${ref("fct_sessions")} AS s
+  CROSS JOIN anchor AS a
+  CROSS JOIN UNNEST(['(all)', COALESCE(s.device_category, '(not set)')]) AS segment
+  WHERE s.session_date >= DATE_SUB(a.last_week, INTERVAL ${kt.weeks * 7 + 364} DAY)
+    AND s.session_date < DATE_ADD(a.last_week, INTERVAL 7 DAY)
+    ${helpers.martSessionFilter("s")}
+),
+
+orders AS (
+  SELECT DATE_TRUNC(t.transaction_date, WEEK(MONDAY)) AS week_start, segment, t.revenue, COALESCE(t.item_quantity, 0) AS items
+  FROM ${ref("fct_transactions")} AS t
+  CROSS JOIN anchor AS a
+  CROSS JOIN UNNEST(['(all)', COALESCE(t.device_category, '(not set)')]) AS segment
+  WHERE t.is_valid_for_revenue
+    AND t.transaction_date >= DATE_SUB(a.last_week, INTERVAL ${kt.weeks * 7 + 364} DAY)
+    AND t.transaction_date < DATE_ADD(a.last_week, INTERVAL 7 DAY)
+),
+
+traffic AS (
+  SELECT week_start, segment, COUNT(DISTINCT user_key) AS users, COUNT(*) AS sessions
+  FROM sessions
+  GROUP BY 1, 2
+),
+
+sales AS (
+  SELECT week_start, segment, COUNT(*) AS transactions, SUM(revenue) AS revenue, SUM(items) AS items
+  FROM orders
+  GROUP BY 1, 2
+),
+
+factors AS (
+  SELECT
+    t.week_start,
+    t.segment,
+    t.users,
+    t.sessions,
+    COALESCE(s.transactions, 0) AS transactions,
+    COALESCE(s.revenue, 0) AS revenue,
+    -- sites that do not send quantity: one item per order, so the price per item is the ticket
+    IF(COALESCE(s.items, 0) > 0, s.items, COALESCE(s.transactions, 0)) AS items,
+    t.users AS f_users,
+    SAFE_DIVIDE(t.sessions, t.users) AS f_frequency,
+    SAFE_DIVIDE(s.transactions, t.sessions) AS f_conversion,
+    SAFE_DIVIDE(IF(COALESCE(s.items, 0) > 0, s.items, s.transactions), s.transactions) AS f_items_per_order,
+    SAFE_DIVIDE(s.revenue, IF(COALESCE(s.items, 0) > 0, s.items, s.transactions)) AS f_price_per_item
+  FROM traffic AS t
+  LEFT JOIN sales AS s USING (week_start, segment)
+),
+
+pairs AS (
+  SELECT
+    cur.week_start,
+    cur.segment,
+    cmp.comparison,
+    base.week_start AS base_week_start,
+    cur.revenue,
+    base.revenue AS base_revenue,
+    cur.users, base.users AS base_users,
+    cur.sessions, base.sessions AS base_sessions,
+    cur.transactions, base.transactions AS base_transactions,
+    ${factors.map(f => `cur.f_${f}, base.f_${f} AS base_f_${f}`).join(",\n    ")}
+  FROM factors AS cur
+  CROSS JOIN anchor AS a
+  CROSS JOIN UNNEST([STRUCT('wow' AS comparison, 7 AS days_back), STRUCT('yoy', 364)]) AS cmp
+  JOIN factors AS base
+    ON base.segment = cur.segment
+    AND base.week_start = DATE_SUB(cur.week_start, INTERVAL cmp.days_back DAY)
+  WHERE cur.week_start >= DATE_SUB(a.last_week, INTERVAL ${(kt.weeks - 1) * 7} DAY)
+),
+
+-- LMDI: L = (R1 - R0) / (ln R1 - ln R0), effect of X = L ln(X1 / X0). The effects add up to R1 - R0
+lmdi AS (
+  SELECT
+    *,
+    COALESCE(
+      revenue > 0 AND base_revenue > 0
+      ${factors.map(f => `AND f_${f} > 0 AND base_f_${f} > 0`).join("\n      ")},
+      FALSE
+    ) AS is_decomposable,
+    IF(revenue = base_revenue, revenue, SAFE_DIVIDE(revenue - base_revenue, LN(revenue) - LN(base_revenue))) AS log_mean
+  FROM pairs
+  WHERE revenue > 0 AND base_revenue > 0
+),
+
+effects AS (
+  SELECT
+    *,
+    ${factors.map(f => `IF(is_decomposable, log_mean * LN(f_${f} / base_f_${f}), NULL) AS effect_${f}`).join(",\n    ")}
+  FROM lmdi
+)
+
+SELECT
+  week_start,
+  segment,
+  comparison,
+  base_week_start,
+  revenue,
+  base_revenue,
+  revenue - base_revenue AS revenue_change,
+  SAFE_DIVIDE(revenue - base_revenue, base_revenue) AS revenue_change_pct,
+  users, base_users,
+  sessions, base_sessions,
+  transactions, base_transactions,
+  ${factors.map(f => `f_${f} AS ${f}, base_f_${f} AS base_${f}`).join(",\n  ")},
+  ${factors.map(f => `effect_${f}`).join(",\n  ")},
+  is_decomposable,
+  CASE GREATEST(${factors.map(f => `ABS(COALESCE(effect_${f}, 0))`).join(", ")})
+    WHEN 0 THEN NULL
+    ${factors.map(f => `WHEN ABS(COALESCE(effect_${f}, 0)) THEN '${f}'`).join("\n    ")}
+  END AS biggest_driver,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM effects

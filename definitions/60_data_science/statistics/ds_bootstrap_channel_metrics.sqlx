@@ -1,0 +1,182 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_bootstrap_channel_metrics",
+  description: "Confidence intervals that do not assume a bell: revenue per session is 97% zeros and a few big orders, and the usual 'mean +- 1.96 sd / sqrt(n)' lies about it. Poisson bootstrap by hash buckets (the trick of the big experimentation platforms): sessions of the last 28 days go to buckets by hash, every bucket gets a Poisson(1) weight per replicate (ga4_udf.poisson_bootstrap_weight, deterministic), and the percentile interval comes from the replicates. For every channel: conversion rate, revenue per session, AOV and engagement rate, the 95% interval, the interval of the difference vs the whole site and the normal interval next to it, to see how much it lied",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics", level: "specialist" }
+  },
+  tags: ["data_science", "statistics", "weekly", "insights"],
+  columns: {
+    channel: "GA4 default channel group, '(all)' = the site",
+    estimate: "The metric on the full sample",
+    ci_low: "2.5% percentile of the bootstrap replicates",
+    ci_high: "97.5% percentile of the bootstrap replicates",
+    diff_vs_site_ci_low: "2.5% percentile of (channel - site) in the same replicates (the same buckets resampled for both)",
+    is_different_from_site: "The interval of the difference does not contain 0",
+    normal_ci_low: "estimate - 1.96 x normal standard error (NULL for AOV, a ratio of two sums)",
+    bootstrap_to_normal_width: "Width of the bootstrap interval / width of the normal one. Far from 1 = the normal one was not to be trusted"
+  }
+}
+
+js {
+  const bs = cfg_insights.bootstrap;
+}
+
+WITH
+sessions AS (
+  SELECT
+    COALESCE(session_default_channel_group, '(not set)') AS channel,
+    ABS(MOD(FARM_FINGERPRINT(session_key), ${bs.buckets})) AS bucket,
+    IF(has_purchase, 1, 0) AS purchased,
+    IF(is_engaged, 1, 0) AS engaged,
+    COALESCE(transactions, 0) AS transactions,
+    COALESCE(revenue, 0) AS revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(bs.window_days)}
+    AND session_date < ${helpers.today()}
+    AND session_key IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+buckets AS (
+  SELECT
+    segment AS channel,
+    bucket,
+    COUNT(*) AS sessions,
+    SUM(purchased) AS purchasers,
+    SUM(engaged) AS engaged,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    SUM(revenue * revenue) AS revenue_squared
+  FROM sessions
+  CROSS JOIN UNNEST([channel, '(all)']) AS segment
+  GROUP BY 1, 2
+),
+
+eligible AS (
+  SELECT channel
+  FROM buckets
+  GROUP BY 1
+  HAVING SUM(sessions) >= ${bs.min_sessions}
+),
+
+-- one weight per bucket and replicate, the SAME for every channel: a replicate resamples the
+-- same sessions for the channel and for the site, so the interval of the difference is right
+weights AS (
+  SELECT b AS bucket, r AS replicate, ${ref("poisson_bootstrap_weight")}(CAST(b AS STRING), r) AS w
+  FROM UNNEST(GENERATE_ARRAY(0, ${bs.buckets - 1})) AS b
+  CROSS JOIN UNNEST(GENERATE_ARRAY(1, ${bs.replicates})) AS r
+),
+
+replicates AS (
+  SELECT
+    k.channel,
+    w.replicate,
+    SUM(w.w * k.sessions) AS sessions,
+    SUM(w.w * k.purchasers) AS purchasers,
+    SUM(w.w * k.engaged) AS engaged,
+    SUM(w.w * k.transactions) AS transactions,
+    SUM(w.w * k.revenue) AS revenue
+  FROM buckets AS k
+  JOIN eligible USING (channel)
+  JOIN weights AS w USING (bucket)
+  GROUP BY 1, 2
+),
+
+replicate_metrics AS (
+  SELECT r.channel, r.replicate, m.metric, m.value
+  FROM replicates AS r
+  CROSS JOIN UNNEST([
+    STRUCT('conversion_rate' AS metric, SAFE_DIVIDE(r.purchasers, r.sessions) AS value),
+    STRUCT('revenue_per_session', SAFE_DIVIDE(r.revenue, r.sessions)),
+    STRUCT('average_order_value', SAFE_DIVIDE(r.revenue, r.transactions)),
+    STRUCT('engagement_rate', SAFE_DIVIDE(r.engaged, r.sessions))
+  ]) AS m
+),
+
+paired AS (
+  SELECT c.channel, c.metric, c.replicate, c.value, s.value AS site_value
+  FROM replicate_metrics AS c
+  JOIN replicate_metrics AS s
+    ON s.channel = '(all)'
+    AND s.replicate = c.replicate
+    AND s.metric = c.metric
+),
+
+intervals AS (
+  SELECT
+    channel,
+    metric,
+    COUNT(value) AS replicates,
+    AVG(value) AS bootstrap_mean,
+    STDDEV_SAMP(value) AS bootstrap_se,
+    APPROX_QUANTILES(value, 40 IGNORE NULLS)[OFFSET(1)] AS ci_low,
+    APPROX_QUANTILES(value, 40 IGNORE NULLS)[OFFSET(39)] AS ci_high,
+    APPROX_QUANTILES(value - site_value, 40 IGNORE NULLS)[OFFSET(1)] AS diff_vs_site_ci_low,
+    APPROX_QUANTILES(value - site_value, 40 IGNORE NULLS)[OFFSET(39)] AS diff_vs_site_ci_high,
+    SAFE_DIVIDE(COUNTIF(value > site_value), COUNT(value)) AS share_of_replicates_above_site
+  FROM paired
+  GROUP BY 1, 2
+),
+
+point AS (
+  SELECT
+    b.channel,
+    SUM(b.sessions) AS sessions,
+    SUM(b.purchasers) AS purchasers,
+    SUM(b.engaged) AS engaged,
+    SUM(b.transactions) AS transactions,
+    SUM(b.revenue) AS revenue,
+    SUM(b.revenue_squared) AS revenue_squared
+  FROM buckets AS b
+  JOIN eligible USING (channel)
+  GROUP BY 1
+),
+
+point_metrics AS (
+  SELECT p.channel, p.sessions, m.metric, m.estimate, m.normal_se
+  FROM point AS p
+  CROSS JOIN UNNEST([
+    STRUCT(
+      'conversion_rate' AS metric,
+      SAFE_DIVIDE(p.purchasers, p.sessions) AS estimate,
+      SQRT(SAFE_DIVIDE(SAFE_DIVIDE(p.purchasers, p.sessions) * (1 - SAFE_DIVIDE(p.purchasers, p.sessions)), p.sessions)) AS normal_se
+    ),
+    STRUCT(
+      'revenue_per_session',
+      SAFE_DIVIDE(p.revenue, p.sessions),
+      SQRT(SAFE_DIVIDE(GREATEST(SAFE_DIVIDE(p.revenue_squared - p.revenue * p.revenue / p.sessions, p.sessions - 1), 0), p.sessions))
+    ),
+    STRUCT('average_order_value', SAFE_DIVIDE(p.revenue, p.transactions), CAST(NULL AS FLOAT64)),
+    STRUCT(
+      'engagement_rate',
+      SAFE_DIVIDE(p.engaged, p.sessions),
+      SQRT(SAFE_DIVIDE(SAFE_DIVIDE(p.engaged, p.sessions) * (1 - SAFE_DIVIDE(p.engaged, p.sessions)), p.sessions))
+    )
+  ]) AS m
+)
+
+SELECT
+  p.channel,
+  p.metric,
+  p.sessions,
+  p.estimate,
+  i.bootstrap_mean,
+  i.bootstrap_se,
+  i.ci_low,
+  i.ci_high,
+  i.diff_vs_site_ci_low,
+  i.diff_vs_site_ci_high,
+  p.channel != '(all)' AND (i.diff_vs_site_ci_low > 0 OR i.diff_vs_site_ci_high < 0) AS is_different_from_site,
+  i.share_of_replicates_above_site,
+  p.estimate - 1.96 * p.normal_se AS normal_ci_low,
+  p.estimate + 1.96 * p.normal_se AS normal_ci_high,
+  SAFE_DIVIDE(i.ci_high - i.ci_low, 2 * 1.96 * p.normal_se) AS bootstrap_to_normal_width,
+  i.replicates,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM point_metrics AS p
+LEFT JOIN intervals AS i USING (channel, metric)

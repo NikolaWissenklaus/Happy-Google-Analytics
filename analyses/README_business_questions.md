@@ -57,3 +57,8 @@ number you must set (threshold, ticket, event names): run the whole file as a sc
 |---|---|
 | `51_frontier_action_lists.sql` | one action list per team from the `frontier` models (docs/frontier.md) |
 | `52_which_attribution_to_trust.sql` | where the attribution models agree and disagree, marginal cost per conversion (docs/attribution_extended.md) |
+
+## next: the insights models (53 to 70)
+
+From the junior cookbook of the raw export to the specialist queries over the `insights` models
+(docs/insights.md): see the table at the end of `README.md` of this folder.

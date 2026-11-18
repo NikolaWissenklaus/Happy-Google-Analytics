@@ -1,0 +1,180 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_flow_divergence_buyers",
+  description: "Where does the navigation of the buyers diverge from the navigation of everybody else? For every page type, the next step of the sessions that bought against the sessions that did not, only in the DISCOVERY part of the visit (before the first cart / checkout page, so 'checkout -> thank you' does not win trivially). Jensen-Shannon divergence per page type (0 = they browse the same, 1 = completely different) and, per transition, the lift in buyers and the purchase rate of the sessions that made it. 'Buyers go from the category to the search 3x more' is a design brief",
+  bigquery: {
+    labels: { layer: "marts", domain: "product", level: "senior" }
+  },
+  tags: ["marts", "product", "daily", "insights"],
+  columns: {
+    device_category: "Device of the session, or '(all)'",
+    from_type: "Page type of the current view",
+    to_type: "Page type of the next view, '(decision)' = the next one is cart / checkout / thank you, '(exit)' = the session ended",
+    p_buyer: "Share of the moves of buyers from from_type that went to to_type (all moves)",
+    p_other: "Same for the sessions that did not buy",
+    p_buyer_browsing: "Like p_buyer but only among the moves that kept browsing (no decision, no exit)",
+    lift_browsing: "p_buyer_browsing / p_other_browsing. Above 1 = buyers do this more",
+    jsd_browsing_moves: "Jensen-Shannon divergence (bits) of the browsing moves of buyers vs others from from_type",
+    jsd_all_moves: "Jensen-Shannon divergence including decision and exit",
+    purchase_rate_of_sessions_with_move: "Share of the sessions that made this move and bought",
+    is_buyer_pattern: "Browsing move with lift_browsing >= flow_divergence.over_represented_lift and enough sessions"
+  }
+}
+
+js {
+  const fd = cfg_insights.flow_divergence;
+  const decision = helpers.sqlList(fd.decision_page_types);
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    page_number,
+    COALESCE(page_type, '(not set)') AS page_type,
+    COALESCE(session_has_purchase, FALSE) AS is_buyer,
+    COALESCE(device_category, '(not set)') AS device_category
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(fd.window_days)}
+    AND event_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+decision_point AS (
+  SELECT session_key, MIN(IF(page_type IN (${decision}), page_number, NULL)) AS first_decision_page
+  FROM views
+  GROUP BY 1
+),
+
+transitions AS (
+  SELECT
+    v.session_key,
+    v.is_buyer,
+    v.device_category,
+    v.page_number,
+    v.page_type AS from_type,
+    COALESCE(LEAD(v.page_type) OVER (PARTITION BY v.session_key ORDER BY v.page_number), '(exit)') AS next_type,
+    d.first_decision_page
+  FROM views AS v
+  JOIN decision_point AS d USING (session_key)
+),
+
+-- only what happened BEFORE the first cart / checkout page: how people decide, not how they pay
+discovery AS (
+  SELECT
+    session_key,
+    is_buyer,
+    device_category,
+    from_type,
+    IF(next_type IN (${decision}), '(decision)', next_type) AS to_type
+  FROM transitions
+  WHERE first_decision_page IS NULL OR page_number < first_decision_page
+),
+
+moves AS (
+  SELECT
+    device_value AS device_category,
+    from_type,
+    to_type,
+    is_buyer,
+    COUNT(*) AS moves,
+    COUNT(DISTINCT session_key) AS sessions
+  FROM discovery
+  CROSS JOIN UNNEST([device_category, '(all)']) AS device_value
+  GROUP BY 1, 2, 3, 4
+),
+
+by_group AS (
+  SELECT
+    device_category,
+    from_type,
+    to_type,
+    to_type NOT IN ('(decision)', '(exit)') AS is_browsing_move,
+    SUM(IF(is_buyer, moves, 0)) AS buyer_moves,
+    SUM(IF(NOT is_buyer, moves, 0)) AS other_moves,
+    SUM(IF(is_buyer, sessions, 0)) AS buyer_sessions,
+    SUM(IF(NOT is_buyer, sessions, 0)) AS other_sessions
+  FROM moves
+  GROUP BY 1, 2, 3, 4
+),
+
+probabilities AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(buyer_moves, SUM(buyer_moves) OVER w) AS p_buyer,
+    SAFE_DIVIDE(other_moves, SUM(other_moves) OVER w) AS p_other,
+    SAFE_DIVIDE(IF(is_browsing_move, buyer_moves, 0), SUM(IF(is_browsing_move, buyer_moves, 0)) OVER w) AS p_buyer_browsing,
+    SAFE_DIVIDE(IF(is_browsing_move, other_moves, 0), SUM(IF(is_browsing_move, other_moves, 0)) OVER w) AS p_other_browsing
+  FROM by_group
+  WINDOW w AS (PARTITION BY device_category, from_type)
+),
+
+mixture AS (
+  SELECT
+    *,
+    (COALESCE(p_buyer, 0) + COALESCE(p_other, 0)) / 2 AS m_all,
+    (COALESCE(p_buyer_browsing, 0) + COALESCE(p_other_browsing, 0)) / 2 AS m_browsing
+  FROM probabilities
+),
+
+-- JSD = 1/2 KL(P || M) + 1/2 KL(Q || M), M = (P + Q) / 2, in bits: 0 = same behaviour, 1 = disjoint
+state_divergence AS (
+  SELECT
+    device_category,
+    from_type,
+    SUM(buyer_moves) AS state_buyer_moves,
+    SUM(other_moves) AS state_other_moves,
+    0.5 * SUM(IF(p_buyer > 0, p_buyer * LOG(p_buyer / m_all, 2), 0))
+      + 0.5 * SUM(IF(p_other > 0, p_other * LOG(p_other / m_all, 2), 0)) AS jsd_all_moves,
+    0.5 * SUM(IF(p_buyer_browsing > 0, p_buyer_browsing * LOG(p_buyer_browsing / m_browsing, 2), 0))
+      + 0.5 * SUM(IF(p_other_browsing > 0, p_other_browsing * LOG(p_other_browsing / m_browsing, 2), 0)) AS jsd_browsing_moves,
+    SUM(IF(to_type = '(decision)', p_buyer, 0)) AS buyer_decision_share,
+    SUM(IF(to_type = '(decision)', p_other, 0)) AS other_decision_share,
+    SUM(IF(to_type = '(exit)', p_other, 0)) AS other_exit_share
+  FROM mixture
+  GROUP BY 1, 2
+),
+
+site AS (
+  SELECT SAFE_DIVIDE(COUNT(DISTINCT IF(is_buyer, session_key, NULL)), COUNT(DISTINCT session_key)) AS site_purchase_rate
+  FROM views
+)
+
+SELECT
+  m.device_category,
+  m.from_type,
+  m.to_type,
+  m.is_browsing_move,
+  m.buyer_moves,
+  m.other_moves,
+  m.buyer_sessions,
+  m.other_sessions,
+  m.p_buyer,
+  m.p_other,
+  m.p_buyer_browsing,
+  m.p_other_browsing,
+  SAFE_DIVIDE(m.p_buyer, m.p_other) AS lift_all,
+  SAFE_DIVIDE(m.p_buyer_browsing, m.p_other_browsing) AS lift_browsing,
+  SAFE_DIVIDE(m.buyer_sessions, m.buyer_sessions + m.other_sessions) AS purchase_rate_of_sessions_with_move,
+  ${helpers.wilsonLower("m.buyer_sessions", "m.buyer_sessions + m.other_sessions")} AS purchase_rate_wilson_low,
+  st.site_purchase_rate,
+  m.is_browsing_move
+    AND m.buyer_moves >= 30
+    AND m.buyer_sessions + m.other_sessions >= ${fd.min_transition_sessions}
+    AND SAFE_DIVIDE(m.p_buyer_browsing, m.p_other_browsing) >= ${fd.over_represented_lift} AS is_buyer_pattern,
+  s.state_buyer_moves,
+  s.state_other_moves,
+  s.jsd_browsing_moves,
+  s.jsd_all_moves,
+  s.buyer_decision_share,
+  s.other_decision_share,
+  s.other_exit_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM mixture AS m
+JOIN state_divergence AS s USING (device_category, from_type)
+CROSS JOIN site AS st
+WHERE m.buyer_sessions + m.other_sessions >= ${fd.min_transition_sessions}

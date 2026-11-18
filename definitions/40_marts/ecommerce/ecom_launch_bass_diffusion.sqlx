@@ -1,0 +1,148 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_launch_bass_diffusion",
+  description: "How does each new product spread? The Bass diffusion model (1969, the one used to forecast the adoption of TVs, phones and drugs) fitted to the weekly new viewers and new buyers of every product launched in the last months (ga4_udf.fit_bass_diffusion): p = innovators (came by themselves or by the ads), q = imitators (came because others did), m = the size of its market, the week of the peak, the share of the market already reached and the next 8 weeks. q / p of 10+ is a word of mouth product (invest in reviews and referral), q < p is a product pushed by media that fades when the push stops",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce", level: "specialist" }
+  },
+  tags: ["marts", "ecommerce", "daily", "insights", "merchandising"],
+  columns: {
+    metric: "viewers (first view_item of each person) | buyers (first purchase of each person)",
+    launch_date: "First day GA4 saw the item (dim_items.first_seen_date)",
+    p_innovation: "Bass p: adoption that does not depend on who adopted before",
+    q_imitation: "Bass q: adoption pulled by the ones that already adopted",
+    q_over_p: "Strength of the imitation. Durable goods usually 10-30",
+    market_size: "Bass m: people that will adopt in the end (a floor when m_at_lower_bound)",
+    peak_week: "Week since launch of the peak of new adopters (0 = launch week)",
+    share_of_market_reached: "Adopters so far / market_size",
+    phase: "too_early_to_tell | takeoff | at_peak | saturating | mature",
+    diffusion_type: "word_of_mouth | mixed | media_pushed"
+  }
+}
+
+js {
+  const bs = cfg_insights.bass;
+}
+
+WITH
+history_start AS (
+  SELECT MIN(first_seen_date) AS first_day FROM ${ref("dim_items")}
+),
+
+-- items seen for the first time inside the window, and not just because the history started then
+launches AS (
+  SELECT i.item_id, i.item_name, i.item_brand, i.item_category, i.first_seen_date AS launch_date
+  FROM ${ref("dim_items")} AS i
+  CROSS JOIN history_start AS h
+  WHERE i.first_seen_date >= ${helpers.daysAgo(bs.launch_window_days)}
+    AND i.first_seen_date > DATE_ADD(h.first_day, INTERVAL 14 DAY)
+    AND i.first_seen_date <= DATE_SUB(${helpers.today()}, INTERVAL ${bs.min_weeks * 7} DAY)
+),
+
+first_views AS (
+  SELECT x.item_id, x.user_key, MIN(x.event_date) AS first_date
+  FROM ${ref("fct_item_interactions")} AS x
+  JOIN launches AS l USING (item_id)
+  WHERE x.event_name = 'view_item'
+    AND x.event_date >= l.launch_date
+    AND x.user_key IS NOT NULL
+    ${helpers.martSessionFilter("x")}
+  GROUP BY 1, 2
+),
+
+first_buys AS (
+  SELECT t.item_id, t.user_key, MIN(t.transaction_date) AS first_date
+  FROM ${ref("fct_transaction_items")} AS t
+  JOIN launches AS l USING (item_id)
+  WHERE t.is_valid_for_revenue
+    AND t.transaction_date >= l.launch_date
+    AND t.user_key IS NOT NULL
+  GROUP BY 1, 2
+),
+
+adoptions AS (
+  SELECT item_id, 'viewers' AS metric, first_date FROM first_views
+  UNION ALL
+  SELECT item_id, 'buyers', first_date FROM first_buys
+),
+
+weekly AS (
+  SELECT a.item_id, a.metric, DIV(DATE_DIFF(a.first_date, l.launch_date, DAY), 7) AS week_index, COUNT(*) AS adopters
+  FROM adoptions AS a
+  JOIN launches AS l USING (item_id)
+  GROUP BY 1, 2, 3
+),
+
+observed AS (
+  SELECT item_id, DIV(DATE_DIFF(${helpers.today()}, launch_date, DAY), 7) AS complete_weeks
+  FROM launches
+),
+
+-- dense weekly grid (complete weeks only), so a week with nobody is a 0 and not a hole
+grid AS (
+  SELECT o.item_id, metric, week_index
+  FROM observed AS o
+  CROSS JOIN UNNEST(['viewers', 'buyers']) AS metric
+  CROSS JOIN UNNEST(GENERATE_ARRAY(0, o.complete_weeks - 1)) AS week_index
+  WHERE o.complete_weeks >= ${bs.min_weeks}
+),
+
+series AS (
+  SELECT
+    g.item_id,
+    g.metric,
+    COUNT(*) AS weeks_observed,
+    SUM(COALESCE(w.adopters, 0)) AS adopters_total,
+    ARRAY_AGG(CAST(COALESCE(w.adopters, 0) AS FLOAT64) ORDER BY g.week_index) AS adoptions
+  FROM grid AS g
+  LEFT JOIN weekly AS w USING (item_id, metric, week_index)
+  GROUP BY 1, 2
+  HAVING SUM(COALESCE(w.adopters, 0)) >= ${bs.min_adopters}
+),
+
+fitted AS (
+  SELECT s.*, ${ref("fit_bass_diffusion")}(s.adoptions, ${bs.horizon_weeks}) AS bass
+  FROM series AS s
+)
+
+SELECT
+  f.item_id,
+  l.item_name,
+  l.item_brand,
+  l.item_category,
+  f.metric,
+  l.launch_date,
+  f.weeks_observed,
+  f.adopters_total,
+  f.bass.p AS p_innovation,
+  f.bass.q AS q_imitation,
+  SAFE_DIVIDE(f.bass.q, f.bass.p) AS q_over_p,
+  f.bass.m AS market_size,
+  f.bass.m_at_lower_bound,
+  f.bass.r2 AS fit_r2,
+  f.bass.peak_period AS peak_week,
+  DATE_ADD(l.launch_date, INTERVAL CAST(ROUND(f.bass.peak_period * 7) AS INT64) DAY) AS peak_date,
+  f.bass.peak_adoptions AS peak_week_adopters,
+  f.bass.share_of_market_reached,
+  f.bass.forecast AS next_weeks_adopters,
+  (SELECT SUM(v) FROM UNNEST(f.bass.forecast) AS v) AS next_weeks_adopters_total,
+  CASE
+    WHEN f.bass.m_at_lower_bound OR f.bass.r2 < 0.3 THEN 'too_early_to_tell'
+    WHEN f.bass.share_of_market_reached >= 0.8 THEN 'mature'
+    WHEN f.weeks_observed < f.bass.peak_period - 1 THEN 'takeoff'
+    WHEN f.weeks_observed <= f.bass.peak_period + 1 THEN 'at_peak'
+    ELSE 'saturating'
+  END AS phase,
+  CASE
+    WHEN SAFE_DIVIDE(f.bass.q, f.bass.p) >= ${bs.word_of_mouth_q_over_p} THEN 'word_of_mouth'
+    WHEN f.bass.q < f.bass.p THEN 'media_pushed'
+    ELSE 'mixed'
+  END AS diffusion_type,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fitted AS f
+JOIN launches AS l USING (item_id)
+WHERE f.bass IS NOT NULL

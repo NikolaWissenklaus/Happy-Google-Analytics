@@ -1,0 +1,124 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ops,
+  name: "ops_event_storage_footprint",
+  description: "Who eats the bytes of the export? Every event name and every event param of the last 7 days with its estimated logical size (BigQuery rules: STRING = 2 bytes + its UTF-8 length, INT64 / FLOAT64 = 8 bytes, NULL = 0, plus an estimate for the fixed columns and the items), the share of the export, the GiB per month it adds and what it costs to store, and whether the param is in the tracking plan. The 'debug_payload' param with a 900 character JSON in every page_view shows up here, together with the bill",
+  bigquery: {
+    labels: { layer: "monitoring", domain: "ops", level: "mid" }
+  },
+  tags: ["monitoring", "ops", "weekly", "insights"],
+  columns: {
+    row_type: "event (one row per event name) | param (one row per event name x param)",
+    logical_bytes: "Estimated logical bytes in the window (params exact by the BigQuery rules, fixed columns and items estimated)",
+    share_of_export: "logical_bytes / estimated bytes of the whole export in the window",
+    estimated_gib_per_month: "logical_bytes / window_days x 30 / 2^30",
+    estimated_storage_usd_per_month: "GiB per month x storage.usd_per_gib_month. It accumulates: every month adds this again",
+    distinct_values: "param rows: approximate distinct values in the window",
+    is_planned_param: "param rows: event x param present in the tracking plan"
+  }
+}
+
+js {
+  const st = cfg_insights.storage;
+  const gib = 1073741824;
+}
+
+WITH
+param_bytes AS (
+  SELECT
+    event_name,
+    param_key,
+    COUNT(*) AS rows_with_param,
+    SUM(
+      2 + BYTE_LENGTH(param_key)
+      + IF(string_value IS NOT NULL, 2 + BYTE_LENGTH(string_value), 0)
+      + IF(int_value IS NOT NULL, 8, 0)
+      + IF(float_value IS NOT NULL, 8, 0)
+      + IF(double_value IS NOT NULL, 8, 0)
+    ) AS logical_bytes,
+    APPROX_COUNT_DISTINCT(value_as_string) AS distinct_values,
+    AVG(value_length) AS avg_string_length
+  FROM ${ref("stg_ga4__event_params")}
+  WHERE event_date >= ${helpers.daysAgo(st.window_days)}
+    AND event_date < ${helpers.today()}
+  GROUP BY 1, 2
+),
+
+events AS (
+  SELECT event_name, COUNT(*) AS events, SUM(COALESCE(items_count, 0)) AS item_rows
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.daysAgo(st.window_days)}
+    AND event_date < ${helpers.today()}
+  GROUP BY 1
+),
+
+event_bytes AS (
+  SELECT
+    e.event_name,
+    e.events,
+    e.item_rows,
+    COALESCE(SUM(p.logical_bytes), 0) AS params_bytes,
+    e.events * ${st.other_columns_bytes} AS fixed_columns_bytes,
+    e.item_rows * ${st.item_row_bytes} AS items_bytes
+  FROM events AS e
+  LEFT JOIN param_bytes AS p USING (event_name)
+  GROUP BY 1, 2, 3
+),
+
+totals AS (
+  SELECT SUM(params_bytes + fixed_columns_bytes + items_bytes) AS export_bytes
+  FROM event_bytes
+),
+
+planned AS (
+  SELECT DISTINCT event_name, param_name AS param_key
+  FROM ${ref("seed_tracking_plan")}
+  WHERE param_name IS NOT NULL
+)
+
+SELECT
+  'event' AS row_type,
+  b.event_name,
+  CAST(NULL AS STRING) AS param_key,
+  b.events,
+  b.events AS rows_in_window,
+  b.params_bytes + b.fixed_columns_bytes + b.items_bytes AS logical_bytes,
+  b.params_bytes,
+  b.items_bytes,
+  SAFE_DIVIDE(b.params_bytes + b.fixed_columns_bytes + b.items_bytes, b.events) AS bytes_per_event,
+  SAFE_DIVIDE(b.params_bytes + b.fixed_columns_bytes + b.items_bytes, t.export_bytes) AS share_of_export,
+  (b.params_bytes + b.fixed_columns_bytes + b.items_bytes) / ${st.window_days} * 30 / ${gib} AS estimated_gib_per_month,
+  (b.params_bytes + b.fixed_columns_bytes + b.items_bytes) / ${st.window_days} * 30 / ${gib} * ${st.usd_per_gib_month} AS estimated_storage_usd_per_month,
+  CAST(NULL AS INT64) AS distinct_values,
+  CAST(NULL AS FLOAT64) AS avg_string_length,
+  CAST(NULL AS BOOL) AS is_planned_param,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM event_bytes AS b
+CROSS JOIN totals AS t
+
+UNION ALL
+
+SELECT
+  'param',
+  p.event_name,
+  p.param_key,
+  e.events,
+  p.rows_with_param,
+  p.logical_bytes,
+  p.logical_bytes,
+  0,
+  SAFE_DIVIDE(p.logical_bytes, p.rows_with_param),
+  SAFE_DIVIDE(p.logical_bytes, t.export_bytes),
+  p.logical_bytes / ${st.window_days} * 30 / ${gib},
+  p.logical_bytes / ${st.window_days} * 30 / ${gib} * ${st.usd_per_gib_month},
+  p.distinct_values,
+  p.avg_string_length,
+  pl.param_key IS NOT NULL,
+  CURRENT_TIMESTAMP()
+FROM param_bytes AS p
+CROSS JOIN totals AS t
+LEFT JOIN events AS e USING (event_name)
+LEFT JOIN planned AS pl ON pl.event_name = p.event_name AND pl.param_key = p.param_key

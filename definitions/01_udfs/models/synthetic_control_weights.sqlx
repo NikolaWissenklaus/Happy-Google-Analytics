@@ -1,0 +1,116 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "synthetic_control_weights",
+  description: "Synthetic control (Abadie, Diamond & Hainmueller 2010): non negative donor weights that sum to 1 and reproduce the pre period of the treated unit as well as possible (least squares on the simplex, accelerated projected gradient). Returns every donor with its weight and the pre period RMSPE",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "models", "insights"]
+}
+
+-- Difference-in-differences compares the test states with the AVERAGE of the control states, and
+-- hopes they walk in parallel. Synthetic control builds the control: "this test is 40% Minas +
+-- 35% Goias + 25% Bahia", the mix that walked exactly like the test states BEFORE the campaign.
+-- After the start, the gap between the real series and the synthetic one is the effect. Weights
+-- live on the simplex (w >= 0, sum = 1) so the synthetic never extrapolates. Normalize the series
+-- in SQL (ex: divide by the pre period mean) when the units have different sizes. treated and
+-- every donor series must have the same length (the pre period, oldest first, no NULLs)
+CREATE OR REPLACE FUNCTION ${self()}(treated ARRAY<FLOAT64>, donors ARRAY<STRUCT<donor STRING, series ARRAY<FLOAT64>>>, iterations FLOAT64)
+RETURNS ARRAY<STRUCT<donor STRING, weight FLOAT64, pre_rmspe FLOAT64>>
+LANGUAGE js AS r"""
+  var y = (treated || []).map(Number);
+  var T = y.length;
+  if (T < 3) return [];
+  for (var t = 0; t < T; t++) if (!isFinite(y[t])) return [];
+  var names = [], X = [];
+  var list = donors || [];
+  for (var i = 0; i < list.length; i++) {
+    var d = list[i];
+    if (!d || d.donor === null || d.donor === undefined || !d.series || d.series.length !== T) continue;
+    var ok = true;
+    var col = new Array(T);
+    for (t = 0; t < T; t++) { col[t] = Number(d.series[t]); if (!isFinite(col[t])) { ok = false; break; } }
+    if (!ok) continue;
+    names.push(d.donor);
+    X.push(col);
+  }
+  var J = names.length;
+  if (J === 0) return [];
+  var maxIt = (iterations === null || iterations === undefined) ? 5000 : Math.max(10, Math.round(iterations));
+
+  // gram matrix and X'y: the gradient of ||y - Xw||^2 / T is 2 (G w - c) / T
+  var G = new Array(J), c = new Array(J);
+  for (var a = 0; a < J; a++) {
+    G[a] = new Array(J);
+    var cy = 0;
+    for (t = 0; t < T; t++) cy += X[a][t] * y[t];
+    c[a] = cy;
+    for (var b = 0; b <= a; b++) {
+      var g = 0;
+      for (t = 0; t < T; t++) g += X[a][t] * X[b][t];
+      G[a][b] = g;
+      G[b][a] = g;
+    }
+  }
+  // Lipschitz constant 2 lambda_max(G) / T, lambda_max by power iteration
+  var vec = new Array(J);
+  for (a = 0; a < J; a++) vec[a] = 1 / Math.sqrt(J);
+  var lambda = 0;
+  for (var pi = 0; pi < 100; pi++) {
+    var nv = new Array(J), norm = 0;
+    for (a = 0; a < J; a++) { var s = 0; for (b = 0; b < J; b++) s += G[a][b] * vec[b]; nv[a] = s; norm += s * s; }
+    norm = Math.sqrt(norm);
+    if (!(norm > 0)) break;
+    for (a = 0; a < J; a++) vec[a] = nv[a] / norm;
+    lambda = norm;
+  }
+  var L = Math.max(2 * lambda / T, 1e-12);
+
+  // Euclidean projection on the simplex (Duchi, Shalev-Shwartz, Singer & Chandra 2008)
+  function project(v) {
+    var u = v.slice().sort(function (p, q) { return q - p; });
+    var cum = 0, theta = 0;
+    for (var k = 0; k < u.length; k++) {
+      cum += u[k];
+      var th = (cum - 1) / (k + 1);
+      if (u[k] - th > 0) theta = th;
+    }
+    return v.map(function (e) { return Math.max(e - theta, 0); });
+  }
+  function gradient(w) {
+    var gr = new Array(J);
+    for (var r = 0; r < J; r++) { var s2 = 0; for (var q = 0; q < J; q++) s2 += G[r][q] * w[q]; gr[r] = 2 * (s2 - c[r]) / T; }
+    return gr;
+  }
+
+  var w = new Array(J);
+  for (a = 0; a < J; a++) w[a] = 1 / J;
+  var z = w.slice(), tk = 1;
+  for (var it = 0; it < maxIt; it++) {
+    var gz = gradient(z);
+    var wNew = project(z.map(function (e, ix) { return e - gz[ix] / L; }));
+    var tNew = (1 + Math.sqrt(1 + 4 * tk * tk)) / 2;
+    var diff = 0;
+    for (a = 0; a < J; a++) diff = Math.max(diff, Math.abs(wNew[a] - w[a]));
+    z = wNew.map(function (e, ix) { return e + ((tk - 1) / tNew) * (e - w[ix]); });
+    w = wNew;
+    tk = tNew;
+    if (diff < 1e-11 && it > 20) break;
+  }
+
+  var sse = 0;
+  for (t = 0; t < T; t++) {
+    var fit = 0;
+    for (a = 0; a < J; a++) fit += w[a] * X[a][t];
+    sse += (y[t] - fit) * (y[t] - fit);
+  }
+  var rmspe = Math.sqrt(sse / T);
+  var out = [];
+  for (a = 0; a < J; a++) out.push({ donor: names[a], weight: w[a] < 1e-9 ? 0 : w[a], pre_rmspe: rmspe });
+  out.sort(function (p, q) { return q.weight - p.weight || (p.donor < q.donor ? -1 : 1); });
+  return out;
+"""
+OPTIONS (description = "Synthetic control donor weights on the simplex")

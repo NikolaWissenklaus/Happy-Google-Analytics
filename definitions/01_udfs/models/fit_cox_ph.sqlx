@@ -1,0 +1,231 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "fit_cox_ph",
+  description: "Cox proportional hazards regression fitted inside BigQuery (Newton-Raphson on the Breslow partial likelihood, small L2 penalty): hazard ratio, standard error, z, p value and 95% interval per covariate, plus the log likelihood and Harrell's concordance of the model",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "models", "insights"]
+}
+
+-- Kaplan-Meier (ecom_repeat_purchase_survival) says HOW LONG until the second purchase. Cox says
+-- WHAT changes it, every covariate adjusted for the others: hazard ratio 1.30 for "paid with PIX"
+-- = at any moment, these customers come back 30% faster than the others with the same coupon,
+-- channel, device and ticket. Censored customers (no second purchase yet) count, that is the point
+-- of survival analysis. Covariates are standardized inside (better numerics) and the coefficients
+-- come back in the original units. Ties by the Breslow method. A constant covariate gets NULL.
+-- Concordance is measured on an even sample of at most 2000 subjects (it is O(n^2)).
+-- Send at most ~50k subjects (deterministic sample in SQL), every covariates array with the same
+-- length as covariate_names
+CREATE OR REPLACE FUNCTION ${self()}(
+  subjects ARRAY<STRUCT<duration FLOAT64, event BOOL, covariates ARRAY<FLOAT64>>>,
+  covariate_names ARRAY<STRING>,
+  l2 FLOAT64,
+  iterations FLOAT64
+)
+RETURNS ARRAY<STRUCT<covariate STRING, coef FLOAT64, hazard_ratio FLOAT64, se FLOAT64, z FLOAT64, p_value FLOAT64, hr_low FLOAT64, hr_high FLOAT64, mean_value FLOAT64, subjects FLOAT64, events FLOAT64, log_likelihood FLOAT64, concordance FLOAT64, converged BOOL>>
+LANGUAGE js AS r"""
+  var names = covariate_names || [];
+  var p = names.length;
+  var rows = [];
+  var list = subjects || [];
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i];
+    if (!s || s.duration === null || s.duration === undefined || !isFinite(s.duration) || s.duration < 0) continue;
+    var cov = s.covariates || [];
+    if (cov.length !== p) continue;
+    var ok = true;
+    for (var j = 0; j < p; j++) if (cov[j] === null || cov[j] === undefined || !isFinite(cov[j])) { ok = false; break; }
+    if (!ok) continue;
+    rows.push({ t: Number(s.duration), e: s.event === true, x: cov.map(Number) });
+  }
+  var n = rows.length;
+  if (p === 0 || n < 10) return [];
+  var penalty = (l2 === null || l2 === undefined) ? 0.01 : Math.max(0, l2);
+  var maxIt = (iterations === null || iterations === undefined) ? 30 : Math.max(1, Math.round(iterations));
+
+  var means = [], sds = [], active = [];
+  for (j = 0; j < p; j++) {
+    var acc = 0;
+    for (i = 0; i < n; i++) acc += rows[i].x[j];
+    var mu = acc / n;
+    var sq = 0;
+    for (i = 0; i < n; i++) sq += (rows[i].x[j] - mu) * (rows[i].x[j] - mu);
+    var sd = Math.sqrt(sq / Math.max(1, n - 1));
+    means.push(mu);
+    sds.push(sd);
+    if (sd > 1e-12) active.push(j);
+  }
+  var q = active.length;
+  var events = 0;
+  for (i = 0; i < n; i++) if (rows[i].e) events++;
+  if (q === 0 || events === 0) return [];
+
+  var Z = new Array(n);
+  for (i = 0; i < n; i++) {
+    var zi = new Array(q);
+    for (var a = 0; a < q; a++) zi[a] = (rows[i].x[active[a]] - means[active[a]]) / sds[active[a]];
+    Z[i] = zi;
+  }
+  var order = [];
+  for (i = 0; i < n; i++) order.push(i);
+  order.sort(function (u, v) { return rows[v].t - rows[u].t; });
+
+  function zeros(k) { var o = new Array(k); for (var r = 0; r < k; r++) o[r] = 0; return o; }
+  function matrix(k) { var o = new Array(k); for (var r = 0; r < k; r++) o[r] = zeros(k); return o; }
+
+  function evaluate(b) {
+    var eta = new Array(n), etaMax = -Infinity;
+    for (var r = 0; r < n; r++) {
+      var e = 0;
+      for (var c = 0; c < q; c++) e += b[c] * Z[r][c];
+      eta[r] = e;
+      if (e > etaMax) etaMax = e;
+    }
+    var S0 = 0, S1 = zeros(q), S2 = matrix(q);
+    var ll = 0, grad = zeros(q), info = matrix(q);
+    var idx = 0;
+    while (idx < n) {
+      var time = rows[order[idx]].t;
+      var d = 0, sumZ = zeros(q);
+      var k = idx;
+      while (k < n && rows[order[k]].t === time) {
+        var sub = order[k];
+        var risk = Math.exp(eta[sub] - etaMax);
+        S0 += risk;
+        for (var c1 = 0; c1 < q; c1++) {
+          var rz = risk * Z[sub][c1];
+          S1[c1] += rz;
+          for (var c2 = c1; c2 < q; c2++) S2[c1][c2] += rz * Z[sub][c2];
+        }
+        if (rows[sub].e) {
+          d++;
+          ll += eta[sub];
+          for (var c3 = 0; c3 < q; c3++) sumZ[c3] += Z[sub][c3];
+        }
+        k++;
+      }
+      if (d > 0) {
+        ll -= d * (Math.log(S0) + etaMax);
+        for (var c4 = 0; c4 < q; c4++) {
+          var m1 = S1[c4] / S0;
+          grad[c4] += sumZ[c4] - d * m1;
+          for (var c5 = c4; c5 < q; c5++) {
+            var v = d * (S2[c4][c5] / S0 - m1 * (S1[c5] / S0));
+            info[c4][c5] += v;
+          }
+        }
+      }
+      idx = k;
+    }
+    for (var c6 = 0; c6 < q; c6++) {
+      for (var c7 = 0; c7 < c6; c7++) info[c6][c7] = info[c7][c6];
+      ll -= 0.5 * penalty * b[c6] * b[c6];
+      grad[c6] -= penalty * b[c6];
+      info[c6][c6] += penalty;
+    }
+    return { ll: ll, grad: grad, info: info };
+  }
+
+  function invert(M) {
+    var k = M.length;
+    var A = new Array(k);
+    for (var r = 0; r < k; r++) {
+      A[r] = M[r].slice();
+      for (var c = 0; c < k; c++) A[r].push(r === c ? 1 : 0);
+    }
+    for (var col = 0; col < k; col++) {
+      var pivot = col;
+      for (var r2 = col + 1; r2 < k; r2++) if (Math.abs(A[r2][col]) > Math.abs(A[pivot][col])) pivot = r2;
+      if (Math.abs(A[pivot][col]) < 1e-14) return null;
+      var tmp = A[col]; A[col] = A[pivot]; A[pivot] = tmp;
+      var div = A[col][col];
+      for (var c2 = 0; c2 < 2 * k; c2++) A[col][c2] /= div;
+      for (var r3 = 0; r3 < k; r3++) {
+        if (r3 === col) continue;
+        var f = A[r3][col];
+        if (f === 0) continue;
+        for (var c3 = 0; c3 < 2 * k; c3++) A[r3][c3] -= f * A[col][c3];
+      }
+    }
+    var out = new Array(k);
+    for (var r4 = 0; r4 < k; r4++) out[r4] = A[r4].slice(k);
+    return out;
+  }
+
+  var beta = zeros(q);
+  var cur = evaluate(beta);
+  var converged = false;
+  for (var it = 0; it < maxIt; it++) {
+    var inv = invert(cur.info);
+    if (inv === null) break;
+    var step = zeros(q);
+    for (var r5 = 0; r5 < q; r5++) for (var c8 = 0; c8 < q; c8++) step[r5] += inv[r5][c8] * cur.grad[c8];
+    var scale = 1, next = null, cand = null;
+    for (var half = 0; half < 25; half++) {
+      cand = beta.map(function (bv, ix) { return bv + scale * step[ix]; });
+      next = evaluate(cand);
+      if (next.ll >= cur.ll - 1e-12) break;
+      scale /= 2;
+    }
+    var change = 0;
+    for (var r6 = 0; r6 < q; r6++) change = Math.max(change, Math.abs(cand[r6] - beta[r6]));
+    var gain = next.ll - cur.ll;
+    beta = cand;
+    cur = next;
+    if (change < 1e-8 || Math.abs(gain) < 1e-10) { converged = true; break; }
+  }
+
+  var covMatrix = invert(cur.info);
+  var stride = Math.max(1, Math.floor(n / 2000));
+  var sample = [];
+  for (i = 0; i < n; i += stride) sample.push(i);
+  var conc = 0, ties = 0, comparable = 0;
+  var score = sample.map(function (ix) { var e = 0; for (var c = 0; c < q; c++) e += beta[c] * Z[ix][c]; return e; });
+  for (var u = 0; u < sample.length; u++) {
+    var iu = sample[u];
+    if (!rows[iu].e) continue;
+    for (var w = 0; w < sample.length; w++) {
+      var iw = sample[w];
+      if (rows[iu].t < rows[iw].t) {
+        comparable++;
+        if (score[u] > score[w]) conc++;
+        else if (score[u] === score[w]) ties++;
+      }
+    }
+  }
+  var concordance = comparable > 0 ? (conc + 0.5 * ties) / comparable : null;
+
+  function normalCdf(zv) {
+    var t = 1 / (1 + 0.3275911 * Math.abs(zv) / Math.SQRT2);
+    var poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    var erf = 1 - poly * Math.exp(-zv * zv / 2);
+    return 0.5 * (1 + (zv >= 0 ? erf : -erf));
+  }
+
+  var out = [];
+  for (j = 0; j < p; j++) {
+    var pos = active.indexOf(j);
+    var row = { covariate: names[j], coef: null, hazard_ratio: null, se: null, z: null, p_value: null, hr_low: null, hr_high: null,
+      mean_value: means[j], subjects: n, events: events, log_likelihood: cur.ll, concordance: concordance, converged: converged };
+    if (pos >= 0) {
+      var coef = beta[pos] / sds[j];
+      row.coef = coef;
+      row.hazard_ratio = Math.exp(coef);
+      if (covMatrix !== null && covMatrix[pos][pos] > 0) {
+        var se = Math.sqrt(covMatrix[pos][pos]) / sds[j];
+        row.se = se;
+        row.z = coef / se;
+        row.p_value = 2 * (1 - normalCdf(Math.abs(coef / se)));
+        row.hr_low = Math.exp(coef - 1.959963984540054 * se);
+        row.hr_high = Math.exp(coef + 1.959963984540054 * se);
+      }
+    }
+    out.push(row);
+  }
+  return out;
+"""
+OPTIONS (description = "Cox proportional hazards regression (Breslow ties, Newton-Raphson)")

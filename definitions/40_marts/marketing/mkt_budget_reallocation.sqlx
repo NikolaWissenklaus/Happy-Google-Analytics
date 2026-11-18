@@ -1,0 +1,121 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_budget_reallocation",
+  description: "The same total budget, split better: with the response curves of mkt_spend_response_curves (reliable campaigns only), the split that maximizes revenue is the one where every campaign has the SAME marginal ROAS (Lagrange). Solved with a grid over that common marginal ROAS, every campaign limited to budget_reallocation.max_cut / max_increase of its current spend (the curves are only known around what was spent). Per campaign: current and suggested daily spend, the marginal ROAS before and after and the expected daily revenue change. A starting point for a test (move the money for 2 weeks, measure), not an autopilot: GA4 revenue is last click and the curves are observational",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing", level: "senior" }
+  },
+  tags: ["marts", "marketing", "daily", "insights", "costs"],
+  columns: {
+    current_daily_spend: "Average daily spend of the window of the curves",
+    suggested_daily_spend: "Spend that equalizes the marginal ROAS, inside the bounds",
+    marginal_roas_after: "b / (1 + suggested spend)",
+    equalized_marginal_roas: "The common marginal ROAS of the solution (campaigns at a bound differ)",
+    expected_daily_revenue_change: "b x (ln(1 + suggested) - ln(1 + current))",
+    budget_gap: "Total suggested - total current (should be ~0, the grid has a finite step)"
+  }
+}
+
+js {
+  const br = cfg_insights.budget_reallocation;
+}
+
+WITH
+curves AS (
+  SELECT platform, campaign, avg_daily_spend AS current_spend, b_revenue AS b, marginal_roas_at_current_spend
+  FROM ${ref("mkt_spend_response_curves")}
+  WHERE is_reliable
+    AND campaign != '(all campaigns)'
+    AND b_revenue > 0
+),
+
+budget AS (
+  SELECT SUM(current_spend) AS total_budget, COUNT(*) AS campaigns
+  FROM curves
+),
+
+bounds AS (
+  SELECT
+    *,
+    current_spend * (1 - ${br.max_cut}) AS min_spend,
+    current_spend * (1 + ${br.max_increase}) AS max_spend
+  FROM curves
+),
+
+-- the common marginal ROAS (lambda) lives between the most and the least efficient extremes
+lambda_range AS (
+  SELECT
+    LN(MIN(b / (1 + max_spend)) / 2) AS ln_low,
+    LN(MAX(b / (1 + min_spend)) * 2) AS ln_high
+  FROM bounds
+),
+
+grid AS (
+  SELECT g, EXP(r.ln_low + (r.ln_high - r.ln_low) * g / ${br.grid_points - 1}) AS lambda
+  FROM lambda_range AS r
+  CROSS JOIN UNNEST(GENERATE_ARRAY(0, ${br.grid_points - 1})) AS g
+),
+
+-- KKT of max sum b ln(1 + s) with sum s = budget: s = b / lambda - 1, clipped to the bounds
+allocations AS (
+  SELECT gr.g, gr.lambda, b.platform, b.campaign, LEAST(GREATEST(b.b / gr.lambda - 1, b.min_spend), b.max_spend) AS spend
+  FROM grid AS gr
+  CROSS JOIN bounds AS b
+),
+
+totals AS (
+  SELECT g, ANY_VALUE(lambda) AS lambda, SUM(spend) AS total_spend
+  FROM allocations
+  GROUP BY 1
+),
+
+chosen AS (
+  SELECT t.g, t.lambda, t.total_spend
+  FROM totals AS t
+  CROSS JOIN budget AS bu
+  ORDER BY ABS(t.total_spend - bu.total_budget), t.g
+  LIMIT 1
+),
+
+result AS (
+  SELECT
+    b.platform,
+    b.campaign,
+    b.current_spend,
+    a.spend AS suggested_spend,
+    b.b,
+    b.min_spend,
+    b.max_spend,
+    b.marginal_roas_at_current_spend AS marginal_roas_before,
+    SAFE_DIVIDE(b.b, 1 + a.spend) AS marginal_roas_after,
+    ch.lambda AS equalized_marginal_roas,
+    b.b * (LN(1 + a.spend) - LN(1 + b.current_spend)) AS expected_daily_revenue_change
+  FROM bounds AS b
+  JOIN allocations AS a USING (platform, campaign)
+  JOIN chosen AS ch ON ch.g = a.g
+)
+
+SELECT
+  r.platform,
+  r.campaign,
+  r.current_spend AS current_daily_spend,
+  r.suggested_spend AS suggested_daily_spend,
+  r.suggested_spend - r.current_spend AS daily_spend_change,
+  SAFE_DIVIDE(r.suggested_spend - r.current_spend, r.current_spend) AS daily_spend_change_pct,
+  r.suggested_spend <= r.min_spend + 1e-6 OR r.suggested_spend >= r.max_spend - 1e-6 AS is_at_bound,
+  r.marginal_roas_before,
+  r.marginal_roas_after,
+  r.equalized_marginal_roas,
+  r.expected_daily_revenue_change,
+  SUM(r.expected_daily_revenue_change) OVER () AS total_expected_daily_revenue_change,
+  SUM(r.suggested_spend) OVER () - SUM(r.current_spend) OVER () AS budget_gap,
+  bu.total_budget AS total_daily_budget,
+  bu.campaigns AS campaigns_in_the_split,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM result AS r
+CROSS JOIN budget AS bu
+WHERE bu.campaigns >= 2

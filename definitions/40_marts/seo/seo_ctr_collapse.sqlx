@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.seo,
+  name: "seo_ctr_collapse",
+  disabled: !constants.ENABLE.search_console,
+  description: "Same position, same impressions, much fewer clicks: the search result page ate the click (AI Overviews, featured snippets, shopping and video carousels, 'people also ask'). Query x page pairs of the last 28 days of Search Console against the same 28 days of last year and against the 28 days before, with the position stable (or better), impressions kept and the CTR down by 30%+, the clicks lost and the intent of the query (informational queries are the first victims of the AI answers). The SEO problem that no ranking tool shows, because the ranking did not move",
+  bigquery: {
+    labels: { layer: "marts", domain: "seo", level: "senior" }
+  },
+  tags: ["marts", "seo", "daily", "insights", "search_console", "optional"],
+  columns: {
+    base_period: "last_year (same 28 days 52 weeks before) | previous (the 28 days before)",
+    position_change: "Average position now - before (negative = better)",
+    relative_ctr_change: "CTR now / CTR before - 1",
+    is_ctr_collapse: "Position stable or better (ctr_collapse.max_position_change), impressions >= 80% of before, CTR down at least ctr_collapse.min_relative_ctr_drop",
+    clicks_lost: "Impressions now x (CTR before - CTR now): the clicks the same ranking used to bring",
+    query_intent: "Intent of the query (cfg_insights.query_intent)",
+    page_clicks_lost: "Sum of clicks_lost of the collapsed queries of the page and base period"
+  }
+}
+
+js {
+  const cc = cfg_insights.ctr_collapse;
+  const qi = cfg_insights.query_intent;
+  const normalized = "REGEXP_REPLACE(NORMALIZE(LOWER(query), NFD), r'\\p{M}', '')";
+  const intentCase = "CASE\n      WHEN is_brand_query THEN 'brand'\n" + qi.intents.map(i => `      WHEN REGEXP_CONTAINS(${normalized}, r'${i.pattern}') THEN '${i.intent}'`).join("\n") + "\n      ELSE 'product_or_generic'\n    END";
+}
+
+WITH
+last_day AS (
+  SELECT MAX(data_date) AS d FROM ${ref("stg_gsc__url_impressions")}
+),
+
+periods AS (
+  SELECT 'current' AS period, DATE_SUB(d, INTERVAL ${cc.window_days - 1} DAY) AS start_date, d AS end_date FROM last_day
+  UNION ALL
+  SELECT 'previous', DATE_SUB(d, INTERVAL ${2 * cc.window_days - 1} DAY), DATE_SUB(d, INTERVAL ${cc.window_days} DAY) FROM last_day
+  UNION ALL
+  SELECT 'last_year', DATE_SUB(d, INTERVAL ${364 + cc.window_days - 1} DAY), DATE_SUB(d, INTERVAL 364 DAY) FROM last_day
+),
+
+aggregated AS (
+  SELECT
+    p.period,
+    g.page_path,
+    g.query,
+    SUM(g.impressions) AS impressions,
+    SUM(g.clicks) AS clicks,
+    SUM(g.sum_position) AS sum_position
+  FROM ${ref("stg_gsc__url_impressions")} AS g
+  JOIN periods AS p ON g.data_date BETWEEN p.start_date AND p.end_date
+  WHERE g.search_type = 'WEB'
+    AND NOT COALESCE(g.is_anonymized_query, FALSE)
+    AND g.query IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+pivoted AS (
+  SELECT
+    page_path,
+    query,
+    SUM(IF(period = 'current', impressions, 0)) AS impressions_now,
+    SUM(IF(period = 'current', clicks, 0)) AS clicks_now,
+    SUM(IF(period = 'current', sum_position, 0)) AS sum_position_now,
+    SUM(IF(period = 'previous', impressions, 0)) AS impressions_previous,
+    SUM(IF(period = 'previous', clicks, 0)) AS clicks_previous,
+    SUM(IF(period = 'previous', sum_position, 0)) AS sum_position_previous,
+    SUM(IF(period = 'last_year', impressions, 0)) AS impressions_last_year,
+    SUM(IF(period = 'last_year', clicks, 0)) AS clicks_last_year,
+    SUM(IF(period = 'last_year', sum_position, 0)) AS sum_position_last_year
+  FROM aggregated
+  GROUP BY 1, 2
+),
+
+brand AS (
+  SELECT
+    *,
+    REGEXP_CONTAINS(LOWER(query), r'(?i)${helpers.regexFromList(cfg_project.brand_terms, false)}') AS is_brand_query
+  FROM pivoted
+),
+
+compared AS (
+  SELECT
+    b.page_path,
+    b.query,
+    ${intentCase} AS query_intent,
+    base.base_period,
+    b.impressions_now,
+    b.clicks_now,
+    SAFE_DIVIDE(b.clicks_now, b.impressions_now) AS ctr_now,
+    SAFE_DIVIDE(b.sum_position_now, b.impressions_now) + 1 AS position_now,
+    base.impressions_before,
+    base.clicks_before,
+    SAFE_DIVIDE(base.clicks_before, base.impressions_before) AS ctr_before,
+    SAFE_DIVIDE(base.sum_position_before, base.impressions_before) + 1 AS position_before
+  FROM brand AS b
+  CROSS JOIN UNNEST([
+    STRUCT('last_year' AS base_period, b.impressions_last_year AS impressions_before, b.clicks_last_year AS clicks_before, b.sum_position_last_year AS sum_position_before),
+    STRUCT('previous', b.impressions_previous, b.clicks_previous, b.sum_position_previous)
+  ]) AS base
+  WHERE b.impressions_now >= ${cc.min_impressions}
+    AND base.impressions_before >= ${cc.min_impressions}
+),
+
+flagged AS (
+  SELECT
+    *,
+    position_now - position_before AS position_change,
+    SAFE_DIVIDE(ctr_now, ctr_before) - 1 AS relative_ctr_change,
+    COALESCE(
+      position_now - position_before <= ${cc.max_position_change}
+      AND impressions_now >= 0.8 * impressions_before
+      AND ctr_before > 0
+      AND SAFE_DIVIDE(ctr_now, ctr_before) - 1 <= -${cc.min_relative_ctr_drop},
+      FALSE
+    ) AS is_ctr_collapse,
+    GREATEST(0, impressions_now * (ctr_before - ctr_now)) AS clicks_lost_if_same_ctr
+  FROM compared
+)
+
+SELECT
+  page_path,
+  query,
+  query_intent,
+  base_period,
+  impressions_now,
+  impressions_before,
+  clicks_now,
+  clicks_before,
+  ctr_now,
+  ctr_before,
+  relative_ctr_change,
+  position_now,
+  position_before,
+  position_change,
+  is_ctr_collapse,
+  IF(is_ctr_collapse, clicks_lost_if_same_ctr, 0) AS clicks_lost,
+  SUM(IF(is_ctr_collapse, clicks_lost_if_same_ctr, 0)) OVER (PARTITION BY page_path, base_period) AS page_clicks_lost,
+  COUNTIF(is_ctr_collapse) OVER (PARTITION BY page_path, base_period) AS page_collapsed_queries,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM flagged

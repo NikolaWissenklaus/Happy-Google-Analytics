@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_cohort_roas_by_campaign",
+  description: "The ROAS of the PEOPLE a campaign brought, not of the sessions it closed: users acquired per month by their first campaign (dim_users), the revenue they generated up to day 0, 7, 30, 60, 90 and 180 after the first visit (any channel, any device of the stitched user), the cost of the campaign in that month, ROAS D7 / D30 / D90 / D180, CAC and the payback day (first day the cumulative gross margin covers the cost). The campaign with ROAS 0.8 on day 0 and 3.5 on day 180 is the one to keep; horizons the cohort did not live yet are NULL",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing", level: "mid" }
+  },
+  tags: ["marts", "marketing", "daily", "insights", "costs", "retention"],
+  columns: {
+    acquisition_month: "Month of the first visit of the users",
+    campaign: "First campaign of the users (lower case), the cost is matched by this name and month",
+    users_acquired: "New stitched users of the campaign in the month",
+    revenue_d30: "Revenue of these users within 30 days of their first visit (NULL while the cohort is younger). Same for the other revenue_dN",
+    roas_d30: "revenue_d30 / cost of the campaign in the acquisition month. Same for the other roas_dN",
+    payback_day: "First day after acquisition when cumulative revenue x assumed_gross_margin >= cost (NULL = not yet)",
+    new_customers_d30: "Users of the cohort that bought within 30 days"
+  }
+}
+
+js {
+  const cr = cfg_insights.cohort_roas;
+  const maxH = Math.max(...cr.horizons_days);
+  const margin = cfg_project.assumed_gross_margin;
+}
+
+WITH
+acquired AS (
+  SELECT
+    user_key,
+    first_seen_date,
+    DATE_TRUNC(first_seen_date, MONTH) AS acquisition_month,
+    LOWER(COALESCE(first_campaign, '(not set)')) AS campaign,
+    CONCAT(COALESCE(first_source, '(none)'), ' / ', COALESCE(first_medium, '(none)')) AS source_medium,
+    COALESCE(first_channel, '(not set)') AS channel
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_SUB(DATE_TRUNC(${helpers.today()}, MONTH), INTERVAL ${cr.months - 1} MONTH)
+    AND first_seen_date < ${helpers.today()}
+),
+
+cohorts AS (
+  SELECT
+    acquisition_month,
+    campaign,
+    ARRAY_AGG(DISTINCT source_medium ORDER BY source_medium LIMIT 3) AS source_mediums,
+    APPROX_TOP_COUNT(channel, 1)[OFFSET(0)].value AS main_channel,
+    COUNT(*) AS users_acquired,
+    DATE_DIFF(${helpers.today()}, LAST_DAY(acquisition_month, MONTH), DAY) AS days_since_month_end
+  FROM acquired
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${cr.min_users}
+),
+
+revenue_by_day AS (
+  SELECT
+    a.acquisition_month,
+    a.campaign,
+    DATE_DIFF(t.transaction_date, a.first_seen_date, DAY) AS day_n,
+    SUM(t.revenue) AS revenue,
+    COUNT(DISTINCT t.user_key) AS buyers
+  FROM acquired AS a
+  JOIN ${ref("fct_transactions")} AS t USING (user_key)
+  WHERE t.is_valid_for_revenue
+    AND t.transaction_date >= a.first_seen_date
+    AND t.transaction_date <= DATE_ADD(a.first_seen_date, INTERVAL ${maxH} DAY)
+  GROUP BY 1, 2, 3
+),
+
+first_purchase_day AS (
+  SELECT a.acquisition_month, a.campaign, a.user_key, MIN(DATE_DIFF(t.transaction_date, a.first_seen_date, DAY)) AS day_n
+  FROM acquired AS a
+  JOIN ${ref("fct_transactions")} AS t USING (user_key)
+  WHERE t.is_valid_for_revenue
+    AND t.transaction_date >= a.first_seen_date
+    AND t.transaction_date <= DATE_ADD(a.first_seen_date, INTERVAL ${maxH} DAY)
+  GROUP BY 1, 2, 3
+),
+
+costs AS (
+  SELECT DATE_TRUNC(metric_date, MONTH) AS acquisition_month, LOWER(campaign) AS campaign, SUM(cost) AS cost
+  FROM ${ref("mkt_paid_media_performance")}
+  WHERE metric_date >= DATE_SUB(DATE_TRUNC(${helpers.today()}, MONTH), INTERVAL ${cr.months - 1} MONTH)
+  GROUP BY 1, 2
+),
+
+horizons AS (
+  SELECT
+    c.acquisition_month,
+    c.campaign,
+    ${cr.horizons_days.map(h => `SUM(IF(r.day_n <= ${h}, r.revenue, 0)) AS revenue_to_d${h}`).join(",\n    ")}
+  FROM cohorts AS c
+  LEFT JOIN revenue_by_day AS r USING (acquisition_month, campaign)
+  GROUP BY 1, 2
+),
+
+new_customers AS (
+  SELECT acquisition_month, campaign, COUNTIF(day_n <= 30) AS new_customers_d30, COUNT(*) AS new_customers_so_far
+  FROM first_purchase_day
+  GROUP BY 1, 2
+),
+
+cumulative AS (
+  SELECT
+    acquisition_month,
+    campaign,
+    day_n,
+    SUM(revenue) OVER (PARTITION BY acquisition_month, campaign ORDER BY day_n) AS cumulative_revenue
+  FROM revenue_by_day
+),
+
+payback AS (
+  SELECT c.acquisition_month, c.campaign, MIN(c.day_n) AS payback_day
+  FROM cumulative AS c
+  JOIN costs AS co USING (acquisition_month, campaign)
+  WHERE co.cost > 0
+    AND c.cumulative_revenue * ${margin} >= co.cost
+  GROUP BY 1, 2
+)
+
+SELECT
+  c.acquisition_month,
+  c.campaign,
+  c.main_channel,
+  c.source_mediums,
+  c.users_acquired,
+  COALESCE(co.cost, 0) AS cost,
+  SAFE_DIVIDE(co.cost, c.users_acquired) AS cost_per_acquired_user,
+  n.new_customers_d30,
+  n.new_customers_so_far,
+  SAFE_DIVIDE(co.cost, n.new_customers_so_far) AS cost_per_new_customer,
+  c.days_since_month_end,
+  ${cr.horizons_days.map(h => `IF(c.days_since_month_end > ${h}, h.revenue_to_d${h}, NULL) AS revenue_d${h}`).join(",\n  ")},
+  ${cr.horizons_days.map(h => `IF(c.days_since_month_end > ${h}, SAFE_DIVIDE(h.revenue_to_d${h}, NULLIF(co.cost, 0)), NULL) AS roas_d${h}`).join(",\n  ")},
+  ${cr.horizons_days.map(h => `IF(c.days_since_month_end > ${h}, SAFE_DIVIDE(h.revenue_to_d${h}, c.users_acquired), NULL) AS revenue_per_user_d${h}`).join(",\n  ")},
+  p.payback_day,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM cohorts AS c
+LEFT JOIN horizons AS h USING (acquisition_month, campaign)
+LEFT JOIN costs AS co USING (acquisition_month, campaign)
+LEFT JOIN new_customers AS n USING (acquisition_month, campaign)
+LEFT JOIN payback AS p USING (acquisition_month, campaign)

@@ -1,0 +1,117 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_second_purchase_cox",
+  description: "What in the FIRST order makes the customer come back sooner (or later)? Cox proportional hazards regression of the time from the first to the second purchase, fitted inside BigQuery (ga4_udf.fit_cox_ph), with every covariate adjusted for the others: coupon, PIX / boleto, paid media, CRM channel, mobile, ticket, more than one unit, logged in, bought on the first day. Customers that did not come back yet count as censored (that is what survival analysis is for). Hazard ratio 0.8 for 'used a coupon' = coupon customers come back 20% slower than similar customers without it. Covariates in cfg_insights.cox",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics", level: "specialist" }
+  },
+  tags: ["data_science", "statistics", "weekly", "insights", "retention"],
+  columns: {
+    covariate: "Name of the covariate (cfg_insights.cox.covariates)",
+    hazard_ratio: "exp(coef): above 1 = comes back sooner, below 1 = later, per unit of the covariate (0 -> 1 for the bool ones)",
+    hr_low: "95% interval of the hazard ratio",
+    p_value: "Wald test of the coefficient",
+    mean_value: "Average of the covariate in the sample (share of customers for the bool ones)",
+    concordance: "Harrell's C of the model: 0.5 = random, 0.7 = good for behaviour data",
+    customers_in_population: "First time customers of the window before the sample",
+    interpretation: "The hazard ratio in words"
+  }
+}
+
+js {
+  const cx = cfg_insights.cox;
+  const covExpr = c => c.type === "bool" ? `IF(COALESCE(${c.sql}, FALSE), 1.0, 0.0)` : `COALESCE(CAST(${c.sql} AS FLOAT64), 0.0)`;
+  const typeCase = "CASE r.covariate\n" + cx.covariates.map(c => `      WHEN ${helpers.sqlString(c.name)} THEN ${helpers.sqlString(c.type)}`).join("\n") + "\n      ELSE 'number'\n    END";
+}
+
+WITH
+first_orders AS (
+  SELECT t.*, u.days_to_first_purchase
+  FROM ${ref("fct_transactions")} AS t
+  LEFT JOIN ${ref("dim_users")} AS u USING (user_key)
+  WHERE t.is_valid_for_revenue
+    AND t.order_number = 1
+    AND t.transaction_date >= ${helpers.daysAgo(cx.first_order_window_days)}
+    AND t.transaction_date < ${helpers.today()}
+),
+
+second_orders AS (
+  SELECT user_key, MIN(transaction_ts) AS second_ts
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND order_number >= 2
+  GROUP BY 1
+),
+
+subjects AS (
+  SELECT
+    user_key,
+    -- days until the second purchase, censored at today or at the end of the follow up
+    LEAST(
+      COALESCE(TIMESTAMP_DIFF(second_ts, transaction_ts, MINUTE), TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), transaction_ts, MINUTE)) / 1440,
+      ${cx.max_followup_days}
+    ) AS duration_days,
+    second_ts IS NOT NULL AND TIMESTAMP_DIFF(second_ts, transaction_ts, MINUTE) / 1440 <= ${cx.max_followup_days} AS came_back,
+    [
+      ${cx.covariates.map(covExpr).join(",\n      ")}
+    ] AS covariates
+  FROM first_orders
+  LEFT JOIN second_orders USING (user_key)
+),
+
+population AS (
+  SELECT COUNT(*) AS customers_in_population, COUNTIF(came_back) AS came_back_in_population
+  FROM subjects
+),
+
+-- deterministic sample: the UDF holds everybody in memory
+sampled AS (
+  SELECT *
+  FROM subjects
+  ORDER BY FARM_FINGERPRINT(user_key)
+  LIMIT ${cx.max_subjects}
+),
+
+fit AS (
+  SELECT
+    ${ref("fit_cox_ph")}(
+      ARRAY_AGG(STRUCT(CAST(duration_days AS FLOAT64) AS duration, came_back AS event, covariates)),
+      [${cx.covariates.map(c => helpers.sqlString(c.name)).join(", ")}],
+      ${cx.l2},
+      ${cx.iterations}
+    ) AS results
+  FROM sampled
+)
+
+SELECT
+  r.covariate,
+  ${typeCase} AS covariate_type,
+  r.coef,
+  r.hazard_ratio,
+  r.se,
+  r.z,
+  r.p_value,
+  r.hr_low,
+  r.hr_high,
+  r.mean_value,
+  r.subjects,
+  r.events,
+  r.log_likelihood,
+  r.concordance,
+  r.converged,
+  p.customers_in_population,
+  p.came_back_in_population,
+  CASE
+    WHEN r.hazard_ratio IS NULL THEN 'constant in the sample, not estimated'
+    WHEN r.p_value >= 0.05 THEN 'no clear effect (p >= 0.05)'
+    WHEN r.hazard_ratio > 1 THEN CONCAT('comes back ', FORMAT('%.0f', (r.hazard_ratio - 1) * 100), '% sooner', IF(${typeCase} = 'bool', '', ' per unit'), ', adjusted for the other covariates')
+    ELSE CONCAT('comes back ', FORMAT('%.0f', (1 - r.hazard_ratio) * 100), '% later', IF(${typeCase} = 'bool', '', ' per unit'), ', adjusted for the other covariates')
+  END AS interpretation,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fit AS f
+CROSS JOIN UNNEST(f.results) AS r
+CROSS JOIN population AS p

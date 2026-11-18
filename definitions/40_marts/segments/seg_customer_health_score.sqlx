@@ -1,0 +1,181 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_customer_health_score",
+  description: "A 0-100 health score per customer, the way customer success teams do it in SaaS, with only what GA4 knows: recency against the customer's OWN buying rhythm (late for a monthly buyer is not late for a yearly one), the trend of orders (last 180 days vs the 180 before), the trend of visits (last 30 days vs the 90 before), friction (refunds, support and returns pages right after the last order) and discount dependence. Band (healthy / watch / at_risk / critical), the main issue to act on and a priority that weighs the value of the customer. Weights and bands in cfg_insights.health",
+  bigquery: {
+    clusterBy: ["health_band"],
+    labels: { layer: "marts", domain: "segments", level: "mid" }
+  },
+  tags: ["marts", "segments", "daily", "insights", "retention", "crm"],
+  columns: Object.assign(docs.pick("user_key"), {
+    expected_gap_days: "Usual days between orders of the customer (site median of the 2nd purchase for one time buyers)",
+    recency_score: "100 while inside the own rhythm, then exp(-(days late / usual gap))",
+    frequency_score: "50 + 50 x (orders last 180 - previous 180) / (sum)",
+    engagement_score: "50 + 50 x (sessions last 30 - average 30 days of the 90 before) / (sum). 20 when silent in the 120 days",
+    friction_score: "100 - 40 refund - 30 support pages - 30 returns pages after the last order",
+    discount_score: "100 x (1 - share of orders with coupon)",
+    health_score: "Weighted sum of the components (cfg_insights.health.weights)",
+    health_band: "healthy | watch | at_risk | critical",
+    main_issue: "The component that costs the most points: recency | frequency | engagement | friction | discount",
+    priority: "(100 - health) x (0.5 + value percentile): who to look at first"
+  })
+}
+
+js {
+  const hc = cfg_insights.health;
+  const w = hc.weights;
+  const pp = cfg_labs.post_purchase;
+  const ordersWindow = Math.max(360, hc.friction_window_days);
+}
+
+WITH
+customers AS (
+  SELECT
+    user_key,
+    user_id,
+    transactions,
+    lifetime_revenue,
+    first_purchase_date,
+    last_purchase_date,
+    days_since_last_purchase,
+    avg_days_between_orders,
+    COALESCE(coupon_orders, 0) AS coupon_orders,
+    COALESCE(is_repeat_customer, FALSE) AS is_repeat_customer
+  FROM ${ref("dim_users")}
+  WHERE is_customer
+    AND last_purchase_date IS NOT NULL
+),
+
+site_second_gap AS (
+  SELECT APPROX_QUANTILES(days_since_previous_order, 2 IGNORE NULLS)[OFFSET(1)] AS median_gap
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND order_number = 2
+    AND transaction_date >= ${helpers.daysAgo(730)}
+),
+
+orders AS (
+  SELECT
+    user_key,
+    COUNTIF(transaction_date >= ${helpers.daysAgo(180)}) AS orders_last_180,
+    COUNTIF(transaction_date >= ${helpers.daysAgo(360)} AND transaction_date < ${helpers.daysAgo(180)}) AS orders_previous_180,
+    LOGICAL_OR(COALESCE(refunded_value, 0) > 0 AND transaction_date >= ${helpers.daysAgo(hc.friction_window_days)}) AS had_refund,
+    MAX(transaction_ts) AS last_order_ts
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.daysAgo(ordersWindow)}
+  GROUP BY 1
+),
+
+activity AS (
+  SELECT
+    user_key,
+    COUNTIF(session_date >= ${helpers.daysAgo(30)}) AS sessions_last_30,
+    COUNTIF(session_date < ${helpers.daysAgo(30)}) AS sessions_previous_90
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(120)}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+-- support and returns pages in the 30 days after the last order: the experience did not end well
+service AS (
+  SELECT
+    pv.user_key,
+    COUNTIF(REGEXP_CONTAINS(COALESCE(pv.page_path, ''), r'${pp.support_pattern}')) AS support_views,
+    COUNTIF(REGEXP_CONTAINS(COALESCE(pv.page_path, ''), r'${pp.returns_pattern}')) AS returns_views
+  FROM ${ref("fct_page_views")} AS pv
+  JOIN orders AS o ON o.user_key = pv.user_key
+  WHERE pv.event_date >= ${helpers.daysAgo(hc.friction_window_days)}
+    AND pv.event_ts BETWEEN o.last_order_ts AND TIMESTAMP_ADD(o.last_order_ts, INTERVAL 30 DAY)
+  GROUP BY 1
+),
+
+joined AS (
+  SELECT
+    c.*,
+    COALESCE(IF(c.is_repeat_customer, c.avg_days_between_orders, NULL), g.median_gap, 60) AS expected_gap_days,
+    COALESCE(o.orders_last_180, 0) AS orders_last_180,
+    COALESCE(o.orders_previous_180, 0) AS orders_previous_180,
+    COALESCE(o.had_refund, FALSE) AS had_refund,
+    COALESCE(a.sessions_last_30, 0) AS sessions_last_30,
+    COALESCE(a.sessions_previous_90, 0) AS sessions_previous_90,
+    COALESCE(sv.support_views, 0) AS support_views,
+    COALESCE(sv.returns_views, 0) AS returns_views
+  FROM customers AS c
+  CROSS JOIN site_second_gap AS g
+  LEFT JOIN orders AS o USING (user_key)
+  LEFT JOIN activity AS a USING (user_key)
+  LEFT JOIN service AS sv USING (user_key)
+),
+
+components AS (
+  SELECT
+    *,
+    100 * EXP(-GREATEST(0, SAFE_DIVIDE(days_since_last_purchase, GREATEST(expected_gap_days, 1)) - 1)) AS recency_score,
+    IF(orders_last_180 + orders_previous_180 = 0, 50, 50 + 50 * (orders_last_180 - orders_previous_180) / (orders_last_180 + orders_previous_180)) AS frequency_score,
+    IF(
+      sessions_last_30 + sessions_previous_90 = 0,
+      20,
+      50 + 50 * (sessions_last_30 - sessions_previous_90 / 3) / (sessions_last_30 + sessions_previous_90 / 3)
+    ) AS engagement_score,
+    100 - IF(had_refund, 40, 0) - IF(support_views > 0, 30, 0) - IF(returns_views > 0, 30, 0) AS friction_score,
+    100 * (1 - LEAST(1, SAFE_DIVIDE(coupon_orders, GREATEST(transactions, 1)))) AS discount_score
+  FROM joined
+),
+
+scored AS (
+  SELECT
+    *,
+    ${w.recency} * recency_score + ${w.frequency} * frequency_score + ${w.engagement} * engagement_score
+      + ${w.friction} * friction_score + ${w.discount} * discount_score AS health_score,
+    PERCENT_RANK() OVER (ORDER BY lifetime_revenue) AS value_percentile
+  FROM components
+)
+
+SELECT
+  user_key,
+  user_id,
+  transactions,
+  lifetime_revenue,
+  first_purchase_date,
+  last_purchase_date,
+  days_since_last_purchase,
+  expected_gap_days,
+  orders_last_180,
+  orders_previous_180,
+  sessions_last_30,
+  sessions_previous_90,
+  had_refund,
+  support_views,
+  returns_views,
+  recency_score,
+  frequency_score,
+  engagement_score,
+  friction_score,
+  discount_score,
+  health_score,
+  CASE
+    WHEN health_score >= ${hc.bands.healthy} THEN 'healthy'
+    WHEN health_score >= ${hc.bands.watch} THEN 'watch'
+    WHEN health_score >= ${hc.bands.at_risk} THEN 'at_risk'
+    ELSE 'critical'
+  END AS health_band,
+  CASE GREATEST(
+      ${w.recency} * (100 - recency_score), ${w.frequency} * (100 - frequency_score), ${w.engagement} * (100 - engagement_score),
+      ${w.friction} * (100 - friction_score), ${w.discount} * (100 - discount_score))
+    WHEN ${w.recency} * (100 - recency_score) THEN 'recency'
+    WHEN ${w.frequency} * (100 - frequency_score) THEN 'frequency'
+    WHEN ${w.engagement} * (100 - engagement_score) THEN 'engagement'
+    WHEN ${w.friction} * (100 - friction_score) THEN 'friction'
+    ELSE 'discount'
+  END AS main_issue,
+  value_percentile,
+  (100 - health_score) * (0.5 + value_percentile) AS priority,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored

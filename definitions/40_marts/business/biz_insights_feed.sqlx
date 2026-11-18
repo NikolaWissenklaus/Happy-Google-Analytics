@@ -1,0 +1,318 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_insights_feed",
+  description: "The monday meeting in one table: the insights models turned into sentences, each one with who should read it, the level of the analysis behind it, the money involved and a priority. A KPI that changed level (and what was going on), the funnel step that broke last week, yesterday outside the forecast band, the chance of hitting the month target, the campaign budget that could be moved, the launch that spreads by word of mouth, valuable customers turning at risk, the GA4 export about to hit its limit, pages that are read by few and sell a lot... Ready for Slack, e-mail or the first page of a dashboard (thresholds in cfg_insights.insights_feed)",
+  bigquery: {
+    labels: { layer: "marts", domain: "business", level: "junior" }
+  },
+  tags: ["marts", "business", "daily", "insights", "alerts"],
+  columns: {
+    insight_date: "Day the insight refers to (or the day it was generated)",
+    area: "business | marketing | cro | product | ecommerce | crm | data",
+    audience: "Who should read it first",
+    level: "Level of the analysis behind it: junior | mid | senior | specialist",
+    headline: "One sentence, ready to paste",
+    detail: "The numbers behind the sentence and what to check",
+    impact_value: "Money involved (property currency) when it can be estimated",
+    priority_score: "0-100, the order to read the feed",
+    source_table: "Table to open for the details"
+  }
+}
+
+js {
+  const f = cfg_insights.insights_feed;
+}
+
+WITH
+regimes AS (
+  SELECT
+    start_date AS insight_date,
+    'business' AS area,
+    'board, analytics' AS audience,
+    'specialist' AS level,
+    CONCAT(kpi, ' changed level on ', CAST(start_date AS STRING), ': ', FORMAT('%.4g', mean_value), ' now vs ', FORMAT('%.4g', previous_mean_value),
+      ' before (', FORMAT('%+.0f', 100 * relative_change_vs_previous), '%)') AS headline,
+    IF(ARRAY_LENGTH(possible_causes) > 0,
+      CONCAT('Around that day: ', ARRAY_TO_STRING(possible_causes, '; '), '. It is a new level, not a one day spike.'),
+      'Nothing known around that day (no intervention, promotion or special day): check deploys, prices, stock and campaigns.') AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    50 + 50 * LEAST(1, ABS(relative_change_vs_previous) / 0.5) AS priority_score,
+    'ds_kpi_regimes' AS source_table
+  FROM ${ref("ds_kpi_regimes")}
+  WHERE is_new_regime
+    AND is_material
+),
+
+funnel AS (
+  SELECT
+    week_start AS insight_date,
+    'cro' AS area,
+    'CRO, product' AS audience,
+    'senior' AS level,
+    CONCAT('Funnel step ', step_name, IF(segment_type = 'all', '', CONCAT(' (', segment_type, ' = ', segment_value, ')')),
+      IF(verdict = 'broke', ' got worse', ' got better'), ' last week: ', FORMAT('%.1f', 100 * rate), '% vs ', FORMAT('%.1f', 100 * baseline_rate), '% in the weeks before') AS headline,
+    CONCAT('False discovery adjusted q = ', FORMAT('%.3f', q_value), '. About ', FORMAT('%.0f', ABS(revenue_impact)), IF(revenue_impact < 0, ' lost', ' gained'), ' in the week.') AS detail,
+    revenue_impact AS impact_value,
+    IF(verdict = 'broke', 60, 40) + 30 * LEAST(1, ABS(revenue_impact) / ${10 * f.min_revenue_impact}) AS priority_score,
+    'cro_funnel_weekly_step_changes' AS source_table
+  FROM ${ref("cro_funnel_weekly_step_changes")}
+  WHERE week_start = (SELECT MAX(week_start) FROM ${ref("cro_funnel_weekly_step_changes")})
+    AND verdict IN ('broke', 'improved')
+    AND ABS(revenue_impact) >= ${f.min_revenue_impact}
+),
+
+forecast AS (
+  SELECT
+    metric_date AS insight_date,
+    'business' AS area,
+    'analytics, business' AS audience,
+    'mid' AS level,
+    CONCAT(kpi, ' on ', CAST(metric_date AS STRING), ' was ', FORMAT('%.4g', actual), ', outside the 95% band of the forecast (expected ', FORMAT('%.4g', forecast_value), ')') AS headline,
+    CONCAT('Holt-Winters backtest error ', FORMAT('%.1f', 100 * COALESCE(holdout_mape, 0)), '%. Check anom_alert_feed for the root cause.') AS detail,
+    IF(kpi = 'revenue', actual - forecast_value, NULL) AS impact_value,
+    70 AS priority_score,
+    'ds_kpi_forecast_holt_winters' AS source_table
+  FROM ${ref("ds_kpi_forecast_holt_winters")}
+  WHERE row_type = 'actual'
+    AND is_outside_95
+    AND metric_date = (SELECT MAX(metric_date) FROM ${ref("ds_kpi_forecast_holt_winters")} WHERE row_type = 'actual')
+),
+
+targets AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'business' AS area,
+    'board, sales' AS audience,
+    'junior' AS level,
+    CONCAT(FORMAT('%.0f', 100 * probability_of_hitting_target), '% chance of hitting the ', kpi, ' target of the month') AS headline,
+    CONCAT('Projected ', FORMAT('%.4g', projected_month_end), ' vs target ', FORMAT('%.4g', target), '. Needs ', FORMAT('%.4g', needed_per_remaining_day),
+      ' a day for ', CAST(remaining_days AS STRING), ' days, a usual day brings ', FORMAT('%.4g', expected_per_remaining_day), '.') AS detail,
+    IF(kpi = 'revenue', projected_month_end - target, NULL) AS impact_value,
+    IF(probability_of_hitting_target < ${f.target_probability_low}, 90 - 30 * probability_of_hitting_target, 35) AS priority_score,
+    'biz_target_hit_probability' AS source_table
+  FROM ${ref("biz_target_hit_probability")}
+  WHERE probability_of_hitting_target < ${f.target_probability_low}
+    OR probability_of_hitting_target > ${f.target_probability_high}
+),
+
+kpi_tree AS (
+  SELECT
+    week_start AS insight_date,
+    'business' AS area,
+    'board, finance' AS audience,
+    'mid' AS level,
+    CONCAT('Revenue ', FORMAT('%+.1f', 100 * revenue_change_pct), '% ', IF(comparison = 'yoy', 'vs the same week last year', 'vs the week before'),
+      ', mostly because of ', REPLACE(biggest_driver, '_', ' ')) AS headline,
+    CONCAT('Users ', FORMAT('%+.0f', effect_users), ', frequency ', FORMAT('%+.0f', effect_frequency), ', conversion ', FORMAT('%+.0f', effect_conversion),
+      ', items per order ', FORMAT('%+.0f', effect_items_per_order), ', price per item ', FORMAT('%+.0f', effect_price_per_item), ' (they add up to the change).') AS detail,
+    revenue_change AS impact_value,
+    IF(comparison = 'yoy', 45, 35) AS priority_score,
+    'biz_kpi_tree_weekly' AS source_table
+  FROM ${ref("biz_kpi_tree_weekly")}
+  WHERE segment = '(all)'
+    AND is_decomposable
+    AND week_start = (SELECT MAX(week_start) FROM ${ref("biz_kpi_tree_weekly")})
+),
+
+budget AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'marketing' AS area,
+    'media, marketing' AS audience,
+    'senior' AS level,
+    CONCAT('Moving budget between ', CAST(ANY_VALUE(campaigns_in_the_split) AS STRING), ' campaigns could add about ', FORMAT('%.0f', ANY_VALUE(total_expected_daily_revenue_change)),
+      ' a day with the same spend') AS headline,
+    CONCAT('More money: ', ARRAY_AGG(campaign ORDER BY daily_spend_change DESC LIMIT 1)[OFFSET(0)],
+      '. Less money: ', ARRAY_AGG(campaign ORDER BY daily_spend_change LIMIT 1)[OFFSET(0)],
+      '. Test it for 2 weeks before trusting it: the curves are observational.') AS detail,
+    ANY_VALUE(total_expected_daily_revenue_change) * 30 AS impact_value,
+    50 + 30 * LEAST(1, ANY_VALUE(total_expected_daily_revenue_change) * 30 / ${10 * f.min_revenue_impact}) AS priority_score,
+    'mkt_budget_reallocation' AS source_table
+  FROM ${ref("mkt_budget_reallocation")}
+  HAVING COUNT(*) > 0
+    AND ANY_VALUE(total_expected_daily_revenue_change) * 30 >= ${f.min_revenue_impact}
+),
+
+curves AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'marketing' AS area,
+    'media' AS audience,
+    'senior' AS level,
+    CONCAT(campaign, ' (', platform, ') has a marginal ROAS of ', FORMAT('%.2f', marginal_roas_at_current_spend), ' at ', FORMAT('%.0f', avg_daily_spend),
+      ' a day, below the target of ', FORMAT('%.2f', target_marginal_roas)) AS headline,
+    CONCAT('Average ROAS ', FORMAT('%.2f', average_roas), ' hides it: the last reais of the day bring much less. Efficient daily spend around ', FORMAT('%.0f', spend_at_target_marginal_roas), '.') AS detail,
+    (avg_daily_spend - spend_at_target_marginal_roas) * 30 AS impact_value,
+    45 AS priority_score,
+    'mkt_spend_response_curves' AS source_table
+  FROM ${ref("mkt_spend_response_curves")}
+  WHERE recommendation = 'cut'
+    AND campaign != '(all campaigns)'
+),
+
+launches AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'ecommerce' AS area,
+    'merchandising, marketing' AS audience,
+    'specialist' AS level,
+    CONCAT(COALESCE(item_name, item_id), ' spreads by word of mouth (q / p = ', FORMAT('%.0f', q_over_p), '), peak of new ', metric, ' expected around ', CAST(peak_date AS STRING)) AS headline,
+    CONCAT('About ', FORMAT('%.0f', next_weeks_adopters_total), ' new ', metric, ' in the next weeks, ', FORMAT('%.0f', 100 * share_of_market_reached),
+      '% of its market reached. Keep stock and ask for reviews now.') AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    40 AS priority_score,
+    'ecom_launch_bass_diffusion' AS source_table
+  FROM ${ref("ecom_launch_bass_diffusion")}
+  WHERE phase = 'takeoff'
+    AND diffusion_type = 'word_of_mouth'
+),
+
+health AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'crm' AS area,
+    'CRM, customer service' AS audience,
+    'mid' AS level,
+    CONCAT(CAST(COUNT(*) AS STRING), ' high value customers are at risk or critical') AS headline,
+    CONCAT('They spent ', FORMAT('%.0f', SUM(lifetime_revenue)), ' in their lifetime. Most common issue: ', APPROX_TOP_COUNT(main_issue, 1)[OFFSET(0)].value, '.') AS detail,
+    SUM(lifetime_revenue) AS impact_value,
+    60 AS priority_score,
+    'seg_customer_health_score' AS source_table
+  FROM ${ref("seg_customer_health_score")}
+  WHERE health_band IN ('at_risk', 'critical')
+    AND value_percentile >= 0.8
+  HAVING COUNT(*) > 0
+),
+
+export_limit AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'data' AS area,
+    'data engineering, analytics' AS audience,
+    'mid' AS level,
+    CONCAT('GA4 export: ', REPLACE(ANY_VALUE(status), '_', ' '), ', ', FORMAT('%.0f', ANY_VALUE(avg_events_last_7_days)), ' events a day vs the limit of ', FORMAT('%.0f', ANY_VALUE(daily_event_limit))) AS headline,
+    CONCAT('Projected limit date: ', COALESCE(CAST(ANY_VALUE(projected_limit_date) AS STRING), 'already over'), '. Biggest events nobody asked for: ',
+      COALESCE(ARRAY_TO_STRING(ARRAY_AGG(IF(is_drop_candidate, event_name, NULL) IGNORE NULLS ORDER BY events_per_day DESC LIMIT 3), ', '), 'none'), '.') AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    IF(ANY_VALUE(status) = 'over_limit', 100, 85) AS priority_score,
+    'dq_export_limit_headroom' AS source_table
+  FROM ${ref("dq_export_limit_headroom")}
+  HAVING ANY_VALUE(status) IN ('over_limit', 'crossing_soon')
+),
+
+drivers AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'business' AS area,
+    'analytics' AS audience,
+    'senior' AS level,
+    CONCAT('What explains the purchase the most is the ', REPLACE(dimension, '_', ' '), ' (it removes ', FORMAT('%.1f', 100 * ANY_VALUE(theils_u)), '% of the uncertainty)') AS headline,
+    CONCAT('Best value: ', ARRAY_AGG(value ORDER BY conversion_wilson_low DESC LIMIT 1)[OFFSET(0)], ' converts ',
+      FORMAT('%.1f', ARRAY_AGG(lift ORDER BY conversion_wilson_low DESC LIMIT 1)[OFFSET(0)]), 'x the site. Segment the dashboards by it.') AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    25 AS priority_score,
+    'ds_conversion_drivers_information' AS source_table
+  FROM ${ref("ds_conversion_drivers_information")}
+  WHERE dimension_kind = 'context'
+    AND dimension_rank = (SELECT MIN(dimension_rank) FROM ${ref("ds_conversion_drivers_information")} WHERE dimension_kind = 'context')
+  GROUP BY dimension
+),
+
+channels AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'marketing' AS area,
+    'marketing, analytics' AS audience,
+    'specialist' AS level,
+    CONCAT(c.channel, ' brings ', FORMAT('%.2f', c.estimate), ' of revenue per session vs ', FORMAT('%.2f', s.estimate), ' of the site, and the bootstrap says it is real') AS headline,
+    CONCAT('95% interval of the difference: ', FORMAT('%.2f', c.diff_vs_site_ci_low), ' to ', FORMAT('%.2f', c.diff_vs_site_ci_high), '.') AS detail,
+    (c.estimate - s.estimate) * c.sessions AS impact_value,
+    30 AS priority_score,
+    'ds_bootstrap_channel_metrics' AS source_table
+  FROM ${ref("ds_bootstrap_channel_metrics")} AS c
+  JOIN ${ref("ds_bootstrap_channel_metrics")} AS s ON s.channel = '(all)' AND s.metric = c.metric
+  WHERE c.metric = 'revenue_per_session'
+    AND c.is_different_from_site
+),
+
+reading AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'product' AS area,
+    'content, UX' AS audience,
+    'specialist' AS level,
+    CONCAT('Only ', FORMAT('%.0f', 100 * readers_share), '% of the visitors read ', page_path, ', and the sessions that read it buy ', FORMAT('%.1f', reader_purchase_lift), 'x more') AS headline,
+    CONCAT('Readers stay ~', FORMAT('%.0f', reader_typical_sec), 's, skimmers ~', FORMAT('%.0f', skimmer_typical_sec), 's. Make the page easier to read above the fold.') AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    30 AS priority_score,
+    'prod_dwell_time_mixture' AS source_table
+  FROM ${ref("prod_dwell_time_mixture")}
+  WHERE has_two_audiences
+    AND readers_share < 0.3
+    AND reader_purchase_lift >= 2
+  QUALIFY ROW_NUMBER() OVER (ORDER BY timed_views DESC) <= 3
+),
+
+features AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'product' AS area,
+    'product' AS audience,
+    'specialist' AS level,
+    CONCAT('Using ', REPLACE(feature, '_', ' '), IF(verdict = 'likely_helps', ' seems to raise', ' seems to lower'), ' the purchase rate by ',
+      FORMAT('%.1f', 100 * ABS(att_purchase_rate)), ' points, after matching similar users') AS headline,
+    CONCAT('The naive difference was ', FORMAT('%+.1f', 100 * naive_diff_purchase_rate), ' points: ', FORMAT('%.1f', 100 * selection_bias_removed),
+      ' of them were just who uses it. Confirm with a holdout before investing.') AS detail,
+    att_revenue_per_user * matched_treated AS impact_value,
+    35 AS priority_score,
+    'ds_feature_impact_cem' AS source_table
+  FROM ${ref("ds_feature_impact_cem")}
+  WHERE verdict IN ('likely_helps', 'likely_hurts')
+),
+
+testing AS (
+  SELECT
+    ${helpers.today()} AS insight_date,
+    'cro' AS area,
+    'CRO' AS audience,
+    'mid' AS level,
+    CONCAT(CAST(COUNTIF(verdict = 'not_testable_use_other_methods') AS STRING), ' of the ', CAST(COUNT(*) AS STRING),
+      ' top landing pages can not detect even a +20% change in 8 weeks of A/B test') AS headline,
+    'Test them grouped by template, test bold changes only, or measure with before / after (lift_interventions) instead.' AS detail,
+    CAST(NULL AS FLOAT64) AS impact_value,
+    20 AS priority_score,
+    'cro_test_capacity_planner' AS source_table
+  FROM ${ref("cro_test_capacity_planner")}
+  WHERE scope = 'landing_page'
+  HAVING COUNTIF(verdict = 'not_testable_use_other_methods') > 0
+),
+
+everything AS (
+  SELECT * FROM regimes
+  UNION ALL SELECT * FROM funnel
+  UNION ALL SELECT * FROM forecast
+  UNION ALL SELECT * FROM targets
+  UNION ALL SELECT * FROM kpi_tree
+  UNION ALL SELECT * FROM budget
+  UNION ALL SELECT * FROM curves
+  UNION ALL SELECT * FROM launches
+  UNION ALL SELECT * FROM health
+  UNION ALL SELECT * FROM export_limit
+  UNION ALL SELECT * FROM drivers
+  UNION ALL SELECT * FROM channels
+  UNION ALL SELECT * FROM reading
+  UNION ALL SELECT * FROM features
+  UNION ALL SELECT * FROM testing
+)
+
+SELECT
+  ROW_NUMBER() OVER (ORDER BY priority_score DESC, ABS(COALESCE(impact_value, 0)) DESC, headline) AS insight_rank,
+  *,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM everything
+WHERE TRUE
+QUALIFY ROW_NUMBER() OVER (ORDER BY priority_score DESC, ABS(COALESCE(impact_value, 0)) DESC, headline) <= ${f.max_rows}

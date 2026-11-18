@@ -1,0 +1,48 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "mde_proportions",
+  description: "Minimum detectable effect, relative: the smallest change of a conversion rate that a test with N units per group can detect (two sided, alpha and power given). mde_proportions(0.02, 20000, 0.05, 0.8) = 0.135 means only changes of 13.5% or more",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "insights"]
+}
+
+-- The inverse of sample_size_proportions. The difference d solves
+--   d = (z(1 - alpha/2) sqrt(2 m (1 - m)) + z(power) sqrt(p (1 - p) + (p + d)(1 - p - d))) / sqrt(n),  m = p + d/2
+-- three fixed point iterations starting from the normal approximation at the baseline (enough to
+-- agree with sample_size_proportions within 1%, tested in tools/tests/test_insights_udfs.js)
+CREATE OR REPLACE FUNCTION ${self()}(baseline_rate FLOAT64, sample_size_per_group FLOAT64, alpha FLOAT64, power FLOAT64) RETURNS FLOAT64 AS ((
+  SELECT
+    IF(
+      baseline_rate IS NULL OR sample_size_per_group IS NULL OR baseline_rate <= 0 OR baseline_rate >= 1 OR sample_size_per_group <= 0,
+      NULL,
+      d3 / p
+    )
+  FROM (
+    SELECT p, (za * SQRT(2 * m2 * (1 - m2)) + zb * SQRT(p * (1 - p) + q2 * (1 - q2))) / SQRT(n) AS d3
+    FROM (
+      SELECT p, n, za, zb, LEAST(p + d2 / 2, 0.999999) AS m2, LEAST(p + d2, 0.999999) AS q2
+      FROM (
+        SELECT p, n, za, zb, (za * SQRT(2 * m1 * (1 - m1)) + zb * SQRT(p * (1 - p) + q1 * (1 - q1))) / SQRT(n) AS d2
+        FROM (
+          SELECT p, n, za, zb, LEAST(p + d1 / 2, 0.999999) AS m1, LEAST(p + d1, 0.999999) AS q1
+          FROM (
+            SELECT p, n, za, zb, (za + zb) * SQRT(2 * p * (1 - p) / n) AS d1
+            FROM (
+              SELECT
+                LEAST(GREATEST(COALESCE(baseline_rate, 0.5), 1e-9), 0.999999) AS p,
+                GREATEST(COALESCE(sample_size_per_group, 1), 1) AS n,
+                ${ref("inverse_normal_cdf")}(1 - COALESCE(alpha, 0.05) / 2) AS za,
+                ${ref("inverse_normal_cdf")}(COALESCE(power, 0.8)) AS zb
+            )
+          )
+        )
+      )
+    )
+  )
+))
+OPTIONS (description = "Relative minimum detectable effect for a two proportions test")

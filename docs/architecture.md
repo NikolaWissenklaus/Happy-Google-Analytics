@@ -11,7 +11,7 @@ How the thing is put together, and why. If you only read one doc, read this one.
             |                                                              |
             v                                                              v
  00_sources   declarations only, nothing is created here
- 01_udfs      47 persistent functions (also for the analysts, not only for the pipeline)
+ 01_udfs      64 persistent functions (also for the analysts, not only for the pipeline)
  02_seeds     reference tables generated from includes/cfg_*.js
             |
  10_staging   stg_ga4__events: dedup, PII masking, export fixes, auto backfill
@@ -85,6 +85,7 @@ every run from the incremental intermediates, so identity and flags are always r
 | `hourly` | if `include_intraday` | realtime view and intraday anomaly checks |
 | `assertions` | after daily | data contract checks, see `definitions/90_assertions` |
 | `lgpd`, `activation`, `ga4_watch`... | | context tags, to run one area alone |
+| `labs`, `frontier`, `attribution_extended`, `insights` | with daily (6 `insights` models are `weekly`) | the advanced tiers: `docs/labs.md`, `docs/frontier.md`, `docs/attribution_extended.md`, `docs/insights.md` |
 
 ## naming
 

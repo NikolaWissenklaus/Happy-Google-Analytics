@@ -1,0 +1,122 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.product,
+  name: "prod_session_distribution_daily",
+  description: "Averages lie: the distribution of the sessions of every day (p10, p25, median, p75, p90, p99) of engagement time, views and events, per device and channel (and '(all)'), next to the mean. When the mean is 2-3x the median a few very long sessions (or tabs left open) are carrying the number, and 'average engagement time went up 20%' may mean nothing. The first table a junior analyst should look at before any 'did the experience change?' discussion",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["device_category", "session_default_channel_group"],
+    labels: { layer: "marts", domain: "product", level: "junior" }
+  },
+  tags: ["marts", "product", "daily", "insights"],
+  columns: Object.assign(docs.pick("session_date", "sessions"), {
+    device_category: "Device of the session, or '(all)'",
+    session_default_channel_group: "GA4 default channel group of the session, or '(all)'",
+    engagement_mean_sec: "Mean engagement time per session (seconds). The number GA4 shows",
+    engagement_p50_sec: "Median engagement time: the typical session",
+    mean_to_median_ratio: "engagement_mean_sec / engagement_p50_sec. Above ~2 the mean is pulled by a few long sessions",
+    zero_engagement_share: "Sessions with 0 seconds of engagement: fast bounces, background tabs, or a consent / tag problem",
+    single_view_share: "Sessions with one view (page or screen)",
+    long_session_share: "Sessions with more than cfg_insights.session_distribution.long_session_minutes of engagement"
+  })
+}
+
+js {
+  const sd = cfg_insights.session_distribution;
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "session_date", watermarks: ref("ops_incremental_watermarks"), upstream: metrics.SESSION_UPSTREAM })}
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_date,
+    COALESCE(device_category, '(not set)') AS device_category,
+    COALESCE(session_default_channel_group, '(not set)') AS session_default_channel_group,
+    is_engaged,
+    is_bounce_ua,
+    has_purchase,
+    COALESCE(engagement_time_sec, 0) AS engagement_sec,
+    COALESCE(page_views, 0) + COALESCE(screen_views, 0) AS views,
+    COALESCE(event_count, 0) AS events,
+    COALESCE(session_duration_sec, 0) AS duration_sec
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= run_from
+    ${helpers.martSessionFilter()}
+),
+
+-- every session counts for its device x channel, its device, its channel and the day total.
+-- percentiles cannot be added up later, so the totals are computed here
+expanded AS (
+  SELECT s.*, g.device_value, g.channel_value
+  FROM sessions AS s
+  CROSS JOIN UNNEST([
+    STRUCT(s.device_category AS device_value, s.session_default_channel_group AS channel_value),
+    STRUCT(s.device_category, '(all)'),
+    STRUCT('(all)', s.session_default_channel_group),
+    STRUCT('(all)', '(all)')
+  ]) AS g
+),
+
+aggregated AS (
+  SELECT
+    session_date,
+    device_value AS device_category,
+    channel_value AS session_default_channel_group,
+    COUNT(*) AS sessions,
+    COUNTIF(is_engaged) AS engaged_sessions,
+    COUNTIF(is_bounce_ua) AS ua_bounces,
+    COUNTIF(has_purchase) AS sessions_with_purchase,
+    AVG(engagement_sec) AS engagement_mean_sec,
+    APPROX_QUANTILES(engagement_sec, 100) AS engagement_q,
+    AVG(views) AS views_mean,
+    APPROX_QUANTILES(views, 100) AS views_q,
+    AVG(events) AS events_mean,
+    APPROX_QUANTILES(events, 100) AS events_q,
+    APPROX_QUANTILES(duration_sec, 100) AS duration_q,
+    COUNTIF(engagement_sec = 0) AS zero_engagement_sessions,
+    COUNTIF(views <= 1) AS single_view_sessions,
+    COUNTIF(engagement_sec > ${sd.long_session_minutes * 60}) AS long_sessions
+  FROM expanded
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  session_date,
+  device_category,
+  session_default_channel_group,
+  sessions,
+  SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+  SAFE_DIVIDE(ua_bounces, sessions) AS ua_bounce_rate,
+  SAFE_DIVIDE(sessions_with_purchase, sessions) AS purchase_session_rate,
+  engagement_mean_sec,
+  engagement_q[OFFSET(10)] AS engagement_p10_sec,
+  engagement_q[OFFSET(25)] AS engagement_p25_sec,
+  engagement_q[OFFSET(50)] AS engagement_p50_sec,
+  engagement_q[OFFSET(75)] AS engagement_p75_sec,
+  engagement_q[OFFSET(90)] AS engagement_p90_sec,
+  engagement_q[OFFSET(99)] AS engagement_p99_sec,
+  SAFE_DIVIDE(engagement_mean_sec, NULLIF(engagement_q[OFFSET(50)], 0)) AS mean_to_median_ratio,
+  views_mean,
+  views_q[OFFSET(50)] AS views_p50,
+  views_q[OFFSET(75)] AS views_p75,
+  views_q[OFFSET(90)] AS views_p90,
+  events_mean,
+  events_q[OFFSET(50)] AS events_p50,
+  events_q[OFFSET(90)] AS events_p90,
+  duration_q[OFFSET(50)] AS duration_p50_sec,
+  duration_q[OFFSET(90)] AS duration_p90_sec,
+  SAFE_DIVIDE(zero_engagement_sessions, sessions) AS zero_engagement_share,
+  SAFE_DIVIDE(single_view_sessions, sessions) AS single_view_share,
+  SAFE_DIVIDE(long_sessions, sessions) AS long_session_share,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregated
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

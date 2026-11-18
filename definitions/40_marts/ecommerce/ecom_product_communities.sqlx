@@ -1,0 +1,159 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_product_communities",
+  description: "The departments your customers draw, next to the ones the merchandising team drew. Products viewed in the same session pull each other together (co-view graph of the last 90 days, only pairs seen together more than chance), and the Louvain method (ga4_udf.louvain_communities) finds the groups. Per product: its community, the size and the top products of the community, the category that dominates it and how pure it is, and a flag when the product lives in a community of another category ('misplaced': the customers shop it with something else, check the menu, the filters and the cross sell). Modularity above ~0.3 = real structure",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce", level: "senior" }
+  },
+  tags: ["marts", "ecommerce", "weekly", "insights", "merchandising"],
+  columns: {
+    community: "Item id of the strongest product of the community (its name is in community_name)",
+    community_size: "Products in the community",
+    top_items_of_community: "The 5 most viewed products of the community",
+    dominant_category: "Most common item_category among the products of the community",
+    community_purity: "Share of the products of the community in the dominant category",
+    is_misplaced: "item_category differs from the dominant category of a community at least communities.misplaced_purity pure",
+    modularity: "Modularity Q of the whole partition (same value in every row)"
+  }
+}
+
+js {
+  const cm = cfg_insights.communities;
+}
+
+WITH
+views AS (
+  SELECT DISTINCT session_key, item_id
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(cm.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+    AND session_key IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+top_items AS (
+  SELECT item_id, COUNT(*) AS view_sessions
+  FROM views
+  GROUP BY 1
+  ORDER BY view_sessions DESC
+  LIMIT ${cm.max_items}
+),
+
+-- sessions that viewed dozens of products (bots that slipped, compulsive browsers) would weigh too much
+session_items AS (
+  SELECT v.session_key, v.item_id
+  FROM views AS v
+  JOIN top_items USING (item_id)
+  WHERE TRUE
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY v.session_key ORDER BY FARM_FINGERPRINT(v.item_id)) <= ${cm.max_items_per_session}
+),
+
+item_sessions AS (
+  SELECT item_id, COUNT(*) AS sessions
+  FROM session_items
+  GROUP BY 1
+),
+
+total AS (
+  SELECT COUNT(DISTINCT session_key) AS sessions
+  FROM session_items
+),
+
+pairs AS (
+  SELECT a.item_id AS item_a, b.item_id AS item_b, COUNT(*) AS co_sessions
+  FROM session_items AS a
+  JOIN session_items AS b ON a.session_key = b.session_key AND a.item_id < b.item_id
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${cm.min_co_sessions}
+),
+
+edges AS (
+  SELECT
+    p.item_a,
+    p.item_b,
+    p.co_sessions,
+    SAFE_DIVIDE(p.co_sessions * t.sessions, ia.sessions * ib.sessions) AS lift
+  FROM pairs AS p
+  CROSS JOIN total AS t
+  JOIN item_sessions AS ia ON ia.item_id = p.item_a
+  JOIN item_sessions AS ib ON ib.item_id = p.item_b
+),
+
+graph AS (
+  SELECT ${ref("louvain_communities")}(
+    ARRAY_AGG(STRUCT(item_a AS src, item_b AS dst, CAST(co_sessions AS FLOAT64) AS weight)),
+    10
+  ) AS result
+  FROM edges
+  WHERE lift >= ${cm.min_lift}
+),
+
+communities AS (
+  SELECT r.node AS item_id, r.community, r.community_size, r.strength, r.modularity
+  FROM graph AS g
+  CROSS JOIN UNNEST(g.result) AS r
+),
+
+members AS (
+  SELECT
+    c.*,
+    i.item_name,
+    COALESCE(i.item_category, '(not set)') AS item_category,
+    i.item_brand,
+    t.view_sessions
+  FROM communities AS c
+  LEFT JOIN ${ref("dim_items")} AS i USING (item_id)
+  LEFT JOIN top_items AS t USING (item_id)
+),
+
+category_mix AS (
+  SELECT community, item_category, COUNT(*) AS items_in_category, ANY_VALUE(community_size) AS community_size
+  FROM members
+  GROUP BY 1, 2
+),
+
+dominant AS (
+  SELECT community, item_category AS dominant_category, SAFE_DIVIDE(items_in_category, community_size) AS community_purity
+  FROM category_mix
+  WHERE TRUE
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY community ORDER BY items_in_category DESC, item_category) = 1
+),
+
+community_profile AS (
+  SELECT
+    community,
+    ARRAY_AGG(COALESCE(item_name, item_id) ORDER BY view_sessions DESC LIMIT 5) AS top_items_of_community,
+    SUM(view_sessions) AS community_view_sessions,
+    COUNT(DISTINCT item_category) AS categories_in_community
+  FROM members
+  GROUP BY 1
+)
+
+SELECT
+  m.item_id,
+  m.item_name,
+  m.item_brand,
+  m.item_category,
+  m.view_sessions,
+  m.community,
+  seed.item_name AS community_name,
+  CAST(m.community_size AS INT64) AS community_size,
+  p.top_items_of_community,
+  p.community_view_sessions,
+  p.categories_in_community,
+  d.dominant_category,
+  d.community_purity,
+  m.item_category != d.dominant_category AND d.community_purity >= ${cm.misplaced_purity} AND m.community_size >= 3 AS is_misplaced,
+  m.strength AS co_view_strength,
+  m.modularity,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM members AS m
+LEFT JOIN dominant AS d USING (community)
+LEFT JOIN community_profile AS p USING (community)
+LEFT JOIN ${ref("dim_items")} AS seed ON seed.item_id = m.community

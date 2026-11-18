@@ -1,0 +1,189 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.cro,
+  name: "cro_funnel_weekly_step_changes",
+  description: "Which step of the funnel broke (or got better) this week? The closed session funnel (session -> product view -> cart -> checkout -> shipping -> payment -> purchase) per week, segment (all, device, new x returning, top channels) and step, compared with the week before and with the average of the 4 weeks before, with a two proportions z test and the Benjamini-Hochberg false discovery rate across all the tests of the week (dozens of segments x steps would give false alarms every monday otherwise). revenue_impact puts the change in money: the change of the rate x the sessions that entered x what a session that passes the step is usually worth",
+  bigquery: {
+    partitionBy: "week_start",
+    clusterBy: ["segment_type", "step_number"],
+    labels: { layer: "marts", domain: "cro", level: "senior" }
+  },
+  tags: ["marts", "cro", "daily", "insights"],
+  columns: {
+    week_start: "Monday of the week (complete weeks only)",
+    segment_type: "all | device | user_type | channel",
+    step_name: "'<from> -> <to>' of the closed funnel (cfg_insights.funnel_weekly.steps)",
+    entered: "Sessions that reached the step before",
+    continued: "Sessions that also reached this step",
+    rate: "continued / entered",
+    baseline_rate: "Pooled rate of the funnel_weekly.baseline_weeks weeks before",
+    p_value_vs_baseline: "Two proportions z test, this week against the baseline",
+    q_value: "Benjamini-Hochberg adjusted p value inside the week (all segments and steps)",
+    revenue_impact: "(rate - baseline_rate) x entered x revenue per session that passed the step in the baseline",
+    verdict: "broke | improved | stable | too_small"
+  }
+}
+
+js {
+  const fw = cfg_insights.funnel_weekly;
+  const steps = fw.steps;
+  const reached = steps.map((s, k) => `(${steps.slice(0, k + 1).map(x => `COALESCE(s.${x.flag}, FALSE)`).join(" AND ")}) AS reached_${k + 1}`);
+  const stepStructs = steps.map((s, k) => `STRUCT(${k + 1} AS step_number, '${k === 0 ? "session" : steps[k - 1].step} -> ${s.step}' AS step_name, ${k === 0 ? "w.sessions" : `w.reached_${k}`} AS entered, w.reached_${k + 1} AS continued, w.revenue_reached_${k + 1} AS revenue_after)`);
+  const days = fw.baseline_weeks * 7;
+}
+
+WITH
+anchor AS (
+  SELECT DATE_SUB(DATE_TRUNC(${helpers.today()}, WEEK(MONDAY)), INTERVAL 7 DAY) AS last_complete_week
+),
+
+sessions AS (
+  SELECT
+    s.session_week AS week_start,
+    COALESCE(s.device_category, '(not set)') AS device_category,
+    IF(s.is_new_user, 'new', 'returning') AS user_type,
+    COALESCE(s.session_default_channel_group, '(not set)') AS channel,
+    COALESCE(s.revenue, 0) AS revenue,
+    ${reached.join(",\n    ")}
+  FROM ${ref("fct_sessions")} AS s
+  CROSS JOIN anchor AS a
+  WHERE s.session_date >= DATE_SUB(a.last_complete_week, INTERVAL ${(fw.weeks + fw.baseline_weeks - 1) * 7} DAY)
+    AND s.session_date < DATE_ADD(a.last_complete_week, INTERVAL 7 DAY)
+    ${helpers.martSessionFilter("s")}
+),
+
+top_channels AS (
+  SELECT channel
+  FROM sessions
+  GROUP BY 1
+  ORDER BY COUNT(*) DESC
+  LIMIT ${fw.top_channels}
+),
+
+long_format AS (
+  SELECT s.*, seg.segment_type, seg.segment_value
+  FROM sessions AS s
+  LEFT JOIN top_channels AS tc ON tc.channel = s.channel
+  CROSS JOIN UNNEST([
+    STRUCT('all' AS segment_type, '(all)' AS segment_value),
+    STRUCT('device', s.device_category),
+    STRUCT('user_type', s.user_type),
+    STRUCT('channel', IF(tc.channel IS NULL, 'Other', s.channel))
+  ]) AS seg
+),
+
+weekly AS (
+  SELECT
+    week_start,
+    segment_type,
+    segment_value,
+    COUNT(*) AS sessions,
+    ${steps.map((s, k) => `COUNTIF(reached_${k + 1}) AS reached_${k + 1}`).join(",\n    ")},
+    ${steps.map((s, k) => `SUM(IF(reached_${k + 1}, revenue, 0)) AS revenue_reached_${k + 1}`).join(",\n    ")}
+  FROM long_format
+  GROUP BY 1, 2, 3
+),
+
+steps_long AS (
+  SELECT
+    w.week_start,
+    w.segment_type,
+    w.segment_value,
+    st.step_number,
+    st.step_name,
+    st.entered,
+    st.continued,
+    st.revenue_after
+  FROM weekly AS w
+  CROSS JOIN UNNEST([
+    ${stepStructs.join(",\n    ")}
+  ]) AS st
+),
+
+-- calendar windows (RANGE on the day number) so a segment without sessions in a week does not shift the baseline
+with_history AS (
+  SELECT
+    *,
+    SUM(entered) OVER (PARTITION BY segment_type, segment_value, step_number ORDER BY UNIX_DATE(week_start) RANGE BETWEEN 7 PRECEDING AND 7 PRECEDING) AS previous_entered,
+    SUM(continued) OVER (PARTITION BY segment_type, segment_value, step_number ORDER BY UNIX_DATE(week_start) RANGE BETWEEN 7 PRECEDING AND 7 PRECEDING) AS previous_continued,
+    SUM(entered) OVER (PARTITION BY segment_type, segment_value, step_number ORDER BY UNIX_DATE(week_start) RANGE BETWEEN ${days} PRECEDING AND 7 PRECEDING) AS baseline_entered,
+    SUM(continued) OVER (PARTITION BY segment_type, segment_value, step_number ORDER BY UNIX_DATE(week_start) RANGE BETWEEN ${days} PRECEDING AND 7 PRECEDING) AS baseline_continued,
+    SUM(revenue_after) OVER (PARTITION BY segment_type, segment_value, step_number ORDER BY UNIX_DATE(week_start) RANGE BETWEEN ${days} PRECEDING AND 7 PRECEDING) AS baseline_revenue_after
+  FROM steps_long
+),
+
+tested AS (
+  SELECT
+    h.*,
+    SAFE_DIVIDE(h.continued, h.entered) AS rate,
+    SAFE_DIVIDE(h.previous_continued, h.previous_entered) AS previous_rate,
+    SAFE_DIVIDE(h.baseline_continued, h.baseline_entered) AS baseline_rate,
+    SAFE_DIVIDE(h.baseline_revenue_after, h.baseline_continued) AS value_per_continuer,
+    h.entered >= ${fw.min_entered} AND COALESCE(h.baseline_entered, 0) >= ${fw.min_entered} AS is_testable,
+    IF(
+      h.entered >= ${fw.min_entered} AND COALESCE(h.baseline_entered, 0) >= ${fw.min_entered},
+      ${ref("z_test_proportions")}(h.baseline_continued, h.baseline_entered, h.continued, h.entered).p_value,
+      NULL
+    ) AS p_value_vs_baseline,
+    IF(
+      h.entered >= ${fw.min_entered} AND COALESCE(h.previous_entered, 0) >= ${fw.min_entered},
+      ${ref("z_test_proportions")}(h.previous_continued, h.previous_entered, h.continued, h.entered).p_value,
+      NULL
+    ) AS p_value_vs_previous
+  FROM with_history AS h
+  CROSS JOIN anchor AS a
+  WHERE h.week_start >= DATE_SUB(a.last_complete_week, INTERVAL ${(fw.weeks - 1) * 7} DAY)
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(p_value_vs_baseline) OVER (PARTITION BY week_start) AS tests_in_week,
+    ROW_NUMBER() OVER (PARTITION BY week_start ORDER BY p_value_vs_baseline ASC NULLS LAST, segment_type, segment_value, step_number) AS p_rank
+  FROM tested
+),
+
+-- Benjamini-Hochberg: q(i) = min over j >= i of p(j) * m / j
+adjusted AS (
+  SELECT
+    *,
+    IF(
+      p_value_vs_baseline IS NULL,
+      NULL,
+      LEAST(1, MIN(SAFE_DIVIDE(p_value_vs_baseline * tests_in_week, p_rank)) OVER (PARTITION BY week_start ORDER BY p_rank DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+    ) AS q_value
+  FROM ranked
+)
+
+SELECT
+  week_start,
+  segment_type,
+  segment_value,
+  step_number,
+  step_name,
+  entered,
+  continued,
+  rate,
+  previous_entered,
+  previous_rate,
+  rate - previous_rate AS change_vs_previous,
+  p_value_vs_previous,
+  baseline_entered,
+  baseline_rate,
+  rate - baseline_rate AS change_vs_baseline,
+  SAFE_DIVIDE(rate - baseline_rate, baseline_rate) AS relative_change_vs_baseline,
+  p_value_vs_baseline,
+  q_value,
+  value_per_continuer,
+  (rate - baseline_rate) * entered * value_per_continuer AS revenue_impact,
+  CASE
+    WHEN NOT is_testable THEN 'too_small'
+    WHEN q_value < ${fw.fdr} AND rate < baseline_rate THEN 'broke'
+    WHEN q_value < ${fw.fdr} AND rate > baseline_rate THEN 'improved'
+    ELSE 'stable'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM adjusted

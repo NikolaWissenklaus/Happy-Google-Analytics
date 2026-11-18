@@ -1,0 +1,143 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_kpi_regimes",
+  description: "The history of every KPI told as regimes: 'conversion was 2.1% until 12/03, 1.6% after the new checkout, 1.9% since 03/06'. PELT change points (ga4_udf.pelt_changepoints) over the daily series of ds_daily_metrics_wide, after removing the weekday effect, with the mean of each regime, the change vs the previous one, whether it is material, and what was going on when it started (interventions of cfg_lifts.js, promotions, holidays and retail dates). Anomaly detection says 'yesterday was weird', this says 'the level changed and stayed'",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics", level: "specialist" }
+  },
+  tags: ["data_science", "statistics", "daily", "insights"],
+  columns: {
+    kpi: "Metric of ds_daily_metrics_wide (cfg_insights.regimes.kpis)",
+    regime_number: "1 = oldest regime of the window",
+    mean_value: "Average of the real daily values inside the regime",
+    mean_deseasonalized: "Average of the weekday adjusted values (what the change point model compared)",
+    relative_change_vs_previous: "mean_value / previous regime mean_value - 1",
+    is_material: "|relative change| >= regimes.min_relative_change",
+    is_new_regime: "Current regime that started in the last regimes.new_regime_days days",
+    possible_causes: "Interventions, promotions and special days within regimes.cause_window_days of the start date"
+  }
+}
+
+js {
+  const rg = cfg_insights.regimes;
+  const kpiExpr = { revenue_per_session: "SAFE_DIVIDE(revenue, sessions)" };
+  const expr = k => kpiExpr[k] || k;
+}
+
+WITH
+daily AS (
+  SELECT
+    w.metric_date,
+    MOD(EXTRACT(DAYOFWEEK FROM w.metric_date) + 5, 7) + 1 AS iso_weekday,
+    k.kpi,
+    k.value
+  FROM ${ref("ds_daily_metrics_wide")} AS w
+  CROSS JOIN UNNEST([
+    ${rg.kpis.map(k => `STRUCT('${k}' AS kpi, CAST(${expr(k)} AS FLOAT64) AS value)`).join(",\n    ")}
+  ]) AS k
+  WHERE w.sessions > 0
+),
+
+clean AS (
+  SELECT *, AVG(value) OVER (PARTITION BY kpi) AS kpi_mean
+  FROM daily
+  WHERE value IS NOT NULL
+),
+
+weekday_factor AS (
+  SELECT kpi, iso_weekday, SAFE_DIVIDE(AVG(value), ANY_VALUE(kpi_mean)) AS factor
+  FROM clean
+  GROUP BY 1, 2
+),
+
+series AS (
+  SELECT
+    c.kpi,
+    ARRAY_AGG(COALESCE(SAFE_DIVIDE(c.value, NULLIF(f.factor, 0)), c.value) ORDER BY c.metric_date) AS adjusted,
+    ARRAY_AGG(c.value ORDER BY c.metric_date) AS raw_values,
+    ARRAY_AGG(c.metric_date ORDER BY c.metric_date) AS dates
+  FROM clean AS c
+  LEFT JOIN weekday_factor AS f USING (kpi, iso_weekday)
+  GROUP BY 1
+),
+
+regimes AS (
+  SELECT
+    s.kpi,
+    CAST(seg.segment AS INT64) AS regime_number,
+    s.dates[OFFSET(CAST(seg.start_index AS INT64))] AS start_date,
+    s.dates[OFFSET(CAST(seg.end_index AS INT64))] AS end_date,
+    CAST(seg.points AS INT64) AS days,
+    (
+      SELECT AVG(v)
+      FROM UNNEST(s.raw_values) AS v WITH OFFSET AS pos
+      WHERE pos BETWEEN CAST(seg.start_index AS INT64) AND CAST(seg.end_index AS INT64)
+    ) AS mean_value,
+    seg.mean AS mean_deseasonalized,
+    seg.sd AS sd_deseasonalized,
+    seg.noise_sigma
+  FROM series AS s
+  CROSS JOIN UNNEST(${ref("pelt_changepoints")}(s.adjusted, ${rg.penalty_multiplier}, ${rg.min_segment_days})) AS seg
+),
+
+compared AS (
+  SELECT
+    *,
+    LAG(mean_value) OVER (PARTITION BY kpi ORDER BY regime_number) AS previous_mean_value,
+    LAG(end_date) OVER (PARTITION BY kpi ORDER BY regime_number) AS previous_end_date,
+    regime_number = MAX(regime_number) OVER (PARTITION BY kpi) AS is_current_regime,
+    COUNT(*) OVER (PARTITION BY kpi) AS regimes_in_window
+  FROM regimes
+),
+
+known_events AS (
+  SELECT start_date AS event_date, CONCAT('intervention: ', intervention_name) AS cause
+  FROM ${ref("seed_lift_interventions")}
+  UNION ALL
+  SELECT start_date, CONCAT('promotion start: ', promo_name)
+  FROM ${ref("seed_promotions")}
+  UNION ALL
+  SELECT end_date, CONCAT('promotion end: ', promo_name)
+  FROM ${ref("seed_promotions")}
+  WHERE end_date IS NOT NULL
+  UNION ALL
+  SELECT date_day, CONCAT('calendar: ', COALESCE(retail_event, holiday_name))
+  FROM ${ref("dim_calendar")}
+  WHERE (retail_event IS NOT NULL OR holiday_name IS NOT NULL)
+    AND date_day <= ${helpers.today()}
+),
+
+causes AS (
+  SELECT c.kpi, c.regime_number, ARRAY_AGG(DISTINCT x.cause IGNORE NULLS ORDER BY x.cause) AS possible_causes
+  FROM compared AS c
+  JOIN known_events AS x
+    ON x.event_date BETWEEN DATE_SUB(c.start_date, INTERVAL ${rg.cause_window_days} DAY) AND DATE_ADD(c.start_date, INTERVAL ${rg.cause_window_days} DAY)
+  WHERE c.regime_number > 1
+  GROUP BY 1, 2
+)
+
+SELECT
+  c.kpi,
+  c.regime_number,
+  c.regimes_in_window,
+  c.start_date,
+  c.end_date,
+  c.days,
+  c.mean_value,
+  c.mean_deseasonalized,
+  c.sd_deseasonalized,
+  c.noise_sigma,
+  c.previous_mean_value,
+  c.mean_value - c.previous_mean_value AS change_vs_previous,
+  SAFE_DIVIDE(c.mean_value, c.previous_mean_value) - 1 AS relative_change_vs_previous,
+  c.regime_number > 1 AND ABS(SAFE_DIVIDE(c.mean_value, c.previous_mean_value) - 1) >= ${rg.min_relative_change} AS is_material,
+  c.is_current_regime,
+  c.is_current_regime AND c.regime_number > 1 AND c.start_date >= ${helpers.daysAgo(rg.new_regime_days)} AS is_new_regime,
+  COALESCE(x.possible_causes, []) AS possible_causes,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM compared AS c
+LEFT JOIN causes AS x USING (kpi, regime_number)

@@ -61,6 +61,10 @@ Every var is a string (`"true"`, `"30"`). `includes/constants.js` parses them.
 | `cfg_experiments.js` | A/B tests and geo experiments | CRO |
 | `cfg_anomaly.js` | metrics watched, breakdowns, thresholds | data |
 | `cfg_ds.js` | features, models, horizons | data science |
+| `cfg_labs.js` | knobs of the labs models (missions, rhythm, bursts, blackouts, PageRank, post purchase patterns, order risk weights...) | data |
+| `cfg_frontier.js` | knobs of the frontier models (free shipping thresholds of the filler, price check, variants, viral K, affluence patterns...) | data + merchandising |
+| `cfg_attribution_extended.js` | knobs of the extended attribution (paid channel pattern, Markov orders, hazard grid, logistic regression) | data + marketing |
+| `cfg_insights.js` | knobs of the insights models (session intents, funnel steps, regimes, forecasts, bootstrap, Cox covariates, CEM, synthetic control, Bass, communities, ABC-XYZ, response curves, campaign naming convention, export limit, SEO intents). See `docs/insights.md` | data + every area |
 | `seeds_br.js` | UFs with IBGE population, stopwords | rarely |
 
 ## before production (checklist)

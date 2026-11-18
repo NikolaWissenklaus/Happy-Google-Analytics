@@ -1,0 +1,165 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_dwell_time_mixture",
+  description: "Every page has two audiences: the ones that skim and the ones that read. The average time on page mixes both and describes nobody. On the log of the time the two groups are two bells, and a gaussian mixture (EM, ga4_udf.gaussian_mixture_1d) separates them per page (last 30 days, top pages): share of readers, the typical time of a skimmer and of a reader, the threshold between them, and the purchase rate of the sessions that read the page vs the ones that skimmed it. A product page where 15% read and readers buy 3x more is a page to make readable",
+  bigquery: {
+    labels: { layer: "marts", domain: "product", level: "specialist" }
+  },
+  tags: ["marts", "product", "weekly", "insights"],
+  columns: {
+    timed_views: "Page views with a UA style time on page (the next view of the session exists, at most dwell_mixture.max_seconds)",
+    readers_share: "Weight of the high component (the readers), NULL when the page has only one audience",
+    skimmer_typical_sec: "Typical time of a skimmer (median of the low component)",
+    reader_typical_sec: "Typical time of a reader (median of the high component)",
+    reader_threshold_sec: "Above this time a view is more likely a reader than a skimmer",
+    separation: "Ashman's D between the two groups. Above 2 they are clearly different",
+    has_two_audiences: "BIC prefers two groups by 10+ AND separation >= dwell_mixture.min_separation",
+    reader_purchase_lift: "Purchase rate of the sessions where the page was read / where it was skimmed (observational)"
+  }
+}
+
+js {
+  const dm = cfg_insights.dwell_mixture;
+}
+
+WITH
+views AS (
+  SELECT
+    event_id,
+    page_path,
+    page_type,
+    time_on_page_sec,
+    -- TIMESTAMP_DIFF truncates to the second, the middle of the second is a better guess
+    LN(time_on_page_sec + 0.5) AS log_seconds,
+    COALESCE(reached_90_percent, FALSE) AS reached_90_percent,
+    COALESCE(session_has_purchase, FALSE) AS session_has_purchase
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(dm.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'page_view'
+    AND page_path IS NOT NULL
+    AND time_on_page_sec > 0
+    AND time_on_page_sec <= ${dm.max_seconds}
+    ${helpers.martSessionFilter()}
+),
+
+top_pages AS (
+  SELECT page_path, ANY_VALUE(page_type) AS page_type, COUNT(*) AS timed_views
+  FROM views
+  GROUP BY 1
+  HAVING COUNT(*) >= ${dm.min_views}
+  ORDER BY timed_views DESC
+  LIMIT ${dm.max_pages}
+),
+
+samples AS (
+  -- event_id is a hash, ordering by it is a deterministic random sample
+  SELECT v.page_path, ARRAY_AGG(v.log_seconds ORDER BY v.event_id LIMIT ${dm.sample_per_page}) AS log_seconds
+  FROM views AS v
+  JOIN top_pages USING (page_path)
+  GROUP BY 1
+),
+
+fitted AS (
+  SELECT page_path, ${ref("gaussian_mixture_1d")}(log_seconds, ${dm.em_iterations}) AS gm
+  FROM samples
+),
+
+classified_views AS (
+  SELECT
+    v.page_path,
+    v.session_has_purchase,
+    v.reached_90_percent,
+    v.log_seconds > f.gm.threshold AS is_reader
+  FROM views AS v
+  JOIN fitted AS f USING (page_path)
+  WHERE f.gm IS NOT NULL
+),
+
+reader_outcomes AS (
+  SELECT
+    page_path,
+    COUNTIF(is_reader) AS reader_views,
+    COUNTIF(NOT is_reader) AS skimmer_views,
+    SAFE_DIVIDE(COUNTIF(is_reader AND session_has_purchase), COUNTIF(is_reader)) AS reader_session_purchase_rate,
+    SAFE_DIVIDE(COUNTIF(NOT is_reader AND session_has_purchase), COUNTIF(NOT is_reader)) AS skimmer_session_purchase_rate,
+    SAFE_DIVIDE(COUNTIF(is_reader AND reached_90_percent), COUNTIF(is_reader)) AS reader_scroll_90_rate,
+    SAFE_DIVIDE(COUNTIF(NOT is_reader AND reached_90_percent), COUNTIF(NOT is_reader)) AS skimmer_scroll_90_rate
+  FROM classified_views
+  GROUP BY 1
+),
+
+plain_stats AS (
+  SELECT
+    v.page_path,
+    APPROX_QUANTILES(v.time_on_page_sec, 4) AS quartiles,
+    AVG(v.time_on_page_sec) AS mean_time_on_page_sec,
+    SAFE_DIVIDE(COUNTIF(v.time_on_page_sec < 5), COUNT(*)) AS under_5s_share
+  FROM views AS v
+  JOIN top_pages USING (page_path)
+  GROUP BY 1
+),
+
+assembled AS (
+  SELECT
+    t.page_path,
+    t.page_type,
+    t.timed_views,
+    f.gm.n AS sample_size,
+    ps.mean_time_on_page_sec,
+    ps.quartiles[OFFSET(2)] AS median_time_on_page_sec,
+    ps.under_5s_share,
+    f.gm.separation >= ${dm.min_separation} AND f.gm.bic_two_components < f.gm.bic_one_component - 10 AS has_two_audiences,
+    f.gm.weight_high,
+    EXP(f.gm.mean_low) - 0.5 AS skimmer_typical_sec,
+    EXP(f.gm.mean_high) - 0.5 AS reader_typical_sec,
+    EXP(f.gm.threshold) - 0.5 AS reader_threshold_sec,
+    f.gm.separation,
+    f.gm.bic_one_component - f.gm.bic_two_components AS bic_gain_of_two_groups,
+    r.reader_views,
+    r.skimmer_views,
+    r.reader_session_purchase_rate,
+    r.skimmer_session_purchase_rate,
+    r.reader_scroll_90_rate,
+    r.skimmer_scroll_90_rate
+  FROM top_pages AS t
+  JOIN fitted AS f USING (page_path)
+  LEFT JOIN reader_outcomes AS r USING (page_path)
+  LEFT JOIN plain_stats AS ps USING (page_path)
+  WHERE f.gm IS NOT NULL
+)
+
+SELECT
+  page_path,
+  page_type,
+  timed_views,
+  sample_size,
+  mean_time_on_page_sec,
+  median_time_on_page_sec,
+  under_5s_share,
+  has_two_audiences,
+  IF(has_two_audiences, weight_high, NULL) AS readers_share,
+  skimmer_typical_sec,
+  reader_typical_sec,
+  reader_threshold_sec,
+  separation,
+  bic_gain_of_two_groups,
+  reader_views,
+  skimmer_views,
+  reader_session_purchase_rate,
+  skimmer_session_purchase_rate,
+  SAFE_DIVIDE(reader_session_purchase_rate, skimmer_session_purchase_rate) AS reader_purchase_lift,
+  reader_scroll_90_rate,
+  skimmer_scroll_90_rate,
+  CASE
+    WHEN NOT has_two_audiences THEN 'one_audience'
+    WHEN weight_high >= 0.5 THEN 'reading_page'
+    WHEN weight_high < 0.2 THEN 'skimming_page'
+    ELSE 'mixed_audience'
+  END AS page_reading_profile,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM assembled

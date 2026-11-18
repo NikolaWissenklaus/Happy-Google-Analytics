@@ -1,0 +1,170 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_conversion_drivers_information",
+  description: "Which dimension explains the purchase? Channel, device, browser, landing page type, state, hour, weekday, new x returning, consent, language... ranked by how much knowing it reduces the uncertainty about 'will this session buy' (mutual information and Theil's U, information theory), with the Miller-Madow correction for dimensions with many values, Cramer's V and the chi-square p value. One row per value too, with its conversion, lift vs the site and its share of the information. Last 30 days. Answers 'what should we segment the dashboard by' with a number instead of an opinion",
+  bigquery: {
+    labels: { layer: "data_science", domain: "statistics", level: "senior" }
+  },
+  tags: ["data_science", "statistics", "daily", "insights"],
+  columns: {
+    dimension_kind: "context (who / where / when the visit came from) | behavior (what the visit did, partly a consequence of the intent to buy)",
+    mutual_information_bits: "I(dimension; purchase) in bits (plug in estimate)",
+    mutual_information_corrected: "MI minus the Miller-Madow bias (values - 1) / (2 n ln 2), floored at 0. Use this one to compare dimensions",
+    theils_u: "mutual_information_corrected / H(purchase): share of the uncertainty about the purchase removed by knowing the dimension",
+    cramers_v: "sqrt(chi2 / n), 0 = independent",
+    dimension_rank: "1 = the dimension that explains the most",
+    lift: "Conversion of the value / conversion of the site",
+    information_contribution: "Part of the (plug in) mutual information that comes from this value"
+  }
+}
+
+js {
+  const dr = cfg_insights.drivers;
+}
+
+WITH
+sessions AS (
+  SELECT *
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(dr.window_days)}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+long_format AS (
+  SELECT d.dimension, d.dimension_kind, COALESCE(NULLIF(d.value, ''), '(not set)') AS value, s.has_purchase
+  FROM sessions AS s
+  CROSS JOIN UNNEST([
+    STRUCT('channel' AS dimension, 'context' AS dimension_kind, s.session_default_channel_group AS value),
+    STRUCT('custom_channel', 'context', s.session_custom_channel_group),
+    STRUCT('device', 'context', s.device_category),
+    STRUCT('operating_system', 'context', s.device_os),
+    STRUCT('browser', 'context', s.device_browser),
+    STRUCT('landing_page_type', 'context', s.landing_page_type),
+    STRUCT('uf', 'context', COALESCE(s.geo_uf, IF(s.geo_country = 'Brazil', '(BR, unknown state)', '(outside Brazil)'))),
+    STRUCT('macro_region', 'context', s.geo_macro_region),
+    STRUCT('hour_block', 'context', CASE WHEN s.session_hour < 6 THEN 'madrugada' WHEN s.session_hour < 12 THEN 'manha' WHEN s.session_hour < 18 THEN 'tarde' ELSE 'noite' END),
+    STRUCT('weekday', 'context', CAST(s.session_iso_weekday AS STRING)),
+    STRUCT('user_type', 'context', IF(s.is_new_user, 'new', 'returning')),
+    STRUCT('session_number', 'context', CASE WHEN s.session_number IS NULL THEN NULL WHEN s.session_number = 1 THEN '1' WHEN s.session_number = 2 THEN '2' WHEN s.session_number <= 5 THEN '3-5' WHEN s.session_number <= 10 THEN '6-10' ELSE '11+' END),
+    STRUCT('ads_consent', 'context', s.consent_ads_storage),
+    STRUCT('language', 'context', SPLIT(COALESCE(s.device_language, ''), '-')[SAFE_OFFSET(0)]),
+    STRUCT('identified_user', 'context', IF(s.is_identified_user, 'identified', 'anonymous')),
+    STRUCT('used_site_search', 'behavior', IF(s.has_site_search, 'yes', 'no')),
+    STRUCT('clicked_promotion', 'behavior', IF(s.has_promotion_click, 'yes', 'no')),
+    STRUCT('engaged_session', 'behavior', IF(s.is_engaged, 'yes', 'no'))
+  ]) AS d
+),
+
+value_counts AS (
+  SELECT dimension, value, COUNT(*) AS n
+  FROM long_format
+  GROUP BY 1, 2
+),
+
+-- rare values are grouped before the math: 300 browsers with 3 sessions each would "explain" anything
+lumped AS (
+  SELECT l.dimension, l.dimension_kind, IF(v.n >= ${dr.min_sessions_per_value}, l.value, '(other)') AS value, l.has_purchase
+  FROM long_format AS l
+  JOIN value_counts AS v USING (dimension, value)
+),
+
+cells AS (
+  SELECT dimension, ANY_VALUE(dimension_kind) AS dimension_kind, value, COUNT(*) AS sessions, COUNTIF(has_purchase) AS purchases
+  FROM lumped
+  GROUP BY 1, 3
+),
+
+totals AS (
+  SELECT dimension, SUM(sessions) AS n, SUM(purchases) AS buyers, COUNT(*) AS values_count
+  FROM cells
+  GROUP BY 1
+),
+
+terms AS (
+  SELECT
+    c.*,
+    t.n,
+    t.buyers,
+    t.values_count,
+    c.sessions / t.n AS p_value_share,
+    t.buyers / t.n AS p_buy,
+    c.purchases / t.n AS p_value_and_buy,
+    (c.sessions - c.purchases) / t.n AS p_value_and_not_buy
+  FROM cells AS c
+  JOIN totals AS t USING (dimension)
+),
+
+contributions AS (
+  SELECT
+    *,
+    IF(p_value_and_buy > 0, p_value_and_buy * LOG(p_value_and_buy / (p_value_share * p_buy), 2), 0)
+      + IF(p_value_and_not_buy > 0, p_value_and_not_buy * LOG(p_value_and_not_buy / (p_value_share * (1 - p_buy)), 2), 0) AS information_contribution,
+    SAFE_DIVIDE(POW(purchases - sessions * p_buy, 2), sessions * p_buy)
+      + SAFE_DIVIDE(POW((sessions - purchases) - sessions * (1 - p_buy), 2), sessions * (1 - p_buy)) AS chi_square_contribution
+  FROM terms
+),
+
+dimensions AS (
+  SELECT
+    dimension,
+    ANY_VALUE(dimension_kind) AS dimension_kind,
+    ANY_VALUE(n) AS sessions_total,
+    ANY_VALUE(buyers) AS purchases_total,
+    ANY_VALUE(values_count) AS values_count,
+    ANY_VALUE(p_buy) AS site_conversion,
+    SUM(information_contribution) AS mutual_information_bits,
+    SUM(chi_square_contribution) AS chi_square
+  FROM contributions
+  GROUP BY 1
+),
+
+scored AS (
+  SELECT
+    *,
+    IF(site_conversion > 0 AND site_conversion < 1,
+      -(site_conversion * LOG(site_conversion, 2) + (1 - site_conversion) * LOG(1 - site_conversion, 2)),
+      NULL) AS purchase_entropy_bits,
+    GREATEST(0, mutual_information_bits - (values_count - 1) / (2 * sessions_total * LN(2))) AS mutual_information_corrected
+  FROM dimensions
+),
+
+ranked AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(mutual_information_corrected, purchase_entropy_bits) AS theils_u,
+    SQRT(SAFE_DIVIDE(chi_square, sessions_total)) AS cramers_v,
+    ${ref("chi_square_pvalue")}(chi_square, values_count - 1) AS chi_square_p_value,
+    ROW_NUMBER() OVER (ORDER BY mutual_information_corrected DESC, dimension) AS dimension_rank
+  FROM scored
+)
+
+SELECT
+  r.dimension_rank,
+  r.dimension,
+  r.dimension_kind,
+  r.mutual_information_bits,
+  r.mutual_information_corrected,
+  r.purchase_entropy_bits,
+  r.theils_u,
+  r.cramers_v,
+  r.chi_square,
+  r.chi_square_p_value,
+  r.values_count,
+  r.sessions_total,
+  r.site_conversion,
+  c.value,
+  c.sessions,
+  c.purchases,
+  SAFE_DIVIDE(c.purchases, c.sessions) AS conversion_rate,
+  ${helpers.wilsonLower("c.purchases", "c.sessions")} AS conversion_wilson_low,
+  SAFE_DIVIDE(SAFE_DIVIDE(c.purchases, c.sessions), r.site_conversion) AS lift,
+  c.information_contribution,
+  SAFE_DIVIDE(c.information_contribution, r.mutual_information_bits) AS share_of_information,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM ranked AS r
+JOIN contributions AS c USING (dimension)

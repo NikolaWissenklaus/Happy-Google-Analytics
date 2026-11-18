@@ -1,0 +1,126 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "gaussian_mixture_1d",
+  description: "Two component gaussian mixture of a sample, fitted by EM: weight, mean and sd of the low and the high group, BIC of one vs two components, Ashman's D (separation) and the value where both groups are equally likely (the threshold to classify a new value)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "stats", "insights"]
+}
+
+-- "the average time on page is 40s" hides two kinds of people: the ones that skimmed for 5s and
+-- the ones that read for 2 minutes. On the log of the time they look like two bells, and EM finds
+-- them (expectation: who belongs to which bell, maximization: the bells that fit those people).
+-- bic_two_components clearly below bic_one_component (10+) and separation > 2 = really two groups.
+-- Works for any 1D sample: log of order values, log of days between purchases, scroll depth...
+-- Send at most a few thousand values (sample them in SQL), NULLs and non finite values are ignored
+CREATE OR REPLACE FUNCTION ${self()}(sample_values ARRAY<FLOAT64>, iterations FLOAT64)
+RETURNS STRUCT<
+  n FLOAT64,
+  weight_low FLOAT64, mean_low FLOAT64, sd_low FLOAT64,
+  weight_high FLOAT64, mean_high FLOAT64, sd_high FLOAT64,
+  log_likelihood FLOAT64, bic_one_component FLOAT64, bic_two_components FLOAT64,
+  separation FLOAT64, threshold FLOAT64, iterations_used FLOAT64
+>
+LANGUAGE js AS r"""
+  var x = [];
+  var raw = sample_values || [];
+  for (var i = 0; i < raw.length; i++) {
+    var v = raw[i];
+    if (v !== null && v !== undefined && isFinite(v)) x.push(Number(v));
+  }
+  var n = x.length;
+  if (n < 20) return null;
+  var maxIt = (iterations === null || iterations === undefined) ? 200 : Math.max(1, Math.round(iterations));
+
+  var sorted = x.slice().sort(function (a, b) { return a - b; });
+  var total = 0;
+  for (i = 0; i < n; i++) total += x[i];
+  var mean = total / n;
+  var ss = 0;
+  for (i = 0; i < n; i++) ss += (x[i] - mean) * (x[i] - mean);
+  var variance = ss / n;
+  if (!(variance > 0)) return null;
+  var floorVar = Math.max(1e-6 * variance, 1e-12);
+
+  var w = [0.5, 0.5];
+  var mu = [sorted[Math.floor(0.25 * (n - 1))], sorted[Math.floor(0.75 * (n - 1))]];
+  if (mu[1] - mu[0] < 1e-9) mu[1] = mu[0] + Math.sqrt(variance);
+  var vr = [variance / 4, variance / 4];
+  var LOG2PI = Math.log(2 * Math.PI);
+  var r1 = new Array(n);
+  var ll = -Infinity, used = 0;
+
+  for (var it = 0; it < maxIt; it++) {
+    used = it + 1;
+    var newLl = 0;
+    var lw0 = Math.log(w[0]) - 0.5 * (LOG2PI + Math.log(vr[0]));
+    var lw1 = Math.log(w[1]) - 0.5 * (LOG2PI + Math.log(vr[1]));
+    for (i = 0; i < n; i++) {
+      var a0 = lw0 - (x[i] - mu[0]) * (x[i] - mu[0]) / (2 * vr[0]);
+      var a1 = lw1 - (x[i] - mu[1]) * (x[i] - mu[1]) / (2 * vr[1]);
+      var mx = Math.max(a0, a1);
+      var lse = mx + Math.log(Math.exp(a0 - mx) + Math.exp(a1 - mx));
+      r1[i] = Math.exp(a1 - lse);
+      newLl += lse;
+    }
+    var n1 = 0, sx1 = 0, sx0 = 0;
+    for (i = 0; i < n; i++) { n1 += r1[i]; sx1 += r1[i] * x[i]; sx0 += (1 - r1[i]) * x[i]; }
+    var n0 = n - n1;
+    if (n0 < 1e-9 || n1 < 1e-9) break;
+    mu[0] = sx0 / n0;
+    mu[1] = sx1 / n1;
+    var sv0 = 0, sv1 = 0;
+    for (i = 0; i < n; i++) {
+      sv0 += (1 - r1[i]) * (x[i] - mu[0]) * (x[i] - mu[0]);
+      sv1 += r1[i] * (x[i] - mu[1]) * (x[i] - mu[1]);
+    }
+    vr[0] = Math.max(sv0 / n0, floorVar);
+    vr[1] = Math.max(sv1 / n1, floorVar);
+    w[0] = n0 / n;
+    w[1] = n1 / n;
+    var converged = Math.abs(newLl - ll) < 1e-9 * Math.abs(newLl) + 1e-12;
+    ll = newLl;
+    if (converged) break;
+  }
+
+  var lo = mu[0] <= mu[1] ? 0 : 1;
+  var hi = 1 - lo;
+  var ll1 = -0.5 * n * (LOG2PI + Math.log(variance) + 1);
+  var separation = Math.SQRT2 * Math.abs(mu[hi] - mu[lo]) / Math.sqrt(vr[lo] + vr[hi]);
+
+  // where w_lo N(mu_lo, v_lo) = w_hi N(mu_hi, v_hi), between the two means
+  var A = 1 / (2 * vr[hi]) - 1 / (2 * vr[lo]);
+  var B = mu[lo] / vr[lo] - mu[hi] / vr[hi];
+  var C = mu[hi] * mu[hi] / (2 * vr[hi]) - mu[lo] * mu[lo] / (2 * vr[lo]) + Math.log(w[lo] / w[hi]) + 0.5 * Math.log(vr[hi] / vr[lo]);
+  var threshold = null;
+  if (Math.abs(A) < 1e-12) {
+    if (Math.abs(B) > 1e-12) threshold = -C / B;
+  } else {
+    var disc = B * B - 4 * A * C;
+    if (disc >= 0) {
+      var roots = [(-B + Math.sqrt(disc)) / (2 * A), (-B - Math.sqrt(disc)) / (2 * A)];
+      for (var k = 0; k < 2; k++) if (roots[k] >= mu[lo] && roots[k] <= mu[hi]) threshold = roots[k];
+    }
+  }
+  if (threshold === null || !isFinite(threshold) || threshold < mu[lo] || threshold > mu[hi]) {
+    var s0 = Math.sqrt(vr[lo]), s1 = Math.sqrt(vr[hi]);
+    threshold = (mu[lo] * s1 + mu[hi] * s0) / (s0 + s1);
+  }
+
+  return {
+    n: n,
+    weight_low: w[lo], mean_low: mu[lo], sd_low: Math.sqrt(vr[lo]),
+    weight_high: w[hi], mean_high: mu[hi], sd_high: Math.sqrt(vr[hi]),
+    log_likelihood: ll,
+    bic_one_component: -2 * ll1 + 2 * Math.log(n),
+    bic_two_components: -2 * ll + 5 * Math.log(n),
+    separation: separation,
+    threshold: threshold,
+    iterations_used: used
+  };
+"""
+OPTIONS (description = "Two component 1D gaussian mixture (EM) with BIC and separation")

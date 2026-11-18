@@ -1,0 +1,132 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_flow_sankey",
+  description: "The user flow ready for a Sankey chart (Looker Studio, Power BI, Flourish, Plotly...): one row per edge 'step k: page type -> step k+1: page type' of the first steps of every session (last 30 days), with sessions, purchases and revenue flowing through it, and the exits as nodes ('(exit)' and '(exit, bought)'). Nodes carry the step number, so the chart never has cycles. Segments: all, device, new x returning, top channels and outcome (bought x did not)",
+  bigquery: {
+    clusterBy: ["segment_type", "segment_value"],
+    labels: { layer: "marts", domain: "product", level: "junior" }
+  },
+  tags: ["marts", "product", "daily", "insights"],
+  columns: {
+    segment_type: "all | device | user_type | channel | outcome",
+    segment_value: "Value of the segment ('(all)' for segment_type = all)",
+    step: "Step of the source node (1 = landing page)",
+    source_node: "'<step>. <page type>'",
+    target_node: "'<step + 1>. <page type>', '<step + 1>. (exit)', '<step + 1>. (exit, bought)' or '<step + 1>. (continues)' after the last step",
+    sessions: "Sessions that went through the edge (the width of the band)",
+    share_of_source: "sessions / sessions leaving the source node (the drop off when the target is an exit)"
+  }
+}
+
+js {
+  const sk = cfg_insights.sankey;
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    page_number,
+    COALESCE(page_type, '(not set)') AS page_type,
+    COALESCE(session_has_purchase, FALSE) AS has_purchase,
+    COALESCE(session_revenue, 0) AS session_revenue,
+    COALESCE(device_category, '(not set)') AS device_category,
+    is_new_user,
+    COALESCE(session_default_channel_group, '(not set)') AS channel
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(sk.window_days)}
+    AND event_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+${sk.collapse_repeats ? `
+-- product > product > product becomes one step (like the GA4 path exploration does with repeated titles)
+collapsed AS (
+  SELECT *
+  FROM views
+  WHERE TRUE
+  QUALIFY COALESCE(LAG(page_type) OVER (PARTITION BY session_key ORDER BY page_number) != page_type, TRUE)
+),` : `
+collapsed AS (
+  SELECT * FROM views
+),`}
+
+steps AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY session_key ORDER BY page_number) AS step,
+    COUNT(*) OVER (PARTITION BY session_key) AS session_steps
+  FROM collapsed
+),
+
+top_channels AS (
+  SELECT channel
+  FROM steps
+  WHERE step = 1
+  GROUP BY 1
+  ORDER BY COUNT(*) DESC
+  LIMIT ${sk.top_channels}
+),
+
+edges AS (
+  SELECT
+    s.session_key,
+    s.has_purchase,
+    s.session_revenue,
+    s.device_category,
+    s.is_new_user,
+    IF(tc.channel IS NULL, 'Other', s.channel) AS channel,
+    s.step,
+    CONCAT(CAST(s.step AS STRING), '. ', s.page_type) AS source_node,
+    CASE
+      WHEN s.step = ${sk.max_steps} AND s.session_steps > ${sk.max_steps} THEN CONCAT(CAST(s.step + 1 AS STRING), '. (continues)')
+      WHEN s.step = s.session_steps THEN CONCAT(CAST(s.step + 1 AS STRING), IF(s.has_purchase, '. (exit, bought)', '. (exit)'))
+      ELSE CONCAT(CAST(s.step + 1 AS STRING), '. ', LEAD(s.page_type) OVER (PARTITION BY s.session_key ORDER BY s.step))
+    END AS target_node
+  FROM steps AS s
+  LEFT JOIN top_channels AS tc ON tc.channel = s.channel
+  WHERE s.step <= ${sk.max_steps}
+),
+
+segmented AS (
+  SELECT e.*, seg.segment_type, seg.segment_value
+  FROM edges AS e
+  CROSS JOIN UNNEST([
+    STRUCT('all' AS segment_type, '(all)' AS segment_value),
+    STRUCT('device', e.device_category),
+    STRUCT('user_type', CASE WHEN e.is_new_user THEN 'new' WHEN e.is_new_user IS NULL THEN '(not set)' ELSE 'returning' END),
+    STRUCT('channel', e.channel),
+    STRUCT('outcome', IF(e.has_purchase, 'bought', 'did_not_buy'))
+  ]) AS seg
+),
+
+aggregated AS (
+  SELECT
+    segment_type,
+    segment_value,
+    step,
+    source_node,
+    target_node,
+    COUNT(*) AS sessions,
+    COUNTIF(has_purchase) AS sessions_with_purchase,
+    SUM(IF(has_purchase, session_revenue, 0)) AS revenue
+  FROM segmented
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+-- the share is computed BEFORE the thin edges are dropped, so it is the share of all sessions leaving the node
+SELECT *
+FROM (
+  SELECT
+    *,
+    SAFE_DIVIDE(sessions_with_purchase, sessions) AS purchase_rate,
+    SAFE_DIVIDE(sessions, SUM(sessions) OVER (PARTITION BY segment_type, segment_value, source_node)) AS share_of_source,
+    STRPOS(target_node, '(exit') > 0 AS is_exit_edge,
+    CURRENT_TIMESTAMP() AS loaded_at
+  FROM aggregated
+)
+WHERE sessions >= ${sk.min_edge_sessions}

@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_target_hit_probability",
+  description: "'Are we going to hit the target?' answered with a probability instead of a yes / no: for the current month and every target of cfg_targets.js (revenue, transactions, sessions, new customers), the month to date, what the remaining days usually bring (mean and variance of the same weekday in the last 8 weeks), the projected month end with an 80% interval, the chance of reaching the target and the daily average still needed. '64% chance, needs R$ 41k a day against a usual R$ 37k' is a sentence the board understands",
+  bigquery: {
+    labels: { layer: "marts", domain: "business", level: "junior" }
+  },
+  tags: ["marts", "business", "daily", "insights"],
+  columns: {
+    kpi: "revenue | transactions | sessions | new_customers",
+    month_to_date: "Value of the complete days of the month (today not included, it is not over)",
+    expected_rest_of_month: "Sum of the usual value of each remaining day (today included), by weekday",
+    projected_month_end: "month_to_date + expected_rest_of_month",
+    projected_low_80: "10% percentile of the month end (normal approximation, variance inflated by target_probability.variance_inflation)",
+    probability_of_hitting_target: "P(month end >= target)",
+    needed_per_remaining_day: "(target - month_to_date) / remaining days",
+    expected_per_remaining_day: "What a remaining day usually brings"
+  }
+}
+
+js {
+  const tp = cfg_insights.target_probability;
+  const historyDays = tp.history_weeks * 7;
+}
+
+WITH
+month AS (
+  SELECT
+    DATE_TRUNC(${helpers.today()}, MONTH) AS month_start,
+    LAST_DAY(${helpers.today()}, MONTH) AS month_end,
+    ${helpers.today()} AS today
+),
+
+calendar AS (
+  SELECT d AS metric_date
+  FROM UNNEST(GENERATE_DATE_ARRAY(DATE_SUB(${helpers.today()}, INTERVAL ${historyDays + 31} DAY), DATE_SUB(${helpers.today()}, INTERVAL 1 DAY))) AS d
+),
+
+sessions_daily AS (
+  SELECT session_date AS metric_date, COUNT(*) AS sessions
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_SUB(${helpers.today()}, INTERVAL ${historyDays + 31} DAY)
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+orders_daily AS (
+  SELECT transaction_date AS metric_date, COUNT(*) AS transactions, SUM(revenue) AS revenue, COUNTIF(is_first_purchase) AS new_customers
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= DATE_SUB(${helpers.today()}, INTERVAL ${historyDays + 31} DAY)
+    AND transaction_date < ${helpers.today()}
+  GROUP BY 1
+),
+
+daily AS (
+  SELECT
+    c.metric_date,
+    MOD(EXTRACT(DAYOFWEEK FROM c.metric_date) + 5, 7) + 1 AS iso_weekday,
+    k.kpi,
+    k.value
+  FROM calendar AS c
+  LEFT JOIN sessions_daily AS s USING (metric_date)
+  LEFT JOIN orders_daily AS o USING (metric_date)
+  CROSS JOIN UNNEST([
+    STRUCT('revenue' AS kpi, COALESCE(o.revenue, 0) AS value),
+    STRUCT('transactions', CAST(COALESCE(o.transactions, 0) AS FLOAT64)),
+    STRUCT('sessions', CAST(COALESCE(s.sessions, 0) AS FLOAT64)),
+    STRUCT('new_customers', CAST(COALESCE(o.new_customers, 0) AS FLOAT64))
+  ]) AS k
+),
+
+weekday_profile AS (
+  SELECT kpi, iso_weekday, AVG(value) AS expected, VAR_SAMP(value) AS variance
+  FROM daily
+  WHERE metric_date >= DATE_SUB(${helpers.today()}, INTERVAL ${historyDays} DAY)
+  GROUP BY 1, 2
+),
+
+month_to_date AS (
+  SELECT d.kpi, SUM(d.value) AS month_to_date, COUNT(*) AS elapsed_days
+  FROM daily AS d
+  CROSS JOIN month AS m
+  WHERE d.metric_date >= m.month_start
+  GROUP BY 1
+),
+
+remaining_days AS (
+  SELECT d AS metric_date, MOD(EXTRACT(DAYOFWEEK FROM d) + 5, 7) + 1 AS iso_weekday
+  FROM month AS m
+  CROSS JOIN UNNEST(GENERATE_DATE_ARRAY(m.today, m.month_end)) AS d
+),
+
+rest_of_month AS (
+  SELECT p.kpi, COUNT(*) AS remaining_days, SUM(p.expected) AS expected_rest, SUM(COALESCE(p.variance, 0)) * ${tp.variance_inflation} AS variance_rest
+  FROM remaining_days AS r
+  JOIN weekday_profile AS p USING (iso_weekday)
+  GROUP BY 1
+),
+
+targets AS (
+  SELECT k.kpi, k.target
+  FROM ${ref("seed_monthly_targets")} AS t
+  CROSS JOIN month AS m
+  CROSS JOIN UNNEST([
+    STRUCT('revenue' AS kpi, t.revenue AS target),
+    STRUCT('transactions', t.transactions),
+    STRUCT('sessions', t.sessions),
+    STRUCT('new_customers', t.new_customers)
+  ]) AS k
+  WHERE t.target_month = m.month_start
+    AND k.target IS NOT NULL
+)
+
+SELECT
+  m.month_start,
+  t.kpi,
+  t.target,
+  COALESCE(x.month_to_date, 0) AS month_to_date,
+  COALESCE(x.elapsed_days, 0) AS elapsed_days,
+  r.remaining_days,
+  r.expected_rest AS expected_rest_of_month,
+  COALESCE(x.month_to_date, 0) + r.expected_rest AS projected_month_end,
+  COALESCE(x.month_to_date, 0) + r.expected_rest - 1.2815515655446004 * SQRT(r.variance_rest) AS projected_low_80,
+  COALESCE(x.month_to_date, 0) + r.expected_rest + 1.2815515655446004 * SQRT(r.variance_rest) AS projected_high_80,
+  SAFE_DIVIDE(COALESCE(x.month_to_date, 0) + r.expected_rest, t.target) AS projected_attainment,
+  IF(
+    r.variance_rest > 0,
+    1 - ${ref("normal_cdf")}((t.target - COALESCE(x.month_to_date, 0) - r.expected_rest) / SQRT(r.variance_rest)),
+    IF(COALESCE(x.month_to_date, 0) + r.expected_rest >= t.target, 1.0, 0.0)
+  ) AS probability_of_hitting_target,
+  SAFE_DIVIDE(t.target - COALESCE(x.month_to_date, 0), r.remaining_days) AS needed_per_remaining_day,
+  SAFE_DIVIDE(r.expected_rest, r.remaining_days) AS expected_per_remaining_day,
+  SAFE_DIVIDE(SAFE_DIVIDE(t.target - COALESCE(x.month_to_date, 0), r.remaining_days), SAFE_DIVIDE(r.expected_rest, r.remaining_days)) - 1 AS extra_effort_needed,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM targets AS t
+CROSS JOIN month AS m
+LEFT JOIN month_to_date AS x USING (kpi)
+LEFT JOIN rest_of_month AS r USING (kpi)

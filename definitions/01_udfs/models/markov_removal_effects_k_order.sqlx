@@ -1,0 +1,125 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "markov_removal_effects_k_order",
+  description: "Markov chain attribution of any order k: the state is the last k channels, not only the last one, so the chain remembers HOW the person got there ('Email after Paid Social' is a different state from 'Email after Direct'). Removal effect and share of each channel. k = 1 gives the same answer as markov_removal_effects",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "attribution", "attribution_extended"]
+}
+
+-- input: one row per distinct path (channels in order) with conversions and non conversions,
+-- and the order k of the chain.
+--
+-- 1. state after the n-th touch = the last min(n, k) channels joined. start, conversion, null absorb
+-- 2. transition probabilities from the counts, P(conversion) from start by value iteration
+-- 3. removing a channel = every state that CONTAINS it sends its flow to null
+-- 4. removal effect = 1 - P(conversion without channel) / P(conversion); share = effect / sum
+-- higher k = more states and fewer observations per state: look at states and min_state_visits
+CREATE OR REPLACE FUNCTION ${self()}(
+  paths ARRAY<STRUCT<path ARRAY<STRING>, conversions FLOAT64, non_conversions FLOAT64>>,
+  k FLOAT64
+)
+RETURNS ARRAY<STRUCT<channel STRING, removal_effect FLOAT64, share FLOAT64, base_conversion_probability FLOAT64, states FLOAT64, median_state_visits FLOAT64>>
+LANGUAGE js AS r"""
+  var START = '(start)', CONV = '(conversion)', LOST = '(null)', SEP = '␟';
+  var order = Math.max(1, Math.min(Number(k) || 1, 6));
+  var counts = {};
+  var visits = {};
+  var channels = {};
+  var stateChannels = {};
+
+  function add(from, to, w) {
+    if (!counts[from]) counts[from] = {};
+    counts[from][to] = (counts[from][to] || 0) + w;
+  }
+
+  for (var i = 0; i < (paths || []).length; i++) {
+    var row = paths[i];
+    if (!row || !row.path || row.path.length === 0) continue;
+    var conv = row.conversions || 0;
+    var lost = row.non_conversions || 0;
+    var total = conv + lost;
+    if (total <= 0) continue;
+    var prev = START;
+    var history = [];
+    for (var j = 0; j < row.path.length; j++) {
+      var ch = row.path[j];
+      if (ch === null || ch === undefined || ch === '') ch = '(unknown)';
+      channels[ch] = true;
+      history.push(ch);
+      if (history.length > order) history.shift();
+      var state = history.join(SEP);
+      if (!stateChannels[state]) stateChannels[state] = history.slice();
+      visits[state] = (visits[state] || 0) + total;
+      add(prev, state, total);
+      prev = state;
+    }
+    if (conv > 0) add(prev, CONV, conv);
+    if (lost > 0) add(prev, LOST, lost);
+  }
+
+  var probs = {};
+  Object.keys(counts).forEach(function (from) {
+    var tos = counts[from];
+    var sum = 0;
+    Object.keys(tos).forEach(function (to) { sum += tos[to]; });
+    probs[from] = {};
+    Object.keys(tos).forEach(function (to) { probs[from][to] = tos[to] / sum; });
+  });
+  var states = Object.keys(probs);
+
+  function isRemoved(state, removed) {
+    if (removed === null) return false;
+    var chs = stateChannels[state];
+    return !!chs && chs.indexOf(removed) >= 0;
+  }
+
+  function conversionProbability(removed) {
+    var P = {};
+    states.forEach(function (s) { P[s] = 0; });
+    for (var it = 0; it < 5000; it++) {
+      var delta = 0;
+      for (var q = 0; q < states.length; q++) {
+        var s = states[q];
+        if (isRemoved(s, removed)) continue;
+        var v = 0;
+        var tos = probs[s];
+        for (var to in tos) {
+          if (to === LOST || isRemoved(to, removed)) continue;
+          v += tos[to] * (to === CONV ? 1 : (P[to] || 0));
+        }
+        var diff = Math.abs(v - P[s]);
+        if (diff > delta) delta = diff;
+        P[s] = v;
+      }
+      if (delta < 1e-12) break;
+    }
+    return P[START] || 0;
+  }
+
+  var base = conversionProbability(null);
+  var names = Object.keys(channels);
+  if (base <= 0 || names.length === 0) return [];
+
+  var visitList = Object.keys(visits).map(function (s) { return visits[s]; }).sort(function (a, b) { return a - b; });
+  var medianVisits = visitList.length ? visitList[Math.floor((visitList.length - 1) / 2)] : null;
+
+  var effects = names.map(function (ch) { return Math.max(0, 1 - conversionProbability(ch) / base); });
+  var totalEffect = effects.reduce(function (acc, e) { return acc + e; }, 0);
+
+  return names.map(function (ch, i) {
+    return {
+      channel: ch,
+      removal_effect: effects[i],
+      share: totalEffect > 0 ? effects[i] / totalEffect : null,
+      base_conversion_probability: base,
+      states: Object.keys(visits).length,
+      median_state_visits: medianVisits
+    };
+  });
+"""
+OPTIONS (description = "Markov chain removal effects of order k")

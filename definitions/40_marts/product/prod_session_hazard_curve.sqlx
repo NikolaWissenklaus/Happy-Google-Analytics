@@ -1,0 +1,118 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_session_hazard_curve",
+  description: "The life table of a visit, the way actuaries look at a population: of the sessions still alive at page N (or minute N), how many die right there (the hazard), and how likely is a purchase for the ones that survived to it. A smooth hazard is human nature. A spike (a 'cliff') at a precise page number or minute is something the site does: the newsletter pop up at 30s, the cookie banner, the 3rd page where the login wall appears. Per device (and '(all)'), last 30 days, by view number and by elapsed minute",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "frontier"],
+  columns: Object.assign(docs.pick("device_category"), {
+    curve: "view_number (step = views of the session) | minute (step = whole minutes of session duration)",
+    step: "Page number or minute. The last step is open ended (that many or more)",
+    sessions_alive: "Sessions that reached this step",
+    sessions_ended: "Sessions that ended exactly at this step",
+    survival: "sessions_alive / sessions of the curve (the Kaplan-Meier curve of the visit, no censoring)",
+    hazard: "sessions_ended / sessions_alive: chance of leaving right here",
+    hazard_excess: "hazard - average hazard of the step before and after. A cliff stands out of its neighbours",
+    is_cliff: "hazard_excess above 3 times the median absolute excess of the curve, with 100+ sessions alive",
+    purchase_rate_if_alive: "Purchase rate of the sessions that reached this step: what one more page (or minute) is worth"
+  })
+}
+
+js {
+  const hz = cfg_frontier.hazard;
+}
+
+WITH
+sessions AS (
+  SELECT
+    device_category,
+    has_purchase,
+    LEAST(page_views + screen_views, ${hz.max_view_number}) AS views,
+    LEAST(DIV(CAST(COALESCE(session_duration_sec, 0) AS INT64), 60), ${hz.max_minute}) AS minutes
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(hz.window_days)}
+    AND session_date < ${helpers.today()}
+    AND page_views + screen_views > 0
+    ${helpers.martSessionFilter()}
+),
+
+expanded AS (
+  SELECT device_category, has_purchase, c.curve, c.value
+  FROM sessions
+  CROSS JOIN UNNEST([STRUCT('view_number' AS curve, views AS value), STRUCT('minute', minutes)]) AS c
+),
+
+both_devices AS (
+  SELECT device_category, has_purchase, curve, value FROM expanded
+  UNION ALL
+  SELECT '(all)' AS device_category, has_purchase, curve, value FROM expanded
+),
+
+ends AS (
+  SELECT
+    device_category,
+    curve,
+    value AS step,
+    COUNT(*) AS sessions_ended,
+    COUNTIF(has_purchase) AS purchases_ended
+  FROM both_devices
+  GROUP BY 1, 2, 3
+),
+
+life AS (
+  SELECT
+    *,
+    -- alive at step k = ended at k or later
+    SUM(sessions_ended) OVER (PARTITION BY device_category, curve ORDER BY step DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sessions_alive,
+    SUM(purchases_ended) OVER (PARTITION BY device_category, curve ORDER BY step DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS purchases_alive,
+    SUM(sessions_ended) OVER (PARTITION BY device_category, curve) AS curve_sessions,
+    MAX(step) OVER (PARTITION BY device_category, curve) AS last_step
+  FROM ends
+),
+
+hazards AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(sessions_ended, sessions_alive) AS hazard
+  FROM life
+),
+
+excess AS (
+  SELECT
+    *,
+    hazard - (
+      COALESCE(LAG(hazard) OVER w, LEAD(hazard) OVER w) + COALESCE(LEAD(hazard) OVER w, LAG(hazard) OVER w)
+    ) / 2 AS hazard_excess
+  FROM hazards
+  WINDOW w AS (PARTITION BY device_category, curve ORDER BY step)
+),
+
+scale AS (
+  SELECT device_category, curve, APPROX_QUANTILES(ABS(hazard_excess), 2 IGNORE NULLS)[OFFSET(1)] AS median_abs_excess
+  FROM excess
+  WHERE step < last_step
+  GROUP BY 1, 2
+)
+
+SELECT
+  e.device_category,
+  e.curve,
+  e.step,
+  e.step = e.last_step AS is_open_ended_step,
+  e.sessions_alive,
+  e.sessions_ended,
+  SAFE_DIVIDE(e.sessions_alive, e.curve_sessions) AS survival,
+  e.hazard,
+  e.hazard_excess,
+  e.step < e.last_step
+    AND e.sessions_alive >= 100
+    AND e.hazard_excess > 3 * GREATEST(s.median_abs_excess, 0.005) AS is_cliff,
+  SAFE_DIVIDE(e.purchases_alive, e.sessions_alive) AS purchase_rate_if_alive,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM excess AS e
+LEFT JOIN scale AS s USING (device_category, curve)

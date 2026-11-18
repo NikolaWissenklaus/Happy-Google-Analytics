@@ -1,0 +1,97 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_markov_higher_order",
+  description: "Markov chain attribution with memory: orders 1, 2 and 3 side by side (cfg_attribution_extended.markov_orders). The first order chain of attr_markov_removal_effects only knows the CURRENT channel; an order 2 chain knows the last two, so 'Email after Paid Social' and 'Email after Direct' are different states. When the credit of a channel moves a lot from order 1 to order 2, the sequence matters for that channel (it works as a closer of a specific opener). Uses the converting and non converting journeys of attr_user_journeys",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science", "attribution_extended"],
+  columns: {
+    markov_order: "Memory of the chain (number of previous channels in the state)",
+    removal_effect: "How much the conversion probability drops without this channel",
+    share: "removal_effect / sum of the removal effects of the order",
+    states: "Number of states of the chain. Many states with few visits = the order is too high for the volume",
+    median_state_visits: "Median number of journeys passing by a state. Below ~30 the estimates of that order are noisy",
+    share_change_vs_order_1: "share - share of the same channel in the order 1 chain"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+}
+
+WITH
+paths AS (
+  SELECT
+    ARRAY_TO_STRING(ARRAY(
+      SELECT channel FROM (
+        SELECT channel, pos FROM UNNEST(SPLIT(channel_path_dedup, ' > ')) AS channel WITH OFFSET AS pos
+      )
+      WHERE pos >= ARRAY_LENGTH(SPLIT(channel_path_dedup, ' > ')) - ${ax.markov_max_path_length}
+      ORDER BY pos
+    ), ' > ') AS path,
+    IF(is_converted, 1, 0) AS conversions,
+    IF(is_converted, 0, 1) AS non_conversions,
+    IF(is_converted, conversion_value, 0) AS conversion_value
+  FROM ${ref("attr_user_journeys")}
+  WHERE channel_path_dedup IS NOT NULL
+    AND channel_path_dedup != ''
+),
+
+distinct_paths AS (
+  SELECT path, SUM(conversions) AS conversions, SUM(non_conversions) AS non_conversions, SUM(conversion_value) AS conversion_value
+  FROM paths
+  GROUP BY path
+  QUALIFY ROW_NUMBER() OVER (ORDER BY SUM(conversions) + SUM(non_conversions) DESC) <= ${ax.markov_max_distinct_paths}
+),
+
+totals AS (
+  SELECT SUM(conversions) AS total_conversions, SUM(conversion_value) AS total_value FROM distinct_paths
+),
+
+path_array AS (
+  SELECT ARRAY_AGG(STRUCT(
+    SPLIT(path, ' > ') AS path,
+    CAST(conversions AS FLOAT64) AS conversions,
+    CAST(non_conversions AS FLOAT64) AS non_conversions
+  )) AS paths
+  FROM distinct_paths
+),
+
+runs AS (
+  SELECT
+    markov_order,
+    ${ref("markov_removal_effects_k_order")}(p.paths, CAST(markov_order AS FLOAT64)) AS effects
+  FROM path_array AS p
+  CROSS JOIN UNNEST([${ax.markov_orders.map(Number).join(", ")}]) AS markov_order
+),
+
+effects AS (
+  SELECT r.markov_order, e.*
+  FROM runs AS r, UNNEST(r.effects) AS e
+)
+
+SELECT
+  (SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1) AS key_event_name,
+  e.markov_order,
+  e.channel,
+  e.removal_effect,
+  e.share,
+  e.share * t.total_conversions AS attributed_conversions,
+  e.share * t.total_value AS attributed_value,
+  e.base_conversion_probability,
+  CAST(e.states AS INT64) AS states,
+  e.median_state_visits,
+  e.share - o1.share AS share_change_vs_order_1,
+  t.total_conversions,
+  ${helpers.today()} AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM effects AS e
+CROSS JOIN totals AS t
+LEFT JOIN effects AS o1
+  ON o1.channel = e.channel
+  AND o1.markov_order = 1

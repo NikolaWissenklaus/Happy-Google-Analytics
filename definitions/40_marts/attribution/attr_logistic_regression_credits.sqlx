@@ -1,0 +1,82 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_logistic_regression_credits",
+  disabled: !constants.ENABLE.bqml,
+  description: "Attribution from the logistic regression of the journeys (attr_model_journey_logit): each converting journey splits its conversion among its channels in proportion to coefficient x touches (only the positive coefficients count: a channel that LOWERS the odds gets nothing). Also the odds ratio of one more touch of each channel. Needs enable_bqml",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "bqml", "weekly", "optional", "attribution_extended"],
+  columns: {
+    coefficient: "Logistic regression weight of one touch of the channel (log odds)",
+    odds_ratio_per_touch: "exp(coefficient): 1.3 = each touch multiplies the odds of converting by 1.3",
+    attributed_conversions: "Sum over the converting journeys of max(coef, 0) x touches / sum of the same over the channels of the journey (linear when every coefficient of the journey is <= 0)",
+    share: "attributed_conversions / total conversions"
+  }
+}
+
+js {
+  const lg = cfg_attribution_extended.logistic;
+  const slug = name => "n_" + name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const mapping = lg.channels.map(ch => `STRUCT(${helpers.sqlString(slug(ch))} AS feature, ${helpers.sqlString(ch)} AS channel)`);
+  mapping.push(`STRUCT('n_other' AS feature, '(other)' AS channel)`);
+}
+
+WITH
+weights AS (
+  SELECT w.processed_input AS feature, w.weight AS coefficient, m.channel
+  FROM ML.WEIGHTS(MODEL ${ref("attr_model_journey_logit")}) AS w
+  JOIN UNNEST([${mapping.join(", ")}]) AS m ON m.feature = w.processed_input
+),
+
+touch_counts AS (
+  SELECT
+    j.journey_id,
+    j.conversion_value,
+    IF(${helpers.inList("COALESCE(t.default_channel, '')", lg.channels)}, t.default_channel, '(other)') AS channel,
+    LEAST(COUNT(*), ${lg.max_touches_per_channel}) AS touches
+  FROM ${ref("attr_user_journeys")} AS j, UNNEST(j.touches) AS t
+  WHERE j.is_converted
+  GROUP BY 1, 2, 3
+),
+
+scored AS (
+  SELECT
+    c.*,
+    GREATEST(COALESCE(w.coefficient, 0), 0) * c.touches AS raw_credit
+  FROM touch_counts AS c
+  LEFT JOIN weights AS w USING (channel)
+),
+
+credits AS (
+  SELECT
+    *,
+    COALESCE(
+      SAFE_DIVIDE(raw_credit, NULLIF(SUM(raw_credit) OVER (PARTITION BY journey_id), 0)),
+      SAFE_DIVIDE(touches, SUM(touches) OVER (PARTITION BY journey_id))
+    ) AS credit
+  FROM scored
+),
+
+by_channel AS (
+  SELECT channel, SUM(credit) AS attributed_conversions, SUM(credit * conversion_value) AS attributed_value
+  FROM credits
+  GROUP BY channel
+)
+
+SELECT
+  (SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1) AS key_event_name,
+  w.channel,
+  w.coefficient,
+  EXP(w.coefficient) AS odds_ratio_per_touch,
+  COALESCE(b.attributed_conversions, 0) AS attributed_conversions,
+  COALESCE(b.attributed_value, 0) AS attributed_value,
+  SAFE_DIVIDE(b.attributed_conversions, SUM(b.attributed_conversions) OVER ()) AS share,
+  ${helpers.today()} AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM weights AS w
+LEFT JOIN by_channel AS b USING (channel)

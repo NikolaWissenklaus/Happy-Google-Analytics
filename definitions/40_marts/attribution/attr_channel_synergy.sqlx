@@ -1,0 +1,79 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_channel_synergy",
+  description: "Which channels work better TOGETHER: for every pair of channels, the conversion of the journeys that had both against what you would expect if they worked independently (1 - (1 - P(y|i alone)) (1 - P(y|j alone))). Synergy > 1 = 1 + 1 > 2 (the YouTube that makes the brand search convert), < 1 = they fight for the same people (two retargeting vendors). Over the converting and non converting journeys of attr_user_journeys. Plan the mix by pairs, not by channels",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science", "attribution_extended"],
+  columns: {
+    p_i_alone: "Conversion of the journeys with channel i and without channel j",
+    p_j_alone: "Conversion of the journeys with channel j and without channel i",
+    p_both: "Conversion of the journeys with both",
+    p_expected_independent: "1 - (1 - p_i_alone) (1 - p_j_alone)",
+    synergy_index: "p_both / p_expected_independent",
+    p_both_interval: "Wilson 95% interval of p_both",
+    relationship: "synergy (index >= 1.2 and the lower bound of p_both above the expected) | cannibalization (index <= 0.8) | independent"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+}
+
+WITH
+journey_channels AS (
+  SELECT j.journey_id, j.is_converted, channel
+  FROM ${ref("attr_user_journeys")} AS j, UNNEST(j.channel_set) AS channel
+),
+
+singles AS (
+  SELECT channel, COUNT(*) AS journeys, COUNTIF(is_converted) AS conversions
+  FROM journey_channels
+  GROUP BY channel
+  HAVING COUNT(*) >= ${ax.min_journeys_per_channel}
+),
+
+pairs AS (
+  SELECT a.channel AS channel_i, b.channel AS channel_j, COUNT(*) AS journeys_both, COUNTIF(a.is_converted) AS conversions_both
+  FROM journey_channels AS a
+  JOIN journey_channels AS b
+    ON b.journey_id = a.journey_id
+    AND a.channel < b.channel
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${ax.min_journeys_per_pair}
+),
+
+rates AS (
+  SELECT
+    p.channel_i,
+    p.channel_j,
+    p.journeys_both,
+    p.conversions_both,
+    si.journeys - p.journeys_both AS journeys_i_alone,
+    sj.journeys - p.journeys_both AS journeys_j_alone,
+    SAFE_DIVIDE(si.conversions - p.conversions_both, si.journeys - p.journeys_both) AS p_i_alone,
+    SAFE_DIVIDE(sj.conversions - p.conversions_both, sj.journeys - p.journeys_both) AS p_j_alone,
+    SAFE_DIVIDE(p.conversions_both, p.journeys_both) AS p_both
+  FROM pairs AS p
+  JOIN singles AS si ON si.channel = p.channel_i
+  JOIN singles AS sj ON sj.channel = p.channel_j
+)
+
+SELECT
+  *,
+  1 - (1 - p_i_alone) * (1 - p_j_alone) AS p_expected_independent,
+  SAFE_DIVIDE(p_both, 1 - (1 - p_i_alone) * (1 - p_j_alone)) AS synergy_index,
+  ${ref("wilson_interval")}(conversions_both, journeys_both, 1.96) AS p_both_interval,
+  CASE
+    WHEN SAFE_DIVIDE(p_both, 1 - (1 - p_i_alone) * (1 - p_j_alone)) >= 1.2
+      AND (${ref("wilson_interval")}(conversions_both, journeys_both, 1.96)).low > 1 - (1 - p_i_alone) * (1 - p_j_alone) THEN 'synergy'
+    WHEN SAFE_DIVIDE(p_both, 1 - (1 - p_i_alone) * (1 - p_j_alone)) <= 0.8 THEN 'cannibalization'
+    ELSE 'independent'
+  END AS relationship,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rates

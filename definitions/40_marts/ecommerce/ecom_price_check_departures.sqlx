@@ -1,0 +1,155 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_price_check_departures",
+  description: "The competitor you never see in GA4: the session ends ON a product page, without a purchase, and the same person comes back to the SAME product a few hours later (usually through Google or a tab left open). That is a price check. Per item (last 60 days): how many departures, how many came back, how many bought after coming back and how many never returned (lost to somebody else), compared with the category. Items with a high never_returned_share against the category = the price or the freight is losing outside your site",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier", "pricing"],
+  columns: {
+    departures: "Sessions without purchase whose exit page is a product page and whose last viewed product is this item",
+    returned_share: "Departures where the same user_key viewed the same item again within cfg_frontier.price_check.max_return_hours",
+    bought_after_return_share: "Departures followed by a purchase of the item inside the window",
+    never_returned_share: "Departures without any new view of the item inside the window (or the person came back on a device we could not stitch)",
+    avg_hours_to_return: "Average hours between the end of the departure session and the first new view of the item",
+    returned_via_search_share: "Returns that came through search or shopping (Organic / Paid Search, Shopping): compared prices on Google and came back",
+    returned_via_direct_share: "Returns through Direct: usually the tab left open or the url copied",
+    category_never_returned_share: "never_returned_share of all the items of the same category",
+    competitor_loss_index: "never_returned_share / category_never_returned_share. Above 1.3 with volume = this item loses more than its neighbours"
+  }
+}
+
+js {
+  const pc = cfg_frontier.price_check;
+}
+
+WITH
+last_view AS (
+  SELECT
+    session_key,
+    ARRAY_AGG(STRUCT(item_id, item_name, item_category, price, event_ts) ORDER BY event_ts DESC LIMIT 1)[OFFSET(0)] AS v
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(pc.window_days)}
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+  GROUP BY session_key
+),
+
+departures AS (
+  SELECT
+    s.session_key,
+    s.user_key,
+    s.session_end_ts,
+    s.device_category,
+    lv.v.item_id,
+    lv.v.item_name,
+    lv.v.item_category,
+    lv.v.price
+  FROM ${ref("fct_sessions")} AS s
+  JOIN last_view AS lv USING (session_key)
+  WHERE s.session_date >= ${helpers.daysAgo(pc.window_days)}
+    AND NOT s.has_purchase
+    AND s.engagement_time_sec >= ${pc.min_session_engagement_sec}
+    AND ${content.pageTypeCase("s.exit_page_path")} = 'product'
+    -- the window to come back must be complete
+    AND s.session_end_ts < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${pc.max_return_hours} HOUR)
+    ${helpers.martSessionFilter("s")}
+),
+
+returns AS (
+  SELECT
+    d.session_key,
+    MIN(r.event_ts) AS returned_ts,
+    ARRAY_AGG(r.session_default_channel_group IGNORE NULLS ORDER BY r.event_ts LIMIT 1)[SAFE_OFFSET(0)] AS return_channel
+  FROM departures AS d
+  JOIN ${ref("fct_item_interactions")} AS r
+    ON r.user_key = d.user_key
+    AND r.item_id = d.item_id
+    AND r.event_ts > d.session_end_ts
+    AND r.event_ts <= TIMESTAMP_ADD(d.session_end_ts, INTERVAL ${pc.max_return_hours} HOUR)
+  WHERE r.event_date >= ${helpers.daysAgo(pc.window_days)}
+    AND r.event_name = 'view_item'
+    AND r.session_key != d.session_key
+  GROUP BY d.session_key
+),
+
+purchases AS (
+  SELECT d.session_key, MIN(t.transaction_ts) AS bought_ts
+  FROM departures AS d
+  JOIN ${ref("fct_transaction_items")} AS t
+    ON t.user_key = d.user_key
+    AND t.item_id = d.item_id
+    AND t.transaction_ts > d.session_end_ts
+    AND t.transaction_ts <= TIMESTAMP_ADD(d.session_end_ts, INTERVAL ${pc.max_return_hours} HOUR)
+  WHERE t.transaction_date >= ${helpers.daysAgo(pc.window_days)}
+    AND t.is_valid_for_revenue
+  GROUP BY d.session_key
+),
+
+outcomes AS (
+  SELECT
+    d.*,
+    r.returned_ts IS NOT NULL AS has_returned,
+    p.bought_ts IS NOT NULL AS has_bought,
+    TIMESTAMP_DIFF(r.returned_ts, d.session_end_ts, MINUTE) / 60 AS hours_to_return,
+    r.return_channel
+  FROM departures AS d
+  LEFT JOIN returns AS r USING (session_key)
+  LEFT JOIN purchases AS p USING (session_key)
+),
+
+items AS (
+  SELECT
+    item_id,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    APPROX_QUANTILES(price, 2 IGNORE NULLS)[OFFSET(1)] AS median_price,
+    COUNT(*) AS departures,
+    COUNT(DISTINCT user_key) AS users,
+    COUNTIF(has_returned) AS returned,
+    COUNTIF(has_bought) AS bought_after_return,
+    COUNTIF(NOT has_returned AND NOT has_bought) AS never_returned,
+    AVG(hours_to_return) AS avg_hours_to_return,
+    COUNTIF(return_channel IN ('Organic Search', 'Paid Search', 'Organic Shopping', 'Paid Shopping', 'Cross-network')) AS returned_via_search,
+    COUNTIF(return_channel = 'Direct') AS returned_via_direct,
+    SAFE_DIVIDE(COUNTIF(device_category = 'mobile'), COUNT(*)) AS mobile_share
+  FROM outcomes
+  GROUP BY item_id
+),
+
+categories AS (
+  SELECT item_category, SAFE_DIVIDE(SUM(never_returned), SUM(departures)) AS category_never_returned_share
+  FROM items
+  GROUP BY item_category
+)
+
+SELECT
+  i.item_id,
+  i.item_name,
+  i.item_category,
+  i.median_price,
+  i.departures,
+  i.users,
+  SAFE_DIVIDE(i.returned, i.departures) AS returned_share,
+  SAFE_DIVIDE(i.bought_after_return, i.departures) AS bought_after_return_share,
+  SAFE_DIVIDE(i.never_returned, i.departures) AS never_returned_share,
+  ${helpers.wilsonLower("i.never_returned", "i.departures")} AS never_returned_share_lower,
+  i.avg_hours_to_return,
+  SAFE_DIVIDE(i.returned_via_search, i.returned) AS returned_via_search_share,
+  SAFE_DIVIDE(i.returned_via_direct, i.returned) AS returned_via_direct_share,
+  i.mobile_share,
+  c.category_never_returned_share,
+  SAFE_DIVIDE(SAFE_DIVIDE(i.never_returned, i.departures), c.category_never_returned_share) AS competitor_loss_index,
+  CASE
+    WHEN SAFE_DIVIDE(SAFE_DIVIDE(i.never_returned, i.departures), c.category_never_returned_share) >= 1.3 THEN 'losing_outside'
+    WHEN SAFE_DIVIDE(i.bought_after_return, i.departures) >= 0.2 THEN 'wins_the_comparison'
+    ELSE 'normal'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM items AS i
+LEFT JOIN categories AS c USING (item_category)
+WHERE i.departures >= ${pc.min_departures}

@@ -1,0 +1,127 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_cart_filler_items",
+  description: "The item people throw in the cart only to reach the free shipping: ecom_order_value_distribution shows THAT orders bunch above a threshold, this one shows WITH WHAT. The running cart value of the session is rebuilt event by event (add_to_cart minus remove_from_cart); an add that takes a cart from just below a threshold to above it, with a cheap item, is a filler. Per threshold and item (last 120 days): filler adds, the gap they closed, the overshoot, and the conversion of the sessions that used them. The top of the list is the shelf for a 'falta pouco para o frete gratis' widget",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier", "pricing"],
+  columns: {
+    threshold: "Cart value threshold (R$)",
+    threshold_source: "configured (cfg_frontier.cart_filler.free_shipping_thresholds) | detected (bucket of ecom_order_value_distribution with bunching_ratio >= 1.5)",
+    filler_adds: "add_to_cart events of this item that crossed the threshold from below, closing a gap up to max_gap_share of the threshold",
+    filler_share_of_item_adds: "filler_adds / all the adds of the item in the window. High = the item exists in the cart to beat the threshold",
+    avg_gap_closed: "Average (threshold - cart before the add)",
+    avg_overshoot: "Average (cart after the add - threshold). Low overshoot = the item is a precise filler",
+    filler_session_conversion: "Purchase rate of the sessions where this item was a filler",
+    threshold_filler_adds: "Filler adds of the threshold summed over the items of this table (to rank the items inside it)"
+  }
+}
+
+js {
+  const cf = cfg_frontier.cart_filler;
+  const configured = (cf.free_shipping_thresholds || []).map(t => `SELECT CAST(${Number(t)} AS FLOAT64) AS threshold, 'configured' AS threshold_source`);
+}
+
+WITH
+thresholds AS (
+  SELECT threshold, MIN(threshold_source) AS threshold_source
+  FROM (
+    ${configured.length ? configured.join("\n    UNION ALL\n    ") + "\n    UNION ALL" : ""}
+    SELECT CAST(bucket_order AS FLOAT64) AS threshold, 'detected' AS threshold_source
+    FROM ${ref("ecom_order_value_distribution")}
+    WHERE bunching_ratio >= 1.5
+      AND orders >= 30
+      AND bucket_order < 999999999
+  )
+  -- configured wins over detected when both point to the same value (MIN: c < d)
+  GROUP BY threshold
+),
+
+cart_events AS (
+  SELECT
+    session_key,
+    event_id,
+    event_ts,
+    event_name,
+    ANY_VALUE(session_has_purchase) AS session_has_purchase,
+    SUM(item_value) * IF(event_name = 'remove_from_cart', -1, 1) AS signed_value
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(cf.window_days)}
+    AND event_name IN ('add_to_cart', 'remove_from_cart')
+    ${helpers.martSessionFilter()}
+  GROUP BY session_key, event_id, event_ts, event_name
+),
+
+running AS (
+  SELECT
+    *,
+    GREATEST(0, COALESCE(SUM(signed_value) OVER (
+      PARTITION BY session_key ORDER BY event_ts, event_id
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ), 0)) AS cart_before
+  FROM cart_events
+),
+
+adds AS (
+  SELECT
+    r.session_key,
+    r.event_id,
+    r.cart_before,
+    r.cart_before + r.signed_value AS cart_after,
+    r.signed_value AS add_value,
+    r.session_has_purchase,
+    i.item_id,
+    i.item_name,
+    i.item_category,
+    i.price
+  FROM running AS r
+  JOIN ${ref("fct_item_interactions")} AS i
+    ON i.event_id = r.event_id
+    AND i.event_date >= ${helpers.daysAgo(cf.window_days)}
+    AND i.event_name = 'add_to_cart'
+  WHERE r.event_name = 'add_to_cart'
+),
+
+item_adds AS (
+  SELECT item_id, COUNT(DISTINCT event_id) AS item_adds
+  FROM adds
+  GROUP BY item_id
+),
+
+fillers AS (
+  SELECT
+    t.threshold,
+    t.threshold_source,
+    a.*
+  FROM adds AS a
+  JOIN thresholds AS t
+    ON a.cart_before < t.threshold
+    AND a.cart_after >= t.threshold
+    AND t.threshold - a.cart_before <= ${cf.max_gap_share} * t.threshold
+    AND a.add_value <= ${cf.max_filler_share} * t.threshold
+)
+
+SELECT
+  f.threshold,
+  f.threshold_source,
+  f.item_id,
+  ANY_VALUE(f.item_name) AS item_name,
+  ANY_VALUE(f.item_category) AS item_category,
+  APPROX_QUANTILES(f.price, 2 IGNORE NULLS)[OFFSET(1)] AS median_price,
+  COUNT(DISTINCT f.event_id) AS filler_adds,
+  COUNT(DISTINCT f.session_key) AS filler_sessions,
+  SAFE_DIVIDE(COUNT(DISTINCT f.event_id), ANY_VALUE(ia.item_adds)) AS filler_share_of_item_adds,
+  AVG(f.threshold - f.cart_before) AS avg_gap_closed,
+  AVG(f.cart_after - f.threshold) AS avg_overshoot,
+  SAFE_DIVIDE(COUNT(DISTINCT IF(f.session_has_purchase, f.session_key, NULL)), COUNT(DISTINCT f.session_key)) AS filler_session_conversion,
+  SUM(COUNT(DISTINCT f.event_id)) OVER (PARTITION BY f.threshold) AS threshold_filler_adds,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fillers AS f
+LEFT JOIN item_adds AS ia USING (item_id)
+GROUP BY f.threshold, f.threshold_source, f.item_id
+HAVING COUNT(DISTINCT f.event_id) >= ${cf.min_events}

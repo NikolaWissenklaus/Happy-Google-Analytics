@@ -1,0 +1,110 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_audience_affluence_index",
+  description: "Purchasing power of the audience of each channel, campaign and state, read from the phone in the hand of the visitor: in Brazil an iPhone or a flagship Galaxy costs months of minimum wage, an entry Android or a phone stuck in an old system says the opposite. Each mobile session gets a device tier (premium | mid | entry) and every channel / source medium / campaign / UF gets an affluence index (100 = the site average). Two campaigns with the same CPA can bring very different customers: the index tells which one brings the wallet, before the LTV shows it. Validated in the same table with the revenue per session of each tier",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "frontier", "media_quality"],
+  columns: Object.assign(docs.pick("sessions", "conversion_rate"), {
+    grouping_level: "tier (the validation rows) | channel | source_medium | campaign | geo_uf",
+    grouping_value: "Value of the dimension of grouping_level",
+    premium_share: "Sessions on premium devices (Apple mobile, or cfg_frontier.affluence.premium_pattern on brand + model)",
+    entry_share: "Sessions on entry devices (cfg_frontier.affluence.entry_pattern, or iOS / Android major version below old_ios_major / old_android_major)",
+    affluence_index: "100 * (1 + premium_share - entry_share) / (1 + same for the whole site). 120 = clearly richer audience than the average, 80 = clearly poorer",
+    revenue_per_session_ratio: "Revenue per session of the group / of the site, to check the index against real money"
+  })
+}
+
+js {
+  const af = cfg_frontier.affluence;
+}
+
+WITH
+sessions AS (
+  SELECT
+    session_default_channel_group,
+    session_source_medium,
+    session_campaign,
+    geo_uf,
+    transactions,
+    revenue,
+    LOWER(CONCAT(COALESCE(device_brand, ''), ' ', COALESCE(device_model, ''))) AS device_text,
+    LOWER(COALESCE(device_os, '')) AS os,
+    SAFE_CAST(REGEXP_EXTRACT(COALESCE(device_os_version, ''), r'(\d+)') AS INT64) AS os_major,
+    LOWER(COALESCE(device_brand, '')) AS brand
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(af.window_days)}
+    AND session_date < ${helpers.today()}
+    AND device_category IN ('mobile', 'tablet')
+    ${helpers.martSessionFilter()}
+),
+
+tiered AS (
+  SELECT
+    *,
+    CASE
+      WHEN REGEXP_CONTAINS(device_text, r'${af.entry_pattern}') THEN 'entry'
+      WHEN os = 'ios' AND os_major < ${af.old_ios_major} THEN 'entry'
+      WHEN os = 'android' AND os_major < ${af.old_android_major} THEN 'entry'
+      WHEN REGEXP_CONTAINS(device_text, r'${af.premium_pattern}') THEN 'premium'
+      WHEN brand = 'apple' OR os = 'ios' THEN 'premium'
+      ELSE 'mid'
+    END AS device_tier
+  FROM sessions
+),
+
+grouped AS (
+  SELECT
+    g.grouping_level,
+    g.grouping_value,
+    COUNT(*) AS sessions,
+    SUM(t.transactions) AS transactions,
+    SUM(t.revenue) AS revenue,
+    SAFE_DIVIDE(COUNTIF(t.device_tier = 'premium'), COUNT(*)) AS premium_share,
+    SAFE_DIVIDE(COUNTIF(t.device_tier = 'mid'), COUNT(*)) AS mid_share,
+    SAFE_DIVIDE(COUNTIF(t.device_tier = 'entry'), COUNT(*)) AS entry_share
+  FROM tiered AS t
+  CROSS JOIN UNNEST([
+    STRUCT('tier' AS grouping_level, t.device_tier AS grouping_value),
+    STRUCT('channel', t.session_default_channel_group),
+    STRUCT('source_medium', t.session_source_medium),
+    STRUCT('campaign', t.session_campaign),
+    STRUCT('geo_uf', t.geo_uf)
+  ]) AS g
+  WHERE g.grouping_value IS NOT NULL
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${af.min_sessions}
+),
+
+site AS (
+  SELECT
+    SAFE_DIVIDE(COUNTIF(device_tier = 'premium'), COUNT(*)) AS site_premium_share,
+    SAFE_DIVIDE(COUNTIF(device_tier = 'entry'), COUNT(*)) AS site_entry_share,
+    SAFE_DIVIDE(SUM(revenue), COUNT(*)) AS site_revenue_per_session,
+    SAFE_DIVIDE(SUM(transactions), COUNT(*)) AS site_conversion_rate
+  FROM tiered
+)
+
+SELECT
+  g.grouping_level,
+  g.grouping_value,
+  g.sessions,
+  g.transactions,
+  g.revenue,
+  SAFE_DIVIDE(g.transactions, g.sessions) AS conversion_rate,
+  SAFE_DIVIDE(g.revenue, g.transactions) AS average_order_value,
+  SAFE_DIVIDE(g.revenue, g.sessions) AS revenue_per_session,
+  g.premium_share,
+  g.mid_share,
+  g.entry_share,
+  100 * SAFE_DIVIDE(1 + g.premium_share - g.entry_share, 1 + s.site_premium_share - s.site_entry_share) AS affluence_index,
+  SAFE_DIVIDE(SAFE_DIVIDE(g.revenue, g.sessions), s.site_revenue_per_session) AS revenue_per_session_ratio,
+  SAFE_DIVIDE(SAFE_DIVIDE(g.transactions, g.sessions), s.site_conversion_rate) AS conversion_ratio,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM grouped AS g
+CROSS JOIN site AS s

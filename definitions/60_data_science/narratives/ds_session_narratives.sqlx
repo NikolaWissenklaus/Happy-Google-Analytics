@@ -1,0 +1,149 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ds,
+  name: "ds_session_narratives",
+  description: "Every session told as a short story in plain text: who arrived, from where, on what device and at what time, what they looked at, searched, put in the cart, how far they went and how it ended. Built for the things that read text and not tables: an LLM that summarises the day, a support or sales agent that wants to know what the customer just did, an embedding model to cluster journeys, a human that wants to read 20 sessions before trusting a dashboard. One row per session (last 14 days), with the same story also as a compact token string (journey_tokens) for sequence models. Personal data (user level): dataset ga4_data_science",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["user_key"],
+    labels: { layer: "data_science", domain: "narratives" }
+  },
+  tags: ["data_science", "daily", "frontier"],
+  columns: Object.assign(docs.pick("session_key", "user_key", "session_date"), {
+    narrative: "The session in one paragraph (english, no personal data besides the city of the IP)",
+    journey_tokens: "Compact sequence of page types and ecommerce steps (page:product > view_item > add_to_cart > page:cart), consecutive repeats removed, up to 40 tokens, for sequence and embedding models",
+    outcome: "purchased | abandoned_checkout | abandoned_cart | browsed_products | bounced | browsed",
+    products_viewed: "Names of the first products viewed (cfg_frontier.narratives.max_items_in_text)",
+    search_terms: "Site search terms of the session"
+  })
+}
+
+js {
+  const nr = cfg_frontier.narratives;
+}
+
+WITH
+sessions AS (
+  SELECT *
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(nr.window_days)}
+),
+
+item_first AS (
+  SELECT session_key, event_name, item_name, MIN(event_ts) AS first_ts
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(nr.window_days)}
+    AND event_name IN ('view_item', 'add_to_cart')
+    AND item_name IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+
+items AS (
+  SELECT
+    session_key,
+    STRING_AGG(IF(event_name = 'view_item', item_name, NULL), ', ' ORDER BY first_ts LIMIT ${nr.max_items_in_text}) AS products_viewed,
+    COUNTIF(event_name = 'view_item') AS distinct_products_viewed,
+    STRING_AGG(IF(event_name = 'add_to_cart', item_name, NULL), ', ' ORDER BY first_ts LIMIT ${nr.max_items_in_text}) AS products_added
+  FROM item_first
+  GROUP BY session_key
+),
+
+searches AS (
+  SELECT session_key, STRING_AGG(DISTINCT CONCAT("'", LOWER(TRIM(search_term)), "'"), ', ' LIMIT 5) AS search_terms
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.daysAgo(nr.window_days)}
+    AND event_name = 'view_search_results'
+    AND search_term IS NOT NULL
+  GROUP BY session_key
+),
+
+steps AS (
+  SELECT
+    session_key,
+    STRING_AGG(token, ' > ' ORDER BY event_ts LIMIT 40) AS journey_tokens
+  FROM (
+    SELECT
+      session_key,
+      event_ts,
+      CASE
+        WHEN event_name IN ('page_view', 'screen_view') THEN CONCAT('page:', COALESCE(${content.pageTypeCase("page_path")}, 'other'))
+        ELSE event_name
+      END AS token,
+      LAG(CASE WHEN event_name IN ('page_view', 'screen_view') THEN CONCAT('page:', COALESCE(${content.pageTypeCase("page_path")}, 'other')) ELSE event_name END)
+        OVER (PARTITION BY session_key ORDER BY event_ts) AS previous_token
+    FROM ${ref("fct_events")}
+    WHERE event_date >= ${helpers.daysAgo(nr.window_days)}
+      AND event_name IN ('page_view', 'screen_view', 'view_search_results', 'view_item', 'add_to_cart', 'remove_from_cart',
+        'begin_checkout', 'add_shipping_info', 'add_payment_info', 'purchase', 'login', 'sign_up', 'generate_lead', 'share')
+  )
+  -- the same page type twice in a row says nothing new
+  WHERE token != COALESCE(previous_token, '')
+  GROUP BY session_key
+),
+
+assembled AS (
+  SELECT
+    s.session_key,
+    s.user_key,
+    s.session_date,
+    s.session_start_ts,
+    s.session_default_channel_group,
+    s.device_category,
+    s.geo_uf,
+    s.has_purchase,
+    s.revenue,
+    s.is_bot_suspect,
+    s.consent_ads_storage,
+    i.products_viewed,
+    i.products_added,
+    q.search_terms,
+    st.journey_tokens,
+    CASE
+      WHEN s.has_purchase THEN 'purchased'
+      WHEN s.has_begin_checkout THEN 'abandoned_checkout'
+      WHEN s.has_add_to_cart THEN 'abandoned_cart'
+      WHEN s.has_view_item THEN 'browsed_products'
+      WHEN NOT s.is_engaged THEN 'bounced'
+      ELSE 'browsed'
+    END AS outcome,
+    CONCAT(
+      IF(s.is_new_user, 'A new visitor', FORMAT('A returning visitor (visit #%d)', COALESCE(s.session_number, 0))),
+      IF(s.is_identified_user, ', logged in,', ''),
+      ' arrived from ', COALESCE(s.session_default_channel_group, 'an unknown channel'),
+      ' (', COALESCE(s.session_source, '(not set)'), ' / ', COALESCE(s.session_medium, '(not set)'),
+      IF(s.session_campaign IS NOT NULL AND s.session_campaign NOT IN ('(not set)', '(direct)', '(organic)', '(referral)'), CONCAT(', campaign ', s.session_campaign), ''),
+      ') on a ', COALESCE(s.device_category, 'device'),
+      IF(s.device_browser IS NOT NULL, CONCAT(' with ', s.device_browser), ''),
+      IF(s.geo_city IS NOT NULL AND s.geo_city != '(not set)', CONCAT(' in ', s.geo_city, IF(s.geo_uf IS NOT NULL, CONCAT('/', s.geo_uf), '')), ''),
+      ', ', FORMAT_DATE('%A', s.session_date), ' at ', COALESCE(CAST(s.session_hour AS STRING), '?'), 'h. ',
+      'Landed on ', COALESCE(s.landing_page_type, 'a page'), ' ', COALESCE(s.landing_page_path, ''), '. ',
+      FORMAT('%d views and %d seconds of engagement in %d minutes. ', COALESCE(s.page_views, 0) + COALESCE(s.screen_views, 0), CAST(COALESCE(s.engagement_time_sec, 0) AS INT64), DIV(CAST(COALESCE(s.session_duration_sec, 0) AS INT64), 60)),
+      IF(q.search_terms IS NOT NULL, CONCAT('Searched for ', q.search_terms, '. '), ''),
+      IF(i.products_viewed IS NOT NULL, CONCAT('Looked at ', CAST(i.distinct_products_viewed AS STRING), ' product(s): ', i.products_viewed, '. '), ''),
+      IF(i.products_added IS NOT NULL, CONCAT('Added to the cart: ', i.products_added, '. '), ''),
+      CASE
+        WHEN s.has_purchase THEN FORMAT('Bought: %d order(s), %s %.2f', s.transactions, '${constants.CURRENCY}', COALESCE(s.revenue, 0))
+        WHEN s.has_add_payment_info THEN 'Reached the payment step and did not finish'
+        WHEN s.has_add_shipping_info THEN 'Calculated the shipping and left'
+        WHEN s.has_begin_checkout THEN 'Started the checkout and left'
+        WHEN s.has_add_to_cart THEN 'Left the cart behind'
+        WHEN NOT s.is_engaged THEN 'Left without engaging'
+        ELSE 'Left'
+      END,
+      IF(s.has_purchase, '', CONCAT(' on ', COALESCE(s.exit_page_path, 'an unknown page'))),
+      IF(s.has_purchase AND s.last_payment_type IS NOT NULL, CONCAT(' paying with ', s.last_payment_type), ''),
+      '.',
+      IF(s.is_bot_suspect, ' Warning: this session looks like a bot.', ''),
+      IF(s.consent_analytics_storage = 'denied', ' Analytics consent denied (partial data).', '')
+    ) AS narrative
+  FROM sessions AS s
+  LEFT JOIN items AS i USING (session_key)
+  LEFT JOIN searches AS q USING (session_key)
+  LEFT JOIN steps AS st USING (session_key)
+)
+
+SELECT *, CURRENT_TIMESTAMP() AS loaded_at
+FROM assembled

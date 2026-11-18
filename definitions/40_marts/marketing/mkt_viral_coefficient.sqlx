@@ -1,0 +1,151 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_viral_coefficient",
+  description: "The K factor of the store, the growth metric of the apps, built from the GA4 share event: per week, how many active users share, how many shares they make, how many NEW users arrive through shared links (WhatsApp, Telegram, share buttons, cfg_frontier.viral.shared_link_pattern) and what those referred newcomers bought in their first days. K = new users from shared links / active users. K = 0.1 means every 10 visitors bring one more for free: it is a channel, it deserves a budget (bigger share buttons, a referral coupon). Free of any referral program, works with what GA4 already collects",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "frontier"],
+  columns: {
+    week: "Week (monday)",
+    active_users: "Active users of the week (distinct devices, GA4 active user rule)",
+    sharers: "Distinct people that triggered a share event (cfg_frontier.viral.share_event_names)",
+    shares: "Share events",
+    shares_per_sharer: "shares / sharers",
+    sharer_rate: "sharers / active_users",
+    new_users_from_shared_links: "New users (first session) whose session source / medium matches cfg_frontier.viral.shared_link_pattern",
+    share_yield: "new_users_from_shared_links / shares: newcomers per share",
+    k_factor: "new_users_from_shared_links / active_users",
+    referred_buyers: "Of those newcomers, how many purchased within cfg_frontier.viral.attribution_days of the first session",
+    referred_revenue: "Revenue of those purchases",
+    referred_conversion_rate: "referred_buyers / new_users_from_shared_links",
+    baseline_new_user_conversion_rate: "Same conversion for all the other new users of the week (to compare the quality)",
+    top_share_methods: "Share methods (method param: whatsapp, copy_link, facebook...) and their counts",
+    top_shared_content_types: "content_type param of the share events and their counts"
+  }
+}
+
+js {
+  const vr = cfg_frontier.viral;
+  const windowStart = helpers.daysAgo(vr.window_days);
+}
+
+WITH
+shares AS (
+  SELECT
+    ${helpers.weekStart("event_date")} AS week,
+    user_key,
+    COALESCE(LOWER(method), '(not set)') AS method,
+    COALESCE(LOWER(content_type), '(not set)') AS content_type
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${windowStart}
+    AND event_date < ${helpers.today()}
+    AND ${helpers.inList("event_name", vr.share_event_names)}
+),
+
+share_weeks AS (
+  SELECT week, COUNT(DISTINCT user_key) AS sharers, COUNT(*) AS shares
+  FROM shares
+  GROUP BY week
+),
+
+methods AS (
+  SELECT week, ARRAY_AGG(STRUCT(method, shares) ORDER BY shares DESC LIMIT 10) AS top_share_methods
+  FROM (SELECT week, method, COUNT(*) AS shares FROM shares GROUP BY 1, 2)
+  GROUP BY week
+),
+
+content_types AS (
+  SELECT week, ARRAY_AGG(STRUCT(content_type, shares) ORDER BY shares DESC LIMIT 10) AS top_shared_content_types
+  FROM (SELECT week, content_type, COUNT(*) AS shares FROM shares GROUP BY 1, 2)
+  GROUP BY week
+),
+
+sessions AS (
+  SELECT
+    ${helpers.weekStart("session_date")} AS week,
+    user_key,
+    user_pseudo_id,
+    session_start_ts,
+    is_new_user,
+    ${metrics.ACTIVE_USER} AS is_active,
+    is_new_user AND REGEXP_CONTAINS(LOWER(CONCAT(COALESCE(session_source_only, ''), ' ', COALESCE(session_medium_only, ''))), r'${vr.shared_link_pattern}') AS is_from_shared_link
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${windowStart}
+    AND session_date < ${helpers.today()}
+    ${helpers.martSessionFilter()}
+),
+
+newcomers AS (
+  SELECT
+    week,
+    user_key,
+    is_from_shared_link,
+    MIN(session_start_ts) AS first_ts
+  FROM sessions
+  WHERE is_new_user
+  GROUP BY week, user_key, is_from_shared_link
+),
+
+newcomer_purchases AS (
+  SELECT
+    n.week,
+    n.user_key,
+    n.is_from_shared_link,
+    COUNT(t.transaction_id) > 0 AS bought,
+    COALESCE(SUM(t.revenue), 0) AS revenue
+  FROM newcomers AS n
+  LEFT JOIN ${ref("fct_transactions")} AS t
+    ON t.user_key = n.user_key
+    AND t.is_valid_for_revenue
+    AND t.transaction_date >= ${windowStart}
+    AND t.transaction_ts >= n.first_ts
+    AND t.transaction_ts < TIMESTAMP_ADD(n.first_ts, INTERVAL ${vr.attribution_days} DAY)
+  GROUP BY 1, 2, 3
+),
+
+newcomer_weeks AS (
+  SELECT
+    week,
+    COUNTIF(is_from_shared_link) AS new_users_from_shared_links,
+    COUNTIF(is_from_shared_link AND bought) AS referred_buyers,
+    SUM(IF(is_from_shared_link, revenue, 0)) AS referred_revenue,
+    SAFE_DIVIDE(COUNTIF(NOT is_from_shared_link AND bought), COUNTIF(NOT is_from_shared_link)) AS baseline_new_user_conversion_rate
+  FROM newcomer_purchases
+  GROUP BY week
+),
+
+active AS (
+  SELECT week, COUNT(DISTINCT IF(is_active, user_pseudo_id, NULL)) AS active_users
+  FROM sessions
+  GROUP BY week
+)
+
+SELECT
+  a.week,
+  a.active_users,
+  COALESCE(s.sharers, 0) AS sharers,
+  COALESCE(s.shares, 0) AS shares,
+  SAFE_DIVIDE(s.shares, s.sharers) AS shares_per_sharer,
+  SAFE_DIVIDE(s.sharers, a.active_users) AS sharer_rate,
+  COALESCE(n.new_users_from_shared_links, 0) AS new_users_from_shared_links,
+  SAFE_DIVIDE(n.new_users_from_shared_links, s.shares) AS share_yield,
+  SAFE_DIVIDE(n.new_users_from_shared_links, a.active_users) AS k_factor,
+  COALESCE(n.referred_buyers, 0) AS referred_buyers,
+  COALESCE(n.referred_revenue, 0) AS referred_revenue,
+  SAFE_DIVIDE(n.referred_buyers, n.new_users_from_shared_links) AS referred_conversion_rate,
+  n.baseline_new_user_conversion_rate,
+  m.top_share_methods,
+  c.top_shared_content_types,
+  -- the last week of the window has not had time to convert the newcomers
+  a.week > ${helpers.weekStart(helpers.daysAgo(vr.attribution_days + 7))} AS is_incomplete_week,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM active AS a
+LEFT JOIN share_weeks AS s USING (week)
+LEFT JOIN newcomer_weeks AS n USING (week)
+LEFT JOIN methods AS m USING (week)
+LEFT JOIN content_types AS c USING (week)

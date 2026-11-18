@@ -1,0 +1,156 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_cart_pipeline_forecast",
+  description: "The open carts as a sales pipeline, the way a B2B team looks at its CRM: every person has one cart that opens at the first add_to_cart after the last purchase and closes with the next purchase (or dies after cfg_frontier.cart_pipeline.max_cart_age_days). From the carts of the past it learns P(the cart converts in the next 7 days | it is still open at age a) and applies it to the carts open today: expected orders and revenue already sitting in the pipeline, per age of the cart. Plus Little's law (L = lambda x W) to say if the pipeline is clogging (more open carts than the arrival rate explains). One row per cart age in days",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier"],
+  columns: {
+    cart_age_days: "Days since the cart opened (first add_to_cart after the last purchase of the person)",
+    open_carts_now: "Carts of this age still open today",
+    open_cart_value_now: "Sum of their value (adds - removes)",
+    learned_open_carts: "Past carts that were still open at this age (learning sample)",
+    p_convert_in_horizon: "Of the past carts still open at this age, share that converted in the next forecast_horizon_days",
+    expected_orders: "open_carts_now * p_convert_in_horizon",
+    expected_revenue: "open_cart_value_now * p_convert_in_horizon * order_to_cart_value_ratio",
+    order_to_cart_value_ratio: "Median revenue of the closing order / value of the cart (people buy more, or less, than what is in the cart)",
+    arrival_rate_per_day: "Little's law lambda: carts opened per day in the learning window",
+    avg_days_in_pipeline: "Little's law W: average days a cart stays open (dead carts count max_cart_age_days)",
+    littles_law_expected_open_carts: "lambda * W: how many carts should be open in a stable pipeline",
+    pipeline_pressure: "open carts now (all ages) / littles_law_expected_open_carts. Above 1.2 = carts piling up (price, freight or stock?), below 0.8 = the top of the funnel is drying"
+  }
+}
+
+js {
+  const cp = cfg_frontier.cart_pipeline;
+  const historyStart = helpers.daysAgo(cp.learning_days + cp.max_cart_age_days + cp.forecast_horizon_days);
+}
+
+WITH
+events AS (
+  SELECT
+    user_key,
+    event_ts,
+    'cart' AS kind,
+    SUM(item_value) * IF(event_name = 'remove_from_cart', -1, 1) AS value
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${historyStart}
+    AND event_name IN ('add_to_cart', 'remove_from_cart')
+    AND user_key IS NOT NULL
+    ${helpers.martSessionFilter()}
+  GROUP BY user_key, event_id, event_ts, event_name
+
+  UNION ALL
+
+  SELECT user_key, transaction_ts, 'purchase' AS kind, revenue AS value
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${historyStart}
+    AND is_valid_for_revenue
+    AND user_key IS NOT NULL
+),
+
+epochs AS (
+  SELECT
+    *,
+    -- purchases before this row: every row between two purchases belongs to the same cart.
+    -- the purchase itself gets the epoch of the cart it closes
+    COALESCE(COUNTIF(kind = 'purchase') OVER (
+      PARTITION BY user_key ORDER BY event_ts, kind
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+    ), 0) AS epoch
+  FROM events
+),
+
+carts AS (
+  SELECT
+    user_key,
+    epoch,
+    MIN(IF(kind = 'cart', event_ts, NULL)) AS opened_ts,
+    GREATEST(0, SUM(IF(kind = 'cart', value, 0))) AS cart_value,
+    MIN(IF(kind = 'purchase', event_ts, NULL)) AS closed_ts,
+    ARRAY_AGG(IF(kind = 'purchase', value, NULL) IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS closing_revenue
+  FROM epochs
+  GROUP BY user_key, epoch
+  HAVING COUNTIF(kind = 'cart') > 0
+),
+
+carts_aged AS (
+  SELECT
+    *,
+    DATE(opened_ts, '${constants.TIMEZONE}') AS opened_date,
+    IF(
+      closed_ts IS NOT NULL AND TIMESTAMP_DIFF(closed_ts, opened_ts, HOUR) < 24 * ${cp.max_cart_age_days},
+      DIV(TIMESTAMP_DIFF(closed_ts, opened_ts, HOUR), 24),
+      NULL
+    ) AS converted_at_age
+  FROM carts
+),
+
+learning AS (
+  SELECT *
+  FROM carts_aged
+  WHERE opened_date >= ${helpers.daysAgo(cp.learning_days + cp.max_cart_age_days + cp.forecast_horizon_days)}
+    AND opened_date < ${helpers.daysAgo(cp.max_cart_age_days + cp.forecast_horizon_days)}
+),
+
+ages AS (
+  SELECT age FROM UNNEST(GENERATE_ARRAY(0, ${cp.max_cart_age_days - 1})) AS age
+),
+
+learned AS (
+  SELECT
+    a.age AS cart_age_days,
+    COUNTIF(l.converted_at_age IS NULL OR l.converted_at_age >= a.age) AS learned_open_carts,
+    COUNTIF(l.converted_at_age >= a.age AND l.converted_at_age < a.age + ${cp.forecast_horizon_days}) AS learned_conversions
+  FROM ages AS a
+  CROSS JOIN learning AS l
+  GROUP BY a.age
+),
+
+little AS (
+  SELECT
+    SAFE_DIVIDE(COUNT(*), ${cp.learning_days}) AS arrival_rate_per_day,
+    AVG(COALESCE(converted_at_age, ${cp.max_cart_age_days})) AS avg_days_in_pipeline,
+    APPROX_QUANTILES(SAFE_DIVIDE(closing_revenue, NULLIF(cart_value, 0)), 2 IGNORE NULLS)[OFFSET(1)] AS order_to_cart_value_ratio,
+    SAFE_DIVIDE(COUNTIF(converted_at_age IS NOT NULL), COUNT(*)) AS cart_conversion_rate
+  FROM learning
+),
+
+open_now AS (
+  SELECT
+    DATE_DIFF(${helpers.today()}, opened_date, DAY) AS cart_age_days,
+    COUNT(*) AS open_carts_now,
+    COUNT(DISTINCT user_key) AS open_cart_people_now,
+    SUM(cart_value) AS open_cart_value_now
+  FROM carts_aged
+  WHERE closed_ts IS NULL
+    AND opened_date > ${helpers.daysAgo(cp.max_cart_age_days)}
+  GROUP BY 1
+)
+
+SELECT
+  l.cart_age_days,
+  COALESCE(o.open_carts_now, 0) AS open_carts_now,
+  COALESCE(o.open_cart_value_now, 0) AS open_cart_value_now,
+  l.learned_open_carts,
+  SAFE_DIVIDE(l.learned_conversions, l.learned_open_carts) AS p_convert_in_horizon,
+  COALESCE(o.open_carts_now, 0) * SAFE_DIVIDE(l.learned_conversions, l.learned_open_carts) AS expected_orders,
+  COALESCE(o.open_cart_value_now, 0) * SAFE_DIVIDE(l.learned_conversions, l.learned_open_carts) * COALESCE(x.order_to_cart_value_ratio, 1) AS expected_revenue,
+  SUM(COALESCE(o.open_carts_now, 0) * SAFE_DIVIDE(l.learned_conversions, l.learned_open_carts)) OVER () AS total_expected_orders,
+  SUM(COALESCE(o.open_cart_value_now, 0) * SAFE_DIVIDE(l.learned_conversions, l.learned_open_carts) * COALESCE(x.order_to_cart_value_ratio, 1)) OVER () AS total_expected_revenue,
+  ${cp.forecast_horizon_days} AS forecast_horizon_days,
+  x.order_to_cart_value_ratio,
+  x.cart_conversion_rate,
+  x.arrival_rate_per_day,
+  x.avg_days_in_pipeline,
+  x.arrival_rate_per_day * x.avg_days_in_pipeline AS littles_law_expected_open_carts,
+  SAFE_DIVIDE(SUM(COALESCE(o.open_carts_now, 0)) OVER (), x.arrival_rate_per_day * x.avg_days_in_pipeline) AS pipeline_pressure,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM learned AS l
+CROSS JOIN little AS x
+LEFT JOIN open_now AS o USING (cart_age_days)

@@ -1,0 +1,167 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_credits_rule_based_extended",
+  description: "Ten more rule based models, same grain and same paths of attr_credits_rule_based (one row per touch of each conversion, credits of a conversion sum 1 per model): first non-direct, last paid click, last engaged touch, J-shaped, inverse J, full path (Z-shaped, with cart and checkout milestones), engagement weighted, geometric position decay, funnel progress (credit for how far each session pushed the person in the funnel) and a time decay whose half life is LEARNED from the data instead of the GA4 default of 7 days",
+  bigquery: {
+    partitionBy: "conversion_date",
+    clusterBy: ["key_event_name", "channel"],
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "attribution_extended"],
+  columns: {
+    credit_first_non_direct: "100% to the first touch that is not Direct (first touch when the path is only Direct). Acquisition view without the 'Direct' noise",
+    credit_last_paid: "100% to the last paid touch (cfg_attribution_extended.paid_channel_pattern), else last non-direct, else last. The view of the media buyer",
+    credit_last_engaged: "100% to the last touch that was an engaged session (else the last touch): a 2 second bounce cannot close a sale",
+    credit_j_shaped: "20% first, 60% last, 20% split in the middle (2 touches: 25 / 75)",
+    credit_inverse_j: "60% first, 20% last, 20% split in the middle (2 touches: 75 / 25)",
+    credit_full_path: "Z-shaped: 22.5% each to the first touch, the first session with add_to_cart, the first session with begin_checkout and the last touch, 10% split among the others. Normalized when milestones fall on the same touch",
+    credit_engagement_weighted: "Proportional to the engagement time of each session (1 second minimum)",
+    credit_geometric_position: "Weight ratio^(steps before the conversion), ratio = cfg_attribution_extended.geometric_ratio. Time decay by position, not by days",
+    credit_funnel_progress: "Proportional to the funnel progress the session made beyond the best stage reached before it (1 visit, 2 product view, 3 cart, 4 checkout, 5 conversion)",
+    credit_learned_time_decay: "2^(-days before / learned half life). Half life = median age of the assisting touches of the window, within cfg_attribution_extended.learned_half_life_bounds_days",
+    learned_half_life_days: "The half life used by credit_learned_time_decay"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+  const [hlMin, hlMax] = ax.learned_half_life_bounds_days;
+}
+
+WITH
+exploded AS (
+  SELECT
+    p.conversion_id,
+    p.key_event_name,
+    p.is_primary,
+    p.conversion_date,
+    p.conversion_value,
+    p.path_length,
+    p.last_non_direct_index,
+    pos + 1 AS touch_index,
+    t.session_key,
+    t.channel,
+    t.source_medium,
+    t.campaign,
+    t.is_direct,
+    t.days_before_conversion
+  FROM ${ref("attr_conversion_paths")} AS p,
+    UNNEST(p.touches) AS t WITH OFFSET AS pos
+),
+
+with_session AS (
+  SELECT
+    e.*,
+    COALESCE(s.is_engaged, FALSE) AS is_engaged,
+    COALESCE(s.engagement_time_sec, 0) AS engagement_time_sec,
+    COALESCE(REGEXP_CONTAINS(s.session_channel_only, r'${ax.paid_channel_pattern}'), FALSE) AS is_paid,
+    CASE
+      WHEN e.touch_index = e.path_length THEN 5
+      WHEN s.has_begin_checkout THEN 4
+      WHEN s.has_add_to_cart THEN 3
+      WHEN s.has_view_item THEN 2
+      ELSE 1
+    END AS funnel_stage,
+    COALESCE(s.has_add_to_cart, FALSE) AS has_add_to_cart,
+    COALESCE(s.has_begin_checkout, FALSE) AS has_begin_checkout
+  FROM exploded AS e
+  LEFT JOIN ${ref("fct_sessions")} AS s
+    ON s.session_key = e.session_key
+    AND s.session_date >= DATE_SUB(${helpers.martWindowStart()}, INTERVAL ${constants.CONVERSION_LOOKBACK_DAYS} DAY)
+),
+
+learned AS (
+  -- typical age of the touches that ASSIST (not the converting one) of multi touch paths
+  SELECT
+    LEAST(GREATEST(COALESCE(APPROX_QUANTILES(days_before_conversion, 2)[OFFSET(1)], 7), ${hlMin}), ${hlMax}) AS half_life
+  FROM exploded
+  WHERE path_length > 1
+    AND touch_index < path_length
+    AND conversion_date >= ${helpers.daysAgo(ax.window_days)}
+),
+
+indexed AS (
+  SELECT
+    w.*,
+    l.half_life AS learned_half_life_days,
+    MIN(IF(NOT w.is_direct, w.touch_index, NULL)) OVER c AS first_non_direct_index,
+    MAX(IF(w.is_paid, w.touch_index, NULL)) OVER c AS last_paid_index,
+    MAX(IF(w.is_engaged, w.touch_index, NULL)) OVER c AS last_engaged_index,
+    MIN(IF(w.has_add_to_cart, w.touch_index, NULL)) OVER c AS first_cart_index,
+    MIN(IF(w.has_begin_checkout, w.touch_index, NULL)) OVER c AS first_checkout_index,
+    -- best stage reached BEFORE this touch
+    COALESCE(MAX(w.funnel_stage) OVER (PARTITION BY w.conversion_id ORDER BY w.touch_index ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) AS previous_best_stage
+  FROM with_session AS w
+  CROSS JOIN learned AS l
+  WINDOW c AS (PARTITION BY w.conversion_id)
+),
+
+milestones AS (
+  SELECT
+    *,
+    (touch_index = 1 OR touch_index = path_length OR touch_index = first_cart_index OR touch_index = first_checkout_index) AS is_milestone
+  FROM indexed
+),
+
+raw_weights AS (
+  SELECT
+    *,
+    0.225 * IF(touch_index = 1, 1, 0)
+      + 0.225 * IF(touch_index = first_cart_index, 1, 0)
+      + 0.225 * IF(touch_index = first_checkout_index, 1, 0)
+      + 0.225 * IF(touch_index = path_length, 1, 0)
+      + IF(COALESCE(is_milestone, FALSE), 0, 0.1 / NULLIF(COUNTIF(NOT COALESCE(is_milestone, FALSE)) OVER (PARTITION BY conversion_id), 0)) AS full_path_weight,
+    GREATEST(engagement_time_sec, 1) AS engagement_weight,
+    POW(${ax.geometric_ratio}, path_length - touch_index) AS geometric_weight,
+    GREATEST(funnel_stage - previous_best_stage, 0) AS progress_weight,
+    POW(2, -GREATEST(days_before_conversion, 0) / learned_half_life_days) AS learned_decay_weight
+  FROM milestones
+)
+
+SELECT
+  conversion_id,
+  key_event_name,
+  is_primary,
+  conversion_date,
+  conversion_value,
+  path_length,
+  touch_index,
+  session_key,
+  channel,
+  source_medium,
+  campaign,
+  is_direct,
+  is_paid,
+  is_engaged,
+  funnel_stage,
+  days_before_conversion,
+  IF(touch_index = COALESCE(first_non_direct_index, 1), 1.0, 0.0) AS credit_first_non_direct,
+  IF(touch_index = COALESCE(last_paid_index, last_non_direct_index, path_length), 1.0, 0.0) AS credit_last_paid,
+  IF(touch_index = COALESCE(last_engaged_index, path_length), 1.0, 0.0) AS credit_last_engaged,
+  CASE
+    WHEN path_length = 1 THEN 1.0
+    WHEN path_length = 2 THEN IF(touch_index = 1, 0.25, 0.75)
+    WHEN touch_index = 1 THEN 0.2
+    WHEN touch_index = path_length THEN 0.6
+    ELSE 0.2 / (path_length - 2)
+  END AS credit_j_shaped,
+  CASE
+    WHEN path_length = 1 THEN 1.0
+    WHEN path_length = 2 THEN IF(touch_index = 1, 0.75, 0.25)
+    WHEN touch_index = 1 THEN 0.6
+    WHEN touch_index = path_length THEN 0.2
+    ELSE 0.2 / (path_length - 2)
+  END AS credit_inverse_j,
+  SAFE_DIVIDE(full_path_weight, SUM(full_path_weight) OVER (PARTITION BY conversion_id)) AS credit_full_path,
+  SAFE_DIVIDE(engagement_weight, SUM(engagement_weight) OVER (PARTITION BY conversion_id)) AS credit_engagement_weighted,
+  SAFE_DIVIDE(geometric_weight, SUM(geometric_weight) OVER (PARTITION BY conversion_id)) AS credit_geometric_position,
+  -- the first touch always has progress >= 1, so the sum is never zero
+  SAFE_DIVIDE(progress_weight, SUM(progress_weight) OVER (PARTITION BY conversion_id)) AS credit_funnel_progress,
+  SAFE_DIVIDE(learned_decay_weight, SUM(learned_decay_weight) OVER (PARTITION BY conversion_id)) AS credit_learned_time_decay,
+  learned_half_life_days,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM raw_weights

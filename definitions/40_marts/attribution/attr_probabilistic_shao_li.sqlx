@@ -1,0 +1,113 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_probabilistic_shao_li",
+  description: "The 'simple probabilistic model' of Shao and Li (KDD 2011, the paper behind the first data driven attribution of the ad industry): the contribution of a channel is its conversion probability when present plus half of the average interaction with every other channel it meets, C(i) = P(y|i) + 1/(2 N) * sum_j [P(y|i,j) - P(y|i) - P(y|j)]. Uses the converting AND the non converting journeys (attr_user_journeys), so a channel that is everywhere but converts nobody gets nothing. Also the naive lift of each channel: conversion of the journeys WITH it vs WITHOUT it",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science", "attribution_extended"],
+  columns: {
+    journeys_with_channel: "Journeys (converting or not) where the channel appears",
+    p_conversion_with: "P(y | channel present)",
+    p_conversion_without: "P(y | channel absent)",
+    presence_lift: "p_conversion_with / p_conversion_without. Correlation, not causation: people that use more channels convert more anyway",
+    pair_interaction: "Average over the channels it meets of P(y|i,j) - P(y|i) - P(y|j). Negative = it overlaps (the other channel already did the job)",
+    contribution: "Shao-Li C(i). Can be negative (then it gets zero credit)",
+    share: "max(contribution, 0) / sum of the positive contributions",
+    attributed_conversions: "share x total conversions",
+    attributed_value: "share x total conversion value"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+}
+
+WITH
+journey_channels AS (
+  SELECT j.journey_id, j.is_converted, j.conversion_value, channel
+  FROM ${ref("attr_user_journeys")} AS j, UNNEST(j.channel_set) AS channel
+),
+
+totals AS (
+  SELECT
+    COUNT(*) AS journeys,
+    COUNTIF(is_converted) AS conversions,
+    SUM(IF(is_converted, conversion_value, 0)) AS conversion_value
+  FROM ${ref("attr_user_journeys")}
+),
+
+singles AS (
+  SELECT channel, COUNT(*) AS journeys_with_channel, COUNTIF(is_converted) AS conversions_with_channel
+  FROM journey_channels
+  GROUP BY channel
+  HAVING COUNT(*) >= ${ax.min_journeys_per_channel}
+),
+
+pairs AS (
+  SELECT a.channel AS channel_i, b.channel AS channel_j, COUNT(*) AS journeys_with_pair, COUNTIF(a.is_converted) AS conversions_with_pair
+  FROM journey_channels AS a
+  JOIN journey_channels AS b
+    ON b.journey_id = a.journey_id
+    AND b.channel != a.channel
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= ${ax.min_journeys_per_pair}
+),
+
+probabilities AS (
+  SELECT
+    s.channel,
+    s.journeys_with_channel,
+    s.conversions_with_channel,
+    SAFE_DIVIDE(s.conversions_with_channel, s.journeys_with_channel) AS p_with,
+    SAFE_DIVIDE(t.conversions - s.conversions_with_channel, t.journeys - s.journeys_with_channel) AS p_without
+  FROM singles AS s
+  CROSS JOIN totals AS t
+),
+
+interactions AS (
+  SELECT
+    p.channel_i AS channel,
+    COUNT(*) AS partners,
+    AVG(SAFE_DIVIDE(p.conversions_with_pair, p.journeys_with_pair) - pi.p_with - pj.p_with) AS pair_interaction
+  FROM pairs AS p
+  JOIN probabilities AS pi ON pi.channel = p.channel_i
+  JOIN probabilities AS pj ON pj.channel = p.channel_j
+  GROUP BY p.channel_i
+),
+
+contributions AS (
+  SELECT
+    pr.*,
+    COALESCE(i.partners, 0) AS partners,
+    i.pair_interaction,
+    -- C(i) = P(y|i) + 1/(2N) sum_j [...] = P(y|i) + 0.5 * average interaction
+    pr.p_with + 0.5 * COALESCE(i.pair_interaction, 0) AS contribution
+  FROM probabilities AS pr
+  LEFT JOIN interactions AS i USING (channel)
+)
+
+SELECT
+  (SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1) AS key_event_name,
+  c.channel,
+  c.journeys_with_channel,
+  c.conversions_with_channel,
+  c.p_with AS p_conversion_with,
+  c.p_without AS p_conversion_without,
+  SAFE_DIVIDE(c.p_with, c.p_without) AS presence_lift,
+  c.partners,
+  c.pair_interaction,
+  c.contribution,
+  SAFE_DIVIDE(GREATEST(c.contribution, 0), SUM(GREATEST(c.contribution, 0)) OVER ()) AS share,
+  SAFE_DIVIDE(GREATEST(c.contribution, 0), SUM(GREATEST(c.contribution, 0)) OVER ()) * t.conversions AS attributed_conversions,
+  SAFE_DIVIDE(GREATEST(c.contribution, 0), SUM(GREATEST(c.contribution, 0)) OVER ()) * t.conversion_value AS attributed_value,
+  t.journeys AS total_journeys,
+  t.conversions AS total_conversions,
+  ${helpers.today()} AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM contributions AS c
+CROSS JOIN totals AS t

@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_language_geo_mismatch",
+  description: "Who is behind a browser in the 'wrong' language: an english browser in Sao Paulo, a portuguese one in Orlando. The device language against the IP country splits the traffic in natives, foreigners (expats, tourists, VPNs and a lot of bots, that use en-us by default) and the diaspora (brazilians abroad, a market for international shipping nobody measures). Per country x language (last 90 days): sessions, bot share, engagement, conversion and a verdict. A foreign segment with real conversion asks for a translated checkout; one with a big bot share is a filter for the bot rules",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "frontier"],
+  columns: Object.assign(docs.pick("geo_country", "sessions", "conversion_rate"), {
+    language: "First part of device_language (pt, en, es...)",
+    language_fit: "native (expected language of the country, cfg_frontier.language_geo.expected_languages) | foreign (country with a rule, other language) | diaspora (a language expected in Brazil, in a country without a rule) | no_rule",
+    all_sessions: "Sessions including bots",
+    bot_share: "Share of all_sessions flagged as bot suspect",
+    conversion_vs_native: "(conversion - conversion of the natives of the same country) / conversion of the natives",
+    verdict: "bot_shelter (bot_share > 0.3) | real_audience (converts at least half as well as the natives) | browsing_only | diaspora_market | native"
+  })
+}
+
+js {
+  const lg = cfg_frontier.language_geo;
+  const rules = Object.entries(lg.expected_languages || {});
+  const fitCase = rules.length
+    ? `CASE ${rules.map(([country, langs]) => `WHEN geo_country = ${helpers.sqlString(country)} THEN IF(${helpers.inList("language", langs)}, 'native', 'foreign')`).join(" ")} ELSE NULL END`
+    : "CAST(NULL AS STRING)";
+  // languages of the home market: the ones expected in the country of the property (Brazil by default)
+  const homeLangs = (lg.expected_languages || {})["Brazil"] || ["pt"];
+  const ruledCountries = rules.map(([country]) => country);
+}
+
+WITH
+sessions AS (
+  SELECT
+    *,
+    COALESCE(NULLIF(SPLIT(LOWER(COALESCE(device_language, '')), '-')[SAFE_OFFSET(0)], ''), '(not set)') AS language
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.daysAgo(lg.window_days)}
+    AND session_date < ${helpers.today()}
+    AND platform = 'WEB'
+),
+
+fitted AS (
+  SELECT
+    *,
+    CASE
+      WHEN ${fitCase} IS NOT NULL THEN ${fitCase}
+      WHEN ${helpers.inList("language", homeLangs)} AND NOT ${helpers.inList("geo_country", ruledCountries)} THEN 'diaspora'
+      ELSE 'no_rule'
+    END AS language_fit
+  FROM sessions
+),
+
+aggregated AS (
+  SELECT
+    geo_country,
+    language,
+    language_fit,
+    COUNT(*) AS all_sessions,
+    SAFE_DIVIDE(COUNTIF(is_bot_suspect), COUNT(*)) AS bot_share,
+    COUNTIF(NOT is_bot_suspect) AS sessions,
+    COUNTIF(NOT is_bot_suspect AND is_engaged) AS engaged_sessions,
+    SUM(IF(NOT is_bot_suspect, transactions, 0)) AS transactions,
+    SUM(IF(NOT is_bot_suspect, revenue, 0)) AS revenue,
+    SAFE_DIVIDE(COUNTIF(NOT is_bot_suspect AND is_new_user), COUNTIF(NOT is_bot_suspect)) AS new_user_share,
+    APPROX_TOP_COUNT(geo_city, 3) AS top_cities,
+    APPROX_TOP_COUNT(session_default_channel_group, 3) AS top_channels,
+    APPROX_TOP_COUNT(device_category, 2) AS top_devices
+  FROM fitted
+  GROUP BY 1, 2, 3
+  HAVING COUNT(*) >= ${lg.min_sessions}
+),
+
+rated AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(engaged_sessions, sessions) AS engagement_rate,
+    SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+    SAFE_DIVIDE(revenue, sessions) AS revenue_per_session
+  FROM aggregated
+),
+
+natives AS (
+  SELECT geo_country, SAFE_DIVIDE(SUM(transactions), SUM(sessions)) AS native_conversion_rate
+  FROM rated
+  WHERE language_fit = 'native'
+  GROUP BY geo_country
+)
+
+SELECT
+  r.*,
+  n.native_conversion_rate,
+  ${helpers.pctChange("r.conversion_rate", "n.native_conversion_rate")} AS conversion_vs_native,
+  CASE
+    WHEN r.language_fit = 'native' THEN 'native'
+    WHEN r.bot_share > 0.3 THEN 'bot_shelter'
+    WHEN r.language_fit = 'diaspora' AND r.transactions > 0 THEN 'diaspora_market'
+    WHEN r.conversion_rate >= 0.5 * n.native_conversion_rate AND r.transactions > 0 THEN 'real_audience'
+    ELSE 'browsing_only'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rated AS r
+LEFT JOIN natives AS n USING (geo_country)

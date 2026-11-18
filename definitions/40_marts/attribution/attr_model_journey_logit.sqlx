@@ -1,0 +1,33 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_model_journey_logit",
+  disabled: !constants.ENABLE.bqml,
+  description: "BQML logistic regression of the journeys (attr_user_journeys): P(conversion) as a function of the number of touches of each GA4 default channel group. The coefficients are the 'bagged logistic regression' attribution of Shao and Li (2011) in its simplest form; attr_logistic_regression_credits turns them into credits",
+  tags: ["marts", "attribution", "bqml", "weekly", "optional", "attribution_extended"]
+}
+
+js {
+  const lg = cfg_attribution_extended.logistic;
+  const slug = name => "n_" + name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const features = lg.channels.map(ch =>
+    `LEAST((SELECT COUNTIF(t.default_channel = ${helpers.sqlString(ch)}) FROM UNNEST(touches) AS t), ${lg.max_touches_per_channel}) AS ${slug(ch)}`);
+  features.push(`LEAST((SELECT COUNTIF(NOT ${helpers.inList("COALESCE(t.default_channel, '')", lg.channels)}) FROM UNNEST(touches) AS t), ${lg.max_touches_per_channel}) AS n_other`);
+}
+
+-- weekly on purpose (training costs money, the coefficients do not change from one day to the next)
+CREATE OR REPLACE MODEL ${self()}
+OPTIONS (
+  model_type = 'LOGISTIC_REG',
+  input_label_cols = ['is_converted'],
+  l2_reg = ${Number(lg.l2_reg)},
+  data_split_method = 'AUTO_SPLIT'
+) AS
+SELECT
+  ${features.join(",\n  ")},
+  is_converted
+FROM ${ref("attr_user_journeys")}

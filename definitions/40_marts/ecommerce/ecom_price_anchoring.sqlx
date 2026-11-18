@@ -1,0 +1,155 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_price_anchoring",
+  description: "Anchoring (Tversky and Kahneman) on the shelf: the first price a session sees becomes the reference for everything after it. Sessions are grouped by how expensive their FIRST viewed product was against the median of its category, and for each group: what they browse next (relative price of the following products), what they pay (relative price of the purchased items), conversion and order value. If 'much_pricier' anchors buy more expensive items and convert as well, the hero product of the ad, the first slot of the category and the landing page should show the premium item first. One row per main category (and '(all)') x anchor bucket",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier", "pricing"],
+  columns: Object.assign(docs.pick("sessions", "conversion_rate"), {
+    anchor_category: "Category of the first product viewed in the session ('(all)' = every category)",
+    anchor_bucket: "Price of the first viewed product / median price of its category: 1_much_cheaper (< 0.6) | 2_cheaper (< 0.9) | 3_typical (0.9 - 1.1) | 4_pricier (<= 1.6) | 5_much_pricier (> 1.6)",
+    avg_anchor_ratio: "Average first price / category median in the bucket",
+    avg_next_views_ratio: "Average relative price (price / category median) of the products viewed AFTER the first one",
+    avg_paid_ratio: "Average relative price of the items purchased in the session (weighted by quantity)",
+    anchor_pull: "avg_paid_ratio of this bucket - avg_paid_ratio of the typical bucket. Positive on the expensive anchors = anchoring works here",
+    conversion_vs_typical: "(conversion - conversion of the typical bucket) / conversion of the typical bucket"
+  })
+}
+
+js {
+  const pa = cfg_frontier.price_anchoring;
+}
+
+WITH
+views AS (
+  SELECT session_key, event_ts, item_id, item_category, price
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(pa.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'view_item'
+    AND price > 0
+    ${helpers.martSessionFilter()}
+),
+
+category_median AS (
+  SELECT COALESCE(item_category, '(not set)') AS item_category, APPROX_QUANTILES(price, 2)[OFFSET(1)] AS median_price
+  FROM views
+  GROUP BY 1
+),
+
+relative_views AS (
+  SELECT
+    v.session_key,
+    v.event_ts,
+    COALESCE(v.item_category, '(not set)') AS item_category,
+    SAFE_DIVIDE(v.price, c.median_price) AS relative_price,
+    ROW_NUMBER() OVER (PARTITION BY v.session_key ORDER BY v.event_ts, v.item_id) AS view_order
+  FROM views AS v
+  JOIN category_median AS c ON c.item_category = COALESCE(v.item_category, '(not set)')
+),
+
+session_anchor AS (
+  SELECT
+    session_key,
+    MAX(IF(view_order = 1, relative_price, NULL)) AS anchor_ratio,
+    MAX(IF(view_order = 1, item_category, NULL)) AS anchor_category,
+    AVG(IF(view_order > 1, relative_price, NULL)) AS next_views_ratio,
+    COUNT(*) AS product_views
+  FROM relative_views
+  GROUP BY session_key
+),
+
+paid AS (
+  SELECT
+    t.session_key,
+    SAFE_DIVIDE(SUM(SAFE_DIVIDE(t.price, c.median_price) * COALESCE(t.quantity, 1)), SUM(COALESCE(t.quantity, 1))) AS paid_ratio
+  FROM ${ref("fct_transaction_items")} AS t
+  JOIN category_median AS c ON c.item_category = COALESCE(t.item_category, '(not set)')
+  WHERE t.transaction_date >= ${helpers.daysAgo(pa.window_days)}
+    AND t.is_valid_for_revenue
+    AND t.price > 0
+  GROUP BY t.session_key
+),
+
+sessions AS (
+  SELECT
+    s.session_key,
+    s.has_purchase,
+    s.transactions,
+    s.revenue,
+    a.anchor_ratio,
+    a.anchor_category,
+    a.next_views_ratio,
+    a.product_views,
+    p.paid_ratio,
+    CASE
+      WHEN a.anchor_ratio < 0.6 THEN '1_much_cheaper'
+      WHEN a.anchor_ratio < 0.9 THEN '2_cheaper'
+      WHEN a.anchor_ratio <= 1.1 THEN '3_typical'
+      WHEN a.anchor_ratio <= 1.6 THEN '4_pricier'
+      ELSE '5_much_pricier'
+    END AS anchor_bucket
+  FROM ${ref("fct_sessions")} AS s
+  JOIN session_anchor AS a USING (session_key)
+  LEFT JOIN paid AS p USING (session_key)
+  WHERE s.session_date >= ${helpers.daysAgo(pa.window_days)}
+    AND s.session_date < ${helpers.today()}
+    AND a.anchor_ratio IS NOT NULL
+    ${helpers.martSessionFilter("s")}
+),
+
+grouped AS (
+  SELECT
+    anchor_category,
+    anchor_bucket,
+    COUNT(*) AS sessions,
+    COUNTIF(has_purchase) AS purchase_sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    AVG(anchor_ratio) AS avg_anchor_ratio,
+    AVG(next_views_ratio) AS avg_next_views_ratio,
+    AVG(paid_ratio) AS avg_paid_ratio,
+    AVG(product_views) AS avg_product_views
+  FROM sessions
+  GROUP BY 1, 2
+  UNION ALL
+  SELECT
+    '(all)' AS anchor_category,
+    anchor_bucket,
+    COUNT(*),
+    COUNTIF(has_purchase),
+    SUM(transactions),
+    SUM(revenue),
+    AVG(anchor_ratio),
+    AVG(next_views_ratio),
+    AVG(paid_ratio),
+    AVG(product_views)
+  FROM sessions
+  GROUP BY 2
+),
+
+rated AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(transactions, sessions) AS conversion_rate,
+    ${helpers.wilsonLower("purchase_sessions", "sessions")} AS purchase_rate_lower,
+    SAFE_DIVIDE(revenue, transactions) AS average_order_value
+  FROM grouped
+  WHERE sessions >= ${pa.min_sessions}
+)
+
+SELECT
+  r.*,
+  r.avg_paid_ratio - t.avg_paid_ratio AS anchor_pull,
+  ${helpers.pctChange("r.conversion_rate", "t.conversion_rate")} AS conversion_vs_typical,
+  ${helpers.pctChange("r.average_order_value", "t.average_order_value")} AS aov_vs_typical,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM rated AS r
+LEFT JOIN rated AS t
+  ON t.anchor_category = r.anchor_category
+  AND t.anchor_bucket = '3_typical'

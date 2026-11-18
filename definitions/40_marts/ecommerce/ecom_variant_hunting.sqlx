@@ -1,0 +1,147 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_variant_hunting",
+  description: "Size and colour hunting: the customer opens variant after variant of the SAME product in one session (P, M, G, GG... azul, preto...) and leaves without adding it. That is a grid that is out of stock, a size chart nobody trusts or a photo that does not show the colour. Per item (last 90 days): share of the sessions that hunted variants, add to cart rate of the hunters against the people that opened one variant, and the 'dead end' variants: the last variant viewed by the hunters that gave up. Needs item_variant in view_item (or one item_id per variant with the same item_name)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier"],
+  columns: {
+    product_key: "item_name when the site sends one item_id per variant, else item_id (the 'product' that has variants)",
+    sessions_viewing: "Sessions that viewed the product",
+    hunting_sessions: "Sessions that viewed cfg_frontier.variant_hunting.min_variants_viewed or more distinct variants",
+    hunting_rate: "hunting_sessions / sessions_viewing",
+    add_rate_hunters: "Share of the hunting sessions that added the product to the cart",
+    add_rate_non_hunters: "Same for the sessions that viewed one or two variants",
+    gave_up_hunters: "Hunting sessions without add_to_cart of the product",
+    dead_end_variants: "Last variant viewed in the sessions that gave up, with how many sessions ended there. The top ones are the sizes people want and do not get",
+    most_viewed_vs_most_bought: "Most viewed variant and most purchased variant. Different = demand is in one variant and the sales in another"
+  }
+}
+
+js {
+  const vh = cfg_frontier.variant_hunting;
+}
+
+WITH
+interactions AS (
+  SELECT
+    session_key,
+    event_name,
+    event_ts,
+    item_id,
+    item_name,
+    item_category,
+    price,
+    -- when the variant is not sent, every item_id under the same name is a variant
+    COALESCE(item_variant, IF(item_name IS NOT NULL, item_id, NULL)) AS variant,
+    IF(item_variant IS NOT NULL, item_id, COALESCE(item_name, item_id)) AS product_key
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(vh.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name IN ('view_item', 'add_to_cart', 'purchase')
+    AND item_id IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+session_product AS (
+  SELECT
+    session_key,
+    product_key,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    APPROX_QUANTILES(price, 2 IGNORE NULLS)[OFFSET(1)] AS price,
+    COUNT(DISTINCT IF(event_name = 'view_item', variant, NULL)) AS variants_viewed,
+    COUNTIF(event_name = 'view_item') AS variant_views,
+    COUNTIF(event_name = 'add_to_cart') > 0 AS added,
+    COUNTIF(event_name = 'purchase') > 0 AS bought,
+    ARRAY_AGG(IF(event_name = 'view_item', variant, NULL) IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_variant_viewed
+  FROM interactions
+  GROUP BY session_key, product_key
+  HAVING COUNTIF(event_name = 'view_item') > 0
+),
+
+flagged AS (
+  SELECT *, variants_viewed >= ${vh.min_variants_viewed} AS is_hunting
+  FROM session_product
+),
+
+dead_ends AS (
+  SELECT
+    product_key,
+    ARRAY_AGG(STRUCT(last_variant_viewed AS variant, sessions) ORDER BY sessions DESC LIMIT 5) AS dead_end_variants
+  FROM (
+    SELECT product_key, last_variant_viewed, COUNT(*) AS sessions
+    FROM flagged
+    WHERE is_hunting AND NOT added AND last_variant_viewed IS NOT NULL
+    GROUP BY 1, 2
+  )
+  GROUP BY product_key
+),
+
+variant_demand AS (
+  SELECT
+    product_key,
+    ARRAY_AGG(variant ORDER BY views DESC LIMIT 1)[SAFE_OFFSET(0)] AS most_viewed_variant,
+    ARRAY_AGG(IF(purchases > 0, variant, NULL) IGNORE NULLS ORDER BY purchases DESC LIMIT 1)[SAFE_OFFSET(0)] AS most_bought_variant,
+    COUNT(DISTINCT variant) AS variants_seen
+  FROM (
+    SELECT
+      product_key,
+      variant,
+      COUNTIF(event_name = 'view_item') AS views,
+      COUNTIF(event_name = 'purchase') AS purchases
+    FROM interactions
+    WHERE variant IS NOT NULL
+    GROUP BY 1, 2
+  )
+  GROUP BY product_key
+),
+
+products AS (
+  SELECT
+    product_key,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    APPROX_QUANTILES(price, 2 IGNORE NULLS)[OFFSET(1)] AS median_price,
+    COUNT(*) AS sessions_viewing,
+    COUNTIF(is_hunting) AS hunting_sessions,
+    AVG(IF(is_hunting, variants_viewed, NULL)) AS avg_variants_viewed_by_hunters,
+    SAFE_DIVIDE(COUNTIF(is_hunting AND added), COUNTIF(is_hunting)) AS add_rate_hunters,
+    SAFE_DIVIDE(COUNTIF(NOT is_hunting AND added), COUNTIF(NOT is_hunting)) AS add_rate_non_hunters,
+    SAFE_DIVIDE(COUNTIF(is_hunting AND bought), COUNTIF(is_hunting)) AS purchase_rate_hunters,
+    SAFE_DIVIDE(COUNTIF(NOT is_hunting AND bought), COUNTIF(NOT is_hunting)) AS purchase_rate_non_hunters,
+    COUNTIF(is_hunting AND NOT added) AS gave_up_hunters
+  FROM flagged
+  GROUP BY product_key
+)
+
+SELECT
+  p.product_key,
+  p.item_name,
+  p.item_category,
+  p.median_price,
+  v.variants_seen,
+  p.sessions_viewing,
+  p.hunting_sessions,
+  SAFE_DIVIDE(p.hunting_sessions, p.sessions_viewing) AS hunting_rate,
+  ${helpers.wilsonLower("p.hunting_sessions", "p.sessions_viewing")} AS hunting_rate_lower,
+  p.avg_variants_viewed_by_hunters,
+  p.add_rate_hunters,
+  p.add_rate_non_hunters,
+  p.purchase_rate_hunters,
+  p.purchase_rate_non_hunters,
+  p.gave_up_hunters,
+  p.gave_up_hunters * p.median_price * COALESCE(p.purchase_rate_non_hunters, 0) AS estimated_revenue_lost,
+  d.dead_end_variants,
+  STRUCT(v.most_viewed_variant AS most_viewed, v.most_bought_variant AS most_bought, v.most_viewed_variant != v.most_bought_variant AS differ) AS most_viewed_vs_most_bought,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM products AS p
+LEFT JOIN dead_ends AS d USING (product_key)
+LEFT JOIN variant_demand AS v USING (product_key)
+WHERE p.sessions_viewing >= ${vh.min_sessions}
+  AND v.variants_seen >= 2

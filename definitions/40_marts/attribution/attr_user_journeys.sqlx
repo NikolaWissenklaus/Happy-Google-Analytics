@@ -1,0 +1,141 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_user_journeys",
+  description: "The journeys that converted AND the ones that did not, in one table, for the primary key event (last 90 days): the base of the data driven models that need to know what happens when nobody converts (Shao-Li, synergy, higher order Markov, additive hazard, logistic regression). A converting journey = the touches of the lookback window before a conversion. A non converting journey = the touches of a person that never converted in the window, up to the lookback before their last touch, censored at the end of the lookback or today. Every touch carries the time from the start and to the end of the journey",
+  bigquery: {
+    clusterBy: ["is_converted"],
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "attribution_extended"],
+  columns: {
+    journey_id: "conversion id (converting journeys) or 'nc:' + user_key (non converting)",
+    is_converted: "The journey ended in the primary key event",
+    journey_start_ts: "Start of the first touch",
+    journey_end_ts: "Conversion time, or the censoring time for non converting journeys (last touch + lookback, capped at now)",
+    observation_days: "Days between the start and the end of the journey (the exposure of the survival model)",
+    touches: "Ordered touches: session, channel (attribution grouping), default_channel (GA4 default), is_direct, days_from_start, days_before_end",
+    channel_set: "Distinct channels of the journey, sorted",
+    channel_path_dedup: "Channels in order without consecutive repetitions"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+  const lookback = constants.CONVERSION_LOOKBACK_DAYS;
+}
+
+WITH
+primary_key_event AS (
+  SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1
+),
+
+conversions AS (
+  SELECT
+    k.key_event_id AS conversion_id,
+    k.key_event_name,
+    k.user_key,
+    k.event_ts AS conversion_ts,
+    k.key_event_value AS conversion_value
+  FROM ${ref("fct_key_events")} AS k
+  WHERE k.event_date >= ${helpers.daysAgo(ax.window_days)}
+    AND k.event_date < ${helpers.today()}
+    AND k.key_event_name IN (SELECT key_event_name FROM primary_key_event)
+    AND NOT k.is_bot_suspect
+),
+
+touchpoints AS (
+  SELECT user_key, session_key, session_start_ts, channel, default_channel, is_direct
+  FROM ${ref("attr_touchpoints")}
+  WHERE session_date >= ${helpers.daysAgo(ax.window_days + lookback)}
+    AND session_date < ${helpers.today()}
+),
+
+converting AS (
+  SELECT
+    c.conversion_id AS journey_id,
+    ANY_VALUE(c.key_event_name) AS key_event_name,
+    ANY_VALUE(c.user_key) AS user_key,
+    TRUE AS is_converted,
+    MIN(t.session_start_ts) AS journey_start_ts,
+    ANY_VALUE(c.conversion_ts) AS journey_end_ts,
+    ANY_VALUE(c.conversion_ts) AS conversion_ts,
+    ANY_VALUE(c.conversion_value) AS conversion_value,
+    ARRAY_AGG(STRUCT(t.session_key, t.session_start_ts, t.channel, t.default_channel, t.is_direct) ORDER BY t.session_start_ts) AS raw_touches
+  FROM conversions AS c
+  JOIN touchpoints AS t
+    ON t.user_key = c.user_key
+    AND t.session_start_ts <= c.conversion_ts
+    AND t.session_start_ts >= TIMESTAMP_SUB(c.conversion_ts, INTERVAL ${lookback} DAY)
+  GROUP BY c.conversion_id
+),
+
+non_converting AS (
+  SELECT
+    CONCAT('nc:', user_key) AS journey_id,
+    (SELECT key_event_name FROM primary_key_event) AS key_event_name,
+    user_key,
+    FALSE AS is_converted,
+    MIN(session_start_ts) AS journey_start_ts,
+    LEAST(TIMESTAMP_ADD(MAX(session_start_ts), INTERVAL ${lookback} DAY), CURRENT_TIMESTAMP()) AS journey_end_ts,
+    CAST(NULL AS TIMESTAMP) AS conversion_ts,
+    CAST(0 AS FLOAT64) AS conversion_value,
+    ARRAY_AGG(STRUCT(session_key, session_start_ts, channel, default_channel, is_direct) ORDER BY session_start_ts) AS raw_touches
+  FROM (
+    SELECT
+      t.*,
+      ROW_NUMBER() OVER (PARTITION BY t.user_key ORDER BY t.session_start_ts DESC) AS newest_rank,
+      MAX(t.session_start_ts) OVER (PARTITION BY t.user_key) AS last_touch_ts
+    FROM touchpoints AS t
+    LEFT JOIN (SELECT DISTINCT user_key FROM conversions) AS c USING (user_key)
+    WHERE c.user_key IS NULL
+      AND t.session_start_ts >= TIMESTAMP(${helpers.daysAgo(ax.window_days)})
+  )
+  WHERE newest_rank <= ${ax.max_touches_per_journey}
+    AND session_start_ts >= TIMESTAMP_SUB(last_touch_ts, INTERVAL ${lookback} DAY)
+  GROUP BY user_key
+),
+
+journeys AS (
+  SELECT * FROM converting
+  UNION ALL
+  SELECT * FROM non_converting
+)
+
+SELECT
+  j.journey_id,
+  j.key_event_name,
+  j.user_key,
+  j.is_converted,
+  j.journey_start_ts,
+  j.journey_end_ts,
+  TIMESTAMP_DIFF(j.journey_end_ts, j.journey_start_ts, SECOND) / 86400 AS observation_days,
+  j.conversion_ts,
+  j.conversion_value,
+  ARRAY(
+    SELECT AS STRUCT
+      t.session_key,
+      t.session_start_ts,
+      t.channel,
+      t.default_channel,
+      t.is_direct,
+      TIMESTAMP_DIFF(t.session_start_ts, j.journey_start_ts, SECOND) / 86400 AS days_from_start,
+      TIMESTAMP_DIFF(j.journey_end_ts, t.session_start_ts, SECOND) / 86400 AS days_before_end
+    FROM UNNEST(j.raw_touches) AS t WITH OFFSET AS pos
+    ORDER BY pos
+  ) AS touches,
+  ARRAY(SELECT DISTINCT t.channel FROM UNNEST(j.raw_touches) AS t WHERE t.channel IS NOT NULL ORDER BY t.channel) AS channel_set,
+  ARRAY_LENGTH(j.raw_touches) AS path_length,
+  ARRAY_TO_STRING(ARRAY(
+    SELECT channel FROM (
+      SELECT t.channel, pos, LAG(t.channel) OVER (ORDER BY pos) AS previous_channel
+      FROM UNNEST(j.raw_touches) AS t WITH OFFSET AS pos
+    )
+    WHERE (previous_channel IS NULL OR previous_channel != channel) AND channel IS NOT NULL
+    ORDER BY pos
+  ), ' > ') AS channel_path_dedup,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM journeys AS j

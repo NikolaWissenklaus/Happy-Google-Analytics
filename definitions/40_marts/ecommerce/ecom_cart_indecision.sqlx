@@ -1,0 +1,149 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_cart_indecision",
+  description: "Regret and indecision, item by item: every add_to_cart and remove_from_cart of the session in order. An item is kept, removed (added and taken out), or flip-flopped (taken out and put back, the customer is fighting with themselves). And WHEN it was removed: seconds after the add (impulse regret), or right after the shipping was calculated (freight regret). Per item (last 90 days): the regret rate against its category, the freight regret share and the conversion of the flip-floppers (the ones that came back are often the best buyers)",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier"],
+  columns: {
+    carts: "Sessions that added the item to the cart",
+    removal_rate: "Carts where the item ended out of the cart (removed and not added back)",
+    flip_flop_rate: "Carts where the item was removed and added back at least once",
+    category_removal_rate: "removal_rate of the category, for comparison",
+    regret_index: "removal_rate / category_removal_rate. Above 1.3 with volume = something in this item (price at the cart, variant, delivery time) scares people",
+    median_seconds_to_remove: "Median seconds between the first add and the first remove. Under a minute = impulse regret, the customer saw something in the cart page",
+    freight_regret_share: "Removals that happened after add_shipping_info in the same session: the freight killed this item",
+    purchase_rate_kept: "Sessions that bought the item when it was never removed",
+    purchase_rate_flip_flop: "Sessions that bought the item after removing and adding it again"
+  }
+}
+
+js {
+  const ind = cfg_frontier.indecision;
+}
+
+WITH
+cart_events AS (
+  SELECT
+    session_key,
+    item_id,
+    item_name,
+    item_category,
+    event_name,
+    event_ts
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(ind.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name IN ('add_to_cart', 'remove_from_cart', 'purchase')
+    AND item_id IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+shipping AS (
+  SELECT session_key, MIN(event_ts) AS shipping_ts
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.daysAgo(ind.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'add_shipping_info'
+  GROUP BY session_key
+),
+
+ordered AS (
+  SELECT
+    *,
+    LAG(event_name) OVER (PARTITION BY session_key, item_id ORDER BY event_ts) AS previous_action
+  FROM cart_events
+  WHERE event_name IN ('add_to_cart', 'remove_from_cart')
+),
+
+session_item AS (
+  SELECT
+    o.session_key,
+    o.item_id,
+    ANY_VALUE(o.item_name) AS item_name,
+    ANY_VALUE(o.item_category) AS item_category,
+    MIN(IF(o.event_name = 'add_to_cart', o.event_ts, NULL)) AS first_add_ts,
+    MIN(IF(o.event_name = 'remove_from_cart', o.event_ts, NULL)) AS first_remove_ts,
+    ARRAY_AGG(o.event_name ORDER BY o.event_ts DESC LIMIT 1)[OFFSET(0)] AS last_action,
+    COUNTIF(o.event_name = 'add_to_cart' AND o.previous_action = 'remove_from_cart') > 0 AS re_added,
+    COUNTIF(o.event_name = 'remove_from_cart') > 0 AS was_removed
+  FROM ordered AS o
+  GROUP BY o.session_key, o.item_id
+  HAVING COUNTIF(o.event_name = 'add_to_cart') > 0
+),
+
+purchased AS (
+  SELECT DISTINCT session_key, item_id
+  FROM cart_events
+  WHERE event_name = 'purchase'
+),
+
+classified AS (
+  SELECT
+    si.*,
+    CASE
+      WHEN NOT si.was_removed THEN 'kept'
+      WHEN si.re_added AND si.last_action = 'add_to_cart' THEN 'flip_flop'
+      ELSE 'removed'
+    END AS cart_outcome,
+    p.item_id IS NOT NULL AS bought,
+    TIMESTAMP_DIFF(si.first_remove_ts, si.first_add_ts, SECOND) AS seconds_to_remove,
+    sh.shipping_ts IS NOT NULL AND si.first_remove_ts >= sh.shipping_ts AS removed_after_shipping
+  FROM session_item AS si
+  LEFT JOIN purchased AS p USING (session_key, item_id)
+  LEFT JOIN shipping AS sh USING (session_key)
+),
+
+items AS (
+  SELECT
+    item_id,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    COUNT(*) AS carts,
+    COUNTIF(cart_outcome = 'removed') AS removed,
+    COUNTIF(cart_outcome = 'flip_flop') AS flip_flops,
+    APPROX_QUANTILES(IF(was_removed AND seconds_to_remove >= 0, seconds_to_remove, NULL), 2 IGNORE NULLS)[OFFSET(1)] AS median_seconds_to_remove,
+    SAFE_DIVIDE(COUNTIF(was_removed AND removed_after_shipping), COUNTIF(was_removed)) AS freight_regret_share,
+    SAFE_DIVIDE(COUNTIF(cart_outcome = 'kept' AND bought), COUNTIF(cart_outcome = 'kept')) AS purchase_rate_kept,
+    SAFE_DIVIDE(COUNTIF(cart_outcome = 'flip_flop' AND bought), COUNTIF(cart_outcome = 'flip_flop')) AS purchase_rate_flip_flop
+  FROM classified
+  GROUP BY item_id
+),
+
+categories AS (
+  SELECT item_category, SAFE_DIVIDE(SUM(removed), SUM(carts)) AS category_removal_rate
+  FROM items
+  GROUP BY item_category
+)
+
+SELECT
+  i.item_id,
+  i.item_name,
+  i.item_category,
+  i.carts,
+  i.removed,
+  i.flip_flops,
+  SAFE_DIVIDE(i.removed, i.carts) AS removal_rate,
+  ${helpers.wilsonLower("i.removed", "i.carts")} AS removal_rate_lower,
+  SAFE_DIVIDE(i.flip_flops, i.carts) AS flip_flop_rate,
+  c.category_removal_rate,
+  SAFE_DIVIDE(SAFE_DIVIDE(i.removed, i.carts), c.category_removal_rate) AS regret_index,
+  i.median_seconds_to_remove,
+  CASE
+    WHEN i.median_seconds_to_remove IS NULL THEN NULL
+    WHEN i.median_seconds_to_remove < 60 THEN 'impulse_regret'
+    WHEN i.median_seconds_to_remove < 900 THEN 'second_thoughts'
+    ELSE 'parked_then_dropped'
+  END AS regret_style,
+  i.freight_regret_share,
+  i.purchase_rate_kept,
+  i.purchase_rate_flip_flop,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM items AS i
+LEFT JOIN categories AS c USING (item_category)
+WHERE i.carts >= ${ind.min_carts}

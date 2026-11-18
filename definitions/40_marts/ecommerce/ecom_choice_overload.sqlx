@@ -1,0 +1,104 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_choice_overload",
+  description: "The paradox of choice (Iyengar and Lepper, the jam experiment) measured on your own catalogue: conversion by the number of distinct products the session opened, per main category. Conversion rises with the first products (the customer is comparing), reaches a peak and then falls (too many options, decision paralysis). The peak is the sweet spot: how many products a category page, a recommendation shelf or a 'compare' feature should show before the customer drowns. One row per category x products viewed",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "frontier"],
+  columns: Object.assign(docs.pick("sessions", "conversion_rate"), {
+    main_category: "Category with most product views in the session ('(all)' = every category together)",
+    distinct_items_viewed: "Distinct products opened in the session (capped at cfg_frontier.choice_overload.max_items_bucket)",
+    conversion_rate_lower: "Wilson lower bound of conversion_rate",
+    marginal_conversion_change: "conversion of this bucket - conversion of the previous bucket. Negative from here on = each new option hurts",
+    sweet_spot_items: "Bucket with the highest Wilson lower bound in the category: the number of options that converts best",
+    is_sweet_spot: "This row is the sweet spot of the category",
+    overload_share: "Share of the sessions of the category that viewed more products than the sweet spot",
+    overload_conversion_gap: "Conversion at the sweet spot - conversion of the sessions above it"
+  })
+}
+
+js {
+  const co = cfg_frontier.choice_overload;
+}
+
+WITH
+session_items AS (
+  SELECT
+    session_key,
+    COUNT(DISTINCT item_id) AS distinct_items_viewed,
+    APPROX_TOP_COUNT(item_category, 1)[SAFE_OFFSET(0)].value AS main_category
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(co.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+  GROUP BY session_key
+),
+
+sessions AS (
+  SELECT
+    s.session_key,
+    s.has_purchase,
+    s.revenue,
+    LEAST(i.distinct_items_viewed, ${co.max_items_bucket}) AS distinct_items_viewed,
+    COALESCE(i.main_category, '(not set)') AS main_category
+  FROM ${ref("fct_sessions")} AS s
+  JOIN session_items AS i USING (session_key)
+  WHERE s.session_date >= ${helpers.daysAgo(co.window_days)}
+    AND s.session_date < ${helpers.today()}
+    ${helpers.martSessionFilter("s")}
+),
+
+buckets AS (
+  SELECT main_category, distinct_items_viewed, COUNT(*) AS sessions, COUNTIF(has_purchase) AS purchase_sessions, SUM(revenue) AS revenue
+  FROM sessions
+  GROUP BY 1, 2
+  UNION ALL
+  SELECT '(all)' AS main_category, distinct_items_viewed, COUNT(*), COUNTIF(has_purchase), SUM(revenue)
+  FROM sessions
+  GROUP BY 2
+),
+
+rated AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(purchase_sessions, sessions) AS conversion_rate,
+    ${helpers.wilsonLower("purchase_sessions", "sessions")} AS conversion_rate_lower,
+    SAFE_DIVIDE(revenue, sessions) AS revenue_per_session
+  FROM buckets
+  WHERE sessions >= ${co.min_sessions_per_bucket}
+),
+
+with_peak AS (
+  SELECT
+    *,
+    conversion_rate - LAG(conversion_rate) OVER (PARTITION BY main_category ORDER BY distinct_items_viewed) AS marginal_conversion_change,
+    FIRST_VALUE(distinct_items_viewed) OVER (PARTITION BY main_category ORDER BY conversion_rate_lower DESC, distinct_items_viewed) AS sweet_spot_items
+  FROM rated
+)
+
+SELECT
+  main_category,
+  distinct_items_viewed,
+  sessions,
+  purchase_sessions,
+  revenue,
+  conversion_rate,
+  conversion_rate_lower,
+  revenue_per_session,
+  marginal_conversion_change,
+  sweet_spot_items,
+  distinct_items_viewed = sweet_spot_items AS is_sweet_spot,
+  SAFE_DIVIDE(SUM(IF(distinct_items_viewed > sweet_spot_items, sessions, 0)) OVER (PARTITION BY main_category), SUM(sessions) OVER (PARTITION BY main_category)) AS overload_share,
+  MAX(IF(distinct_items_viewed = sweet_spot_items, conversion_rate, NULL)) OVER (PARTITION BY main_category)
+    - SAFE_DIVIDE(
+        SUM(IF(distinct_items_viewed > sweet_spot_items, purchase_sessions, 0)) OVER (PARTITION BY main_category),
+        SUM(IF(distinct_items_viewed > sweet_spot_items, sessions, 0)) OVER (PARTITION BY main_category)
+      ) AS overload_conversion_gap,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_peak

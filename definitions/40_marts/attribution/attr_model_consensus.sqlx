@@ -1,0 +1,144 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_model_consensus",
+  description: "Every attribution model of the project in one place, for the primary key event (last 90 days): 17 rule based models, Markov (orders 1 and 2), Shapley, Shao-Li, additive hazard and, with enable_bqml, the logistic regression. Per channel and model the share of the conversions, plus the consensus across the models (median share), how much they disagree (min, max, coefficient of variation) and whether the data driven models value the channel more or less than the GA4 default (last non-direct click). A channel the models agree on is a safe decision; one where they disagree needs an incrementality test before moving budget",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "attribution_extended"],
+  columns: {
+    model: "Model name",
+    model_family: "rule_based | data_driven",
+    share: "Share of the conversions given to the channel by the model",
+    consensus_share: "Median share of the channel across all the models",
+    data_driven_share: "Average share of the channel across the data driven models",
+    last_non_direct_share: "Share in the GA4 default model (last non-direct click)",
+    data_driven_vs_last_click: "data_driven_share / last_non_direct_share. Above 1.3 = undervalued by the GA4 default (usually openers: social, video, display); below 0.7 = overvalued (usually closers: brand search, direct, email)",
+    disagreement_cv: "Standard deviation / mean of the shares across the models. Above 0.5 = the models do not agree, test before trusting any of them",
+    verdict: "undervalued_by_last_click | overvalued_by_last_click | models_disagree | consistent"
+  }
+}
+
+js {
+  const ax = cfg_attribution_extended;
+  const ruleOriginal = ["first_click", "last_click", "last_non_direct", "linear", "time_decay", "position_based", "w_shaped"];
+  const ruleExtended = ["first_non_direct", "last_paid", "last_engaged", "j_shaped", "inverse_j", "full_path", "engagement_weighted", "geometric_position", "funnel_progress", "learned_time_decay"];
+  const unnestCredits = (models, alias) => models.map(m => `STRUCT('${m}' AS model, ${alias}.credit_${m} AS credit)`).join(",\n      ");
+}
+
+WITH
+primary_key_event AS (
+  SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1
+),
+
+rule_original AS (
+  SELECT m.model, c.channel, SUM(m.credit) AS conversions
+  FROM ${ref("attr_credits_rule_based")} AS c,
+    UNNEST([
+      ${unnestCredits(ruleOriginal, "c")}
+    ]) AS m
+  WHERE c.conversion_date >= ${helpers.daysAgo(ax.window_days)}
+    AND c.key_event_name IN (SELECT key_event_name FROM primary_key_event)
+  GROUP BY 1, 2
+),
+
+rule_extended AS (
+  SELECT m.model, c.channel, SUM(m.credit) AS conversions
+  FROM ${ref("attr_credits_rule_based_extended")} AS c,
+    UNNEST([
+      ${unnestCredits(ruleExtended, "c")}
+    ]) AS m
+  WHERE c.conversion_date >= ${helpers.daysAgo(ax.window_days)}
+    AND c.key_event_name IN (SELECT key_event_name FROM primary_key_event)
+  GROUP BY 1, 2
+),
+
+rule_shares AS (
+  SELECT model, 'rule_based' AS model_family, channel, SAFE_DIVIDE(conversions, SUM(conversions) OVER (PARTITION BY model)) AS share
+  FROM (SELECT * FROM rule_original UNION ALL SELECT * FROM rule_extended)
+),
+
+data_driven AS (
+  SELECT 'markov_order_1' AS model, channel, share
+  FROM ${ref("attr_markov_removal_effects")}
+  WHERE key_event_name IN (SELECT key_event_name FROM primary_key_event)
+
+  UNION ALL
+  SELECT 'markov_order_2', channel, share
+  FROM ${ref("attr_markov_higher_order")}
+  WHERE markov_order = 2
+
+  UNION ALL
+  SELECT 'shapley', channel, share_of_conversions
+  FROM ${ref("attr_shapley_values")}
+  WHERE key_event_name IN (SELECT key_event_name FROM primary_key_event)
+
+  UNION ALL
+  SELECT 'shao_li', channel, share
+  FROM ${ref("attr_probabilistic_shao_li")}
+
+  UNION ALL
+  SELECT 'additive_hazard', channel, share_without_baseline
+  FROM ${ref("attr_additive_hazard")}
+  WHERE channel != '(baseline)'
+  ${constants.ENABLE.bqml ? `
+  UNION ALL
+  SELECT 'logistic_regression', channel, share
+  FROM ${ref("attr_logistic_regression_credits")}` : ""}
+),
+
+all_models AS (
+  SELECT model, model_family, channel, share FROM rule_shares
+  UNION ALL
+  SELECT model, 'data_driven' AS model_family, channel, share FROM data_driven
+),
+
+-- every channel x every model (a model that gives nothing to a channel says 0, not NULL)
+grid AS (
+  SELECT m.model, m.model_family, c.channel, COALESCE(a.share, 0) AS share
+  FROM (SELECT DISTINCT model, model_family FROM all_models) AS m
+  CROSS JOIN (SELECT DISTINCT channel FROM all_models WHERE channel IS NOT NULL) AS c
+  LEFT JOIN all_models AS a
+    ON a.model = m.model
+    AND a.channel = c.channel
+),
+
+stats AS (
+  SELECT
+    *,
+    PERCENTILE_CONT(share, 0.5) OVER (PARTITION BY channel) AS consensus_share,
+    MIN(share) OVER (PARTITION BY channel) AS min_share,
+    MAX(share) OVER (PARTITION BY channel) AS max_share,
+    SAFE_DIVIDE(STDDEV_POP(share) OVER (PARTITION BY channel), AVG(share) OVER (PARTITION BY channel)) AS disagreement_cv,
+    AVG(IF(model_family = 'data_driven', share, NULL)) OVER (PARTITION BY channel) AS data_driven_share,
+    MAX(IF(model = 'last_non_direct', share, NULL)) OVER (PARTITION BY channel) AS last_non_direct_share
+  FROM grid
+)
+
+SELECT
+  (SELECT key_event_name FROM primary_key_event) AS key_event_name,
+  channel,
+  model,
+  model_family,
+  share,
+  consensus_share,
+  min_share,
+  max_share,
+  disagreement_cv,
+  data_driven_share,
+  last_non_direct_share,
+  SAFE_DIVIDE(data_driven_share, last_non_direct_share) AS data_driven_vs_last_click,
+  CASE
+    WHEN disagreement_cv > 0.5 AND consensus_share >= 0.02 THEN 'models_disagree'
+    WHEN SAFE_DIVIDE(data_driven_share, last_non_direct_share) >= 1.3 THEN 'undervalued_by_last_click'
+    WHEN SAFE_DIVIDE(data_driven_share, last_non_direct_share) <= 0.7 THEN 'overvalued_by_last_click'
+    ELSE 'consistent'
+  END AS verdict,
+  RANK() OVER (PARTITION BY model ORDER BY share DESC) AS rank_in_model,
+  ${helpers.today()} AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM stats

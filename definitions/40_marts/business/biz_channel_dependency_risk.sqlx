@@ -1,0 +1,98 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_channel_dependency_risk",
+  description: "How hostage the revenue is, measured like antitrust regulators measure a market: the Herfindahl-Hirschman index (HHI) of the weekly revenue by channel AND by the company that owns the traffic (Google, Meta, ByteDance, Microsoft, AI assistants, owned channels). 1 / HHI = the effective number of independent channels. A store with 8 channels in GA4 and an effective number of 1.6 depends on one algorithm update of one company. One row per week and lens, with the share of each player and the trend of the concentration",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "frontier"],
+  columns: {
+    week: "Week (monday)",
+    lens: "channel (GA4 default channel group of the order) | traffic_owner (company behind the session source)",
+    revenue: "Valid revenue of the week",
+    players: "Channels / owners with revenue in the week",
+    hhi: "Sum of the squared revenue shares (0 to 1). Above cfg_frontier.dependency.concentrated_hhi = concentrated",
+    effective_players: "1 / hhi: the number of equal sized channels that would give the same concentration",
+    top_player: "Channel / owner with most revenue",
+    top_share: "Its share of the revenue",
+    revenue_at_risk_top: "Revenue of the top player in the week (what a blackout of it, a ban or an algorithm change puts at stake)",
+    hhi_vs_8_week_avg: "hhi - average hhi of the 8 weeks before. Positive and growing = the dependency is increasing",
+    shares: "Every player with its revenue and share"
+  }
+}
+
+js {
+  const dp = cfg_frontier.dependency;
+  const start = helpers.weekStart(helpers.daysAgo(dp.weeks * 7));
+}
+
+WITH
+orders AS (
+  SELECT
+    ${helpers.weekStart("transaction_date")} AS week,
+    revenue,
+    COALESCE(session_default_channel_group, 'Unassigned') AS channel,
+    CASE
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(chatgpt|openai|perplexity|gemini|bard|claude|copilot|deepseek)') THEN 'AI assistants'
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(google|youtube|gmail|doubleclick|dv360|discover)') THEN 'Google'
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(facebook|instagram|^ig$|^fb$|meta|whatsapp|messenger|threads)') THEN 'Meta'
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(tiktok|bytedance)') THEN 'ByteDance'
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(bing|microsoft|msn|linkedin|outlook)') THEN 'Microsoft'
+      WHEN REGEXP_CONTAINS(LOWER(COALESCE(session_source, '')), r'(mercadolivre|mercado livre|amazon|shopee|magalu|americanas)') THEN 'Marketplaces'
+      WHEN LOWER(COALESCE(session_source, '')) IN ('(direct)', '')
+        OR REGEXP_CONTAINS(LOWER(COALESCE(session_medium, '')), r'(email|e-mail|newsletter|crm|sms|push|rcs)') THEN 'Owned (direct, email, CRM)'
+      ELSE 'Others'
+    END AS traffic_owner
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${start}
+    AND transaction_date < ${helpers.weekStart(helpers.today())}
+    AND is_valid_for_revenue
+    AND revenue > 0
+),
+
+by_player AS (
+  SELECT o.week, l.lens, l.player, SUM(o.revenue) AS revenue
+  FROM orders AS o
+  CROSS JOIN UNNEST([STRUCT('channel' AS lens, o.channel AS player), STRUCT('traffic_owner', o.traffic_owner)]) AS l
+  GROUP BY 1, 2, 3
+),
+
+shares AS (
+  SELECT *, SAFE_DIVIDE(revenue, SUM(revenue) OVER (PARTITION BY week, lens)) AS share
+  FROM by_player
+),
+
+weekly AS (
+  SELECT
+    week,
+    lens,
+    SUM(revenue) AS revenue,
+    COUNT(*) AS players,
+    SUM(share * share) AS hhi,
+    ARRAY_AGG(player ORDER BY revenue DESC LIMIT 1)[OFFSET(0)] AS top_player,
+    MAX(share) AS top_share,
+    MAX(revenue) AS revenue_at_risk_top,
+    ARRAY_AGG(STRUCT(player, revenue, share) ORDER BY revenue DESC) AS shares
+  FROM shares
+  GROUP BY week, lens
+)
+
+SELECT
+  week,
+  lens,
+  revenue,
+  players,
+  hhi,
+  SAFE_DIVIDE(1, hhi) AS effective_players,
+  hhi > ${dp.concentrated_hhi} AS is_concentrated,
+  top_player,
+  top_share,
+  revenue_at_risk_top,
+  hhi - AVG(hhi) OVER (PARTITION BY lens ORDER BY week ROWS BETWEEN 8 PRECEDING AND 1 PRECEDING) AS hhi_vs_8_week_avg,
+  shares,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM weekly

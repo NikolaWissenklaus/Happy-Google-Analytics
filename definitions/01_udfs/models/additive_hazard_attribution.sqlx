@@ -1,0 +1,149 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "operations",
+  hasOutput: true,
+  schema: constants.SCHEMAS.udf,
+  name: "additive_hazard_attribution",
+  description: "Survival (time to conversion) attribution, the additive hazard model of Zhang, Wei and Ren (2014): every touch adds a bump to the conversion hazard that fades with time, on top of a baseline the person has anyway. Fitted by maximum likelihood (EM) over converting and censored journeys, the decay picked from a grid of half lives. Gives the incremental conversions per touch of each channel AND the share of the conversions that is baseline (would happen without any touch)",
+  dependencies: ["ops_bootstrap_datasets"],
+  tags: ["udf", "daily", "attribution", "attribution_extended"]
+}
+
+-- model: lambda(t) = b0 + sum over the touches j before t of beta[channel j] * w * exp(-w (t - t_j))
+--   the kernel w exp(-w d) integrates to 1, so beta[c] = expected conversions caused by ONE touch of c
+-- log likelihood (journey u observed on [0, E_u], converted at E_u or censored there, weight m_u):
+--   sum_conv m log lambda(E) - sum_u m [ b0 E + sum_j beta[c_j] (1 - exp(-w (E - t_j))) ]
+-- for a fixed w the problem is concave in (b0, beta) and EM is exact and monotone:
+--   r_0 = b0 / lambda, r_j = beta w exp(-w (E - t_j)) / lambda   (responsibilities of a conversion)
+--   b0 = sum m r_0 / sum m E,   beta[c] = sum m r_j / sum m (1 - exp(-w (E - t_j)))
+-- the half life with the best likelihood wins. Output: one row per channel + one '(baseline)' row
+CREATE OR REPLACE FUNCTION ${self()}(
+  journeys ARRAY<STRUCT<converted BOOL, end_days FLOAT64, weight FLOAT64, value FLOAT64, touches ARRAY<STRUCT<channel STRING, days FLOAT64>>>>,
+  half_lives ARRAY<FLOAT64>,
+  iterations FLOAT64
+)
+RETURNS ARRAY<STRUCT<channel STRING, beta FLOAT64, touches FLOAT64, attributed_conversions FLOAT64, attributed_value FLOAT64, share FLOAT64, half_life_days FLOAT64, log_likelihood FLOAT64>>
+LANGUAGE js AS r"""
+  var J = [];
+  var channelIndex = {};
+  var names = [];
+  (journeys || []).forEach(function (j) {
+    if (!j || j.end_days === null || j.end_days <= 0) return;
+    var ts = [];
+    (j.touches || []).forEach(function (t) {
+      if (!t || t.days === null || t.days < 0 || t.days > j.end_days) return;
+      var ch = t.channel || '(unknown)';
+      if (!(ch in channelIndex)) { channelIndex[ch] = names.length; names.push(ch); }
+      ts.push({ c: channelIndex[ch], d: j.end_days - t.days });
+    });
+    J.push({ conv: !!j.converted, E: j.end_days, m: (j.weight === null || j.weight === undefined) ? 1 : j.weight, v: j.value || 0, t: ts });
+  });
+  var C = names.length;
+  if (J.length === 0) return [];
+  var iters = Math.max(10, Math.min(Number(iterations) || 100, 2000));
+  var grid = (half_lives && half_lives.length) ? half_lives : [1, 7, 30];
+
+  var totalExposure = 0, totalConv = 0;
+  J.forEach(function (j) { totalExposure += j.m * j.E; if (j.conv) totalConv += j.m; });
+  if (totalConv <= 0) return [];
+
+  function fit(halfLife) {
+    var w = Math.LN2 / halfLife;
+    // exposure of each touch: integral of its kernel up to the end of the journey
+    var denom = new Array(C).fill(0);
+    J.forEach(function (j) {
+      j.t.forEach(function (t) { denom[t.c] += j.m * (1 - Math.exp(-w * t.d)); });
+    });
+    var b0 = totalConv / totalExposure * 0.5;
+    var beta = new Array(C).fill(0.01);
+    var ll = -Infinity;
+    for (var it = 0; it < iters; it++) {
+      var num0 = 0;
+      var num = new Array(C).fill(0);
+      for (var u = 0; u < J.length; u++) {
+        var j = J[u];
+        if (!j.conv) continue;
+        var lam = b0;
+        var parts = [];
+        for (var q = 0; q < j.t.length; q++) {
+          var p = beta[j.t[q].c] * w * Math.exp(-w * j.t[q].d);
+          parts.push(p);
+          lam += p;
+        }
+        if (lam <= 0) continue;
+        num0 += j.m * b0 / lam;
+        for (var q2 = 0; q2 < j.t.length; q2++) num[j.t[q2].c] += j.m * parts[q2] / lam;
+      }
+      b0 = num0 / totalExposure;
+      for (var c = 0; c < C; c++) beta[c] = denom[c] > 0 ? num[c] / denom[c] : 0;
+    }
+    // log likelihood and the final responsibilities
+    ll = 0;
+    var resp0 = 0, respV0 = 0;
+    var resp = new Array(C).fill(0), respV = new Array(C).fill(0), touches = new Array(C).fill(0);
+    for (var u2 = 0; u2 < J.length; u2++) {
+      var jj = J[u2];
+      var integral = b0 * jj.E;
+      for (var q3 = 0; q3 < jj.t.length; q3++) {
+        integral += beta[jj.t[q3].c] * (1 - Math.exp(-w * jj.t[q3].d));
+        touches[jj.t[q3].c] += jj.m;
+      }
+      ll -= jj.m * integral;
+      if (jj.conv) {
+        var lam2 = b0;
+        var parts2 = [];
+        for (var q4 = 0; q4 < jj.t.length; q4++) {
+          var p2 = beta[jj.t[q4].c] * w * Math.exp(-w * jj.t[q4].d);
+          parts2.push(p2);
+          lam2 += p2;
+        }
+        if (lam2 > 0) {
+          ll += jj.m * Math.log(lam2);
+          resp0 += jj.m * b0 / lam2;
+          respV0 += jj.m * jj.v * b0 / lam2;
+          for (var q5 = 0; q5 < jj.t.length; q5++) {
+            resp[jj.t[q5].c] += jj.m * parts2[q5] / lam2;
+            respV[jj.t[q5].c] += jj.m * jj.v * parts2[q5] / lam2;
+          }
+        }
+      }
+    }
+    return { halfLife: halfLife, b0: b0, beta: beta, ll: ll, resp0: resp0, respV0: respV0, resp: resp, respV: respV, touches: touches };
+  }
+
+  var best = null;
+  grid.forEach(function (h) {
+    if (!(h > 0)) return;
+    var r = fit(h);
+    if (best === null || r.ll > best.ll) best = r;
+  });
+  if (best === null) return [];
+
+  var totalResp = best.resp0 + best.resp.reduce(function (a, b) { return a + b; }, 0);
+  var out = names.map(function (ch, c) {
+    return {
+      channel: ch,
+      beta: best.beta[c],
+      touches: best.touches[c],
+      attributed_conversions: best.resp[c],
+      attributed_value: best.respV[c],
+      share: totalResp > 0 ? best.resp[c] / totalResp : null,
+      half_life_days: best.halfLife,
+      log_likelihood: best.ll
+    };
+  });
+  out.push({
+    channel: '(baseline)',
+    beta: best.b0,
+    touches: null,
+    attributed_conversions: best.resp0,
+    attributed_value: best.respV0,
+    share: totalResp > 0 ? best.resp0 / totalResp : null,
+    half_life_days: best.halfLife,
+    log_likelihood: best.ll
+  });
+  return out;
+"""
+OPTIONS (description = "Additive hazard (survival) attribution")

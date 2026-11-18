@@ -1,0 +1,176 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_multi_tab_browsing",
+  description: "Tab hoarding, measured: GA4 thinks a session is a straight line of pages, but people open products in new tabs and compare them side by side. A NEW page of the session whose page_referrer is an EARLIER page of the session (not the one viewed right before) can only be a parallel tab. Per device and channel (last 30 days): share of multi tab sessions, their conversion against single tab sessions and the pages that spawn the tabs (usually category and search: the comparison table the site does not have)",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "frontier"],
+  columns: Object.assign(docs.pick("device_category", "session_default_channel_group", "sessions", "conversion_rate"), {
+    tab_behaviour: "single_tab | multi_tab (cfg_frontier.multi_tab.min_parallel_views or more parallel views in the session)",
+    parallel_views: "Views that came from an earlier page of the session that was not the previous view (a tab left open)",
+    avg_parallel_views: "parallel_views / sessions",
+    share_of_sessions: "Sessions of this behaviour / all the sessions of the device and channel",
+    conversion_lift_vs_single_tab: "(conversion multi tab - conversion single tab) / conversion single tab. Only on the multi_tab rows",
+    top_tab_spawning_pages: "Pages that most spawned parallel tabs (path, page type, parallel views spawned)",
+    tab_spawning_page_type_mix: "Share of the parallel views per page type of the page that spawned them"
+  })
+}
+
+js {
+  const mt = cfg_frontier.multi_tab;
+  const siteHosts = helpers.inList("referrer_host", constants.SITE_HOSTNAMES);
+}
+
+WITH
+views AS (
+  SELECT
+    session_key,
+    event_ts,
+    page_number,
+    page_path,
+    page_type,
+    previous_page_path,
+    page_hostname,
+    device_category,
+    session_default_channel_group,
+    ${ga4.urlPath("page_referrer")} AS referrer_path,
+    ${ga4.urlHost("page_referrer")} AS referrer_host
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${helpers.daysAgo(mt.window_days)}
+    AND event_date < ${helpers.today()}
+    AND event_name = 'page_view'
+    AND page_path IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+with_history AS (
+  SELECT
+    *,
+    -- first time this page shows up in the session (a back button brings an OLD page back)
+    ROW_NUMBER() OVER (PARTITION BY session_key, page_path ORDER BY event_ts, page_number) = 1 AS is_first_view_of_page,
+    -- every page of the session up to two views before this one
+    ARRAY_AGG(page_path IGNORE NULLS) OVER (
+      PARTITION BY session_key ORDER BY event_ts, page_number
+      ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING
+    ) AS earlier_paths
+  FROM views
+),
+
+flagged AS (
+  SELECT
+    *,
+    (
+      page_number > 1
+      AND is_first_view_of_page
+      AND referrer_path IS NOT NULL
+      AND (referrer_host = page_hostname OR ${siteHosts})
+      AND referrer_path != COALESCE(previous_page_path, '')
+      AND referrer_path != page_path
+      AND referrer_path IN UNNEST(earlier_paths)
+    ) AS is_parallel_view
+  FROM with_history
+),
+
+session_tabs AS (
+  SELECT session_key, COUNTIF(is_parallel_view) AS parallel_views
+  FROM flagged
+  GROUP BY session_key
+),
+
+sessions AS (
+  SELECT
+    s.*,
+    COALESCE(t.parallel_views, 0) AS parallel_views,
+    IF(COALESCE(t.parallel_views, 0) >= ${mt.min_parallel_views}, 'multi_tab', 'single_tab') AS tab_behaviour
+  FROM ${ref("fct_sessions")} AS s
+  LEFT JOIN session_tabs AS t USING (session_key)
+  WHERE s.session_date >= ${helpers.daysAgo(mt.window_days)}
+    AND s.session_date < ${helpers.today()}
+    AND s.platform = 'WEB'
+    AND s.page_views >= 2
+    ${helpers.martSessionFilter("s")}
+),
+
+aggregated AS (
+  SELECT
+    device_category,
+    session_default_channel_group,
+    tab_behaviour,
+    ${metrics.sessionMetrics()},
+    SUM(parallel_views) AS parallel_views,
+    COUNTIF(has_add_to_cart) AS sessions_with_cart
+  FROM sessions
+  GROUP BY 1, 2, 3
+),
+
+spawning_pages AS (
+  SELECT
+    device_category,
+    session_default_channel_group,
+    ARRAY_AGG(STRUCT(referrer_path AS page_path, spawner_page_type AS page_type, spawned AS parallel_views) ORDER BY spawned DESC LIMIT 10) AS top_tab_spawning_pages
+  FROM (
+    SELECT
+      device_category,
+      session_default_channel_group,
+      referrer_path,
+      ${content.pageTypeCase("referrer_path")} AS spawner_page_type,
+      COUNT(*) AS spawned
+    FROM flagged
+    WHERE is_parallel_view
+    GROUP BY 1, 2, 3, 4
+  )
+  GROUP BY 1, 2
+),
+
+spawning_mix AS (
+  SELECT
+    device_category,
+    session_default_channel_group,
+    ARRAY_AGG(STRUCT(spawner_page_type AS page_type, share) ORDER BY share DESC) AS tab_spawning_page_type_mix
+  FROM (
+    SELECT
+      device_category,
+      session_default_channel_group,
+      ${content.pageTypeCase("referrer_path")} AS spawner_page_type,
+      SAFE_DIVIDE(COUNT(*), SUM(COUNT(*)) OVER (PARTITION BY device_category, session_default_channel_group)) AS share
+    FROM flagged
+    WHERE is_parallel_view
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+
+with_ratios AS (
+  SELECT
+    * EXCEPT (users_hll, active_users_hll),
+    ${metrics.sessionRatios()},
+    SAFE_DIVIDE(parallel_views, sessions) AS avg_parallel_views,
+    SAFE_DIVIDE(sessions_with_cart, sessions) AS cart_rate
+  FROM aggregated
+)
+
+SELECT
+  a.*,
+  SAFE_DIVIDE(a.sessions, SUM(a.sessions) OVER (PARTITION BY a.device_category, a.session_default_channel_group)) AS share_of_sessions,
+  IF(a.tab_behaviour = 'multi_tab', ${helpers.pctChange("a.conversion_rate", "b.conversion_rate")}, NULL) AS conversion_lift_vs_single_tab,
+  IF(a.tab_behaviour = 'multi_tab', ${helpers.pctChange("a.average_order_value", "b.average_order_value")}, NULL) AS aov_lift_vs_single_tab,
+  IF(a.tab_behaviour = 'multi_tab', sp.top_tab_spawning_pages, NULL) AS top_tab_spawning_pages,
+  IF(a.tab_behaviour = 'multi_tab', sm.tab_spawning_page_type_mix, NULL) AS tab_spawning_page_type_mix,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_ratios AS a
+LEFT JOIN with_ratios AS b
+  ON b.device_category = a.device_category
+  AND b.session_default_channel_group = a.session_default_channel_group
+  AND b.tab_behaviour = 'single_tab'
+LEFT JOIN spawning_pages AS sp
+  ON sp.device_category = a.device_category
+  AND sp.session_default_channel_group = a.session_default_channel_group
+LEFT JOIN spawning_mix AS sm
+  ON sm.device_category = a.device_category
+  AND sm.session_default_channel_group = a.session_default_channel_group
+WHERE a.sessions >= 30

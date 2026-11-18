@@ -1,0 +1,104 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.segments,
+  name: "seg_price_watchers",
+  description: "People waiting for the price to drop: the same person opens the same product on 3 or more different days and never buys it. One row per user_key x item (last 45 days) with the price they saw the first time, the price they saw the last time, today's price and whether they are still hot. The most precise audience a store has: send THIS product, to THIS person, when the price moves (or with a small coupon), instead of a generic remarketing. Has consent_ads so activation can respect LGPD",
+  bigquery: {
+    clusterBy: ["item_id", "user_key"],
+    labels: { layer: "marts", domain: "segments" }
+  },
+  tags: ["marts", "segments", "daily", "frontier", "pricing", "crm"],
+  columns: Object.assign(docs.pick("user_key"), {
+    view_days: "Distinct days the person viewed the item",
+    first_seen_price: "Price of the item in the first view of the person",
+    last_seen_price: "Price of the item in the last view of the person",
+    current_price: "dim_items.current_price (median price on the last day the item was seen by anybody)",
+    price_change_since_first_view: "(current_price - first_seen_price) / first_seen_price. Negative = it already got cheaper and they still did not buy (the price is not the problem, or they did not see it)",
+    added_to_cart: "The person added the item to the cart at least once in the window",
+    watch_status: "hot (last view in cfg_frontier.price_watch.hot_days) | cooling",
+    watch_intensity: "view_days / days between the first and the last view (1 = came every day)",
+    item_watchers: "Watchers of the item (any status): a product with many watchers is a candidate to a price test",
+    consent_ads_storage: "Latest ads consent of the person (dim_users.latest_consent_ads). Activate only 'granted'"
+  })
+}
+
+js {
+  const pw = cfg_frontier.price_watch;
+}
+
+WITH
+views AS (
+  SELECT
+    user_key,
+    item_id,
+    item_name,
+    item_category,
+    event_date,
+    event_ts,
+    event_name,
+    price
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(pw.window_days)}
+    AND event_name IN ('view_item', 'add_to_cart')
+    AND item_id IS NOT NULL
+    AND user_key IS NOT NULL
+    ${helpers.martSessionFilter()}
+),
+
+watch AS (
+  SELECT
+    user_key,
+    item_id,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    COUNT(DISTINCT IF(event_name = 'view_item', event_date, NULL)) AS view_days,
+    COUNTIF(event_name = 'view_item') AS views,
+    MIN(event_date) AS first_view_date,
+    MAX(IF(event_name = 'view_item', event_date, NULL)) AS last_view_date,
+    ARRAY_AGG(IF(event_name = 'view_item', price, NULL) IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS first_seen_price,
+    ARRAY_AGG(IF(event_name = 'view_item', price, NULL) IGNORE NULLS ORDER BY event_ts DESC LIMIT 1)[SAFE_OFFSET(0)] AS last_seen_price,
+    COUNTIF(event_name = 'add_to_cart') > 0 AS added_to_cart
+  FROM views
+  GROUP BY user_key, item_id
+  HAVING COUNT(DISTINCT IF(event_name = 'view_item', event_date, NULL)) >= ${pw.min_view_days}
+),
+
+bought AS (
+  SELECT DISTINCT user_key, item_id
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= ${helpers.daysAgo(pw.window_days)}
+    AND is_valid_for_revenue
+)
+
+SELECT
+  w.user_key,
+  w.item_id,
+  w.item_name,
+  w.item_category,
+  w.view_days,
+  w.views,
+  w.first_view_date,
+  w.last_view_date,
+  DATE_DIFF(${helpers.today()}, w.last_view_date, DAY) AS days_since_last_view,
+  SAFE_DIVIDE(w.view_days, DATE_DIFF(w.last_view_date, w.first_view_date, DAY) + 1) AS watch_intensity,
+  w.first_seen_price,
+  w.last_seen_price,
+  i.current_price,
+  ${helpers.pctChange("i.current_price", "w.first_seen_price")} AS price_change_since_first_view,
+  w.added_to_cart,
+  IF(DATE_DIFF(${helpers.today()}, w.last_view_date, DAY) <= ${pw.hot_days}, 'hot', 'cooling') AS watch_status,
+  COUNT(*) OVER (PARTITION BY w.item_id) AS item_watchers,
+  u.is_customer,
+  u.lifetime_revenue,
+  u.latest_consent_ads AS consent_ads_storage,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM watch AS w
+LEFT JOIN bought AS b
+  ON b.user_key = w.user_key
+  AND b.item_id = w.item_id
+LEFT JOIN ${ref("dim_items")} AS i ON i.item_id = w.item_id
+LEFT JOIN ${ref("dim_users")} AS u ON u.user_key = w.user_key
+WHERE b.user_key IS NULL

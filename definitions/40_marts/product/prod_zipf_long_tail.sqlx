@@ -1,0 +1,107 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_zipf_long_tail",
+  description: "Zipf's law of the store, week by week: words in a book, cities in a country and the views of the pages of a site follow frequency ~ 1 / rank^s. The exponent s is the shape of the attention: s above 1 = a few winners take everything (the home, two hero products), s below 1 = a fat long tail (the catalogue and the SEO work). Fitted every week with a log-log regression for pages, products and site search terms. A rising s means the attention is concentrating (a campaign that only pushes 3 products, a broken category); a falling s means the long tail is growing. Also the share of the head and of the tail, and the R2 of the fit (low R2 = the distribution is not a power law, something odd is going on)",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "frontier"],
+  columns: {
+    week: "Week (monday)",
+    entity_type: "page | product | search_term",
+    distinct_entities: "Distinct pages / products / terms with at least one hit in the week",
+    hits: "Views (pages, products) or searches (terms)",
+    zipf_exponent: "s of frequency ~ rank^-s, OLS on log(frequency) x log(rank) over the top cfg_frontier.zipf.max_rank ranks",
+    fit_r2: "R2 of the log-log fit. Above 0.9 = a clean power law",
+    top_1_share: "Share of the hits of the number 1 entity",
+    top_10_share: "Share of the hits of the 10 first",
+    tail_share: "Share of the hits outside the top 100 (the long tail)",
+    exponent_change_vs_previous_week: "zipf_exponent - the one of the previous week",
+    exponent_vs_8_week_avg: "zipf_exponent - average of the 8 weeks before. Above 0.1 = the attention is concentrating"
+  }
+}
+
+js {
+  const zp = cfg_frontier.zipf;
+  const start = helpers.weekStart(helpers.daysAgo(zp.weeks * 7));
+  const end = helpers.weekStart(helpers.today());
+}
+
+WITH
+hits AS (
+  SELECT ${helpers.weekStart("event_date")} AS week, 'page' AS entity_type, page_path AS entity
+  FROM ${ref("fct_page_views")}
+  WHERE event_date >= ${start}
+    AND event_date < ${end}
+    AND page_path IS NOT NULL
+    ${helpers.martSessionFilter()}
+
+  UNION ALL
+
+  SELECT ${helpers.weekStart("event_date")}, 'product', item_id
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${start}
+    AND event_date < ${end}
+    AND event_name = 'view_item'
+    AND item_id IS NOT NULL
+    ${helpers.martSessionFilter()}
+
+  UNION ALL
+
+  SELECT ${helpers.weekStart("event_date")}, 'search_term', LOWER(TRIM(search_term))
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${start}
+    AND event_date < ${end}
+    AND event_name = 'view_search_results'
+    AND search_term IS NOT NULL
+    AND TRIM(search_term) != ''
+),
+
+frequencies AS (
+  SELECT week, entity_type, entity, COUNT(*) AS frequency
+  FROM hits
+  GROUP BY 1, 2, 3
+),
+
+ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY week, entity_type ORDER BY frequency DESC, entity) AS rank_position,
+    SUM(frequency) OVER (PARTITION BY week, entity_type) AS total_hits
+  FROM frequencies
+),
+
+fit AS (
+  SELECT
+    week,
+    entity_type,
+    COUNT(*) AS distinct_entities,
+    ANY_VALUE(total_hits) AS hits,
+    -- slope of log(freq) on log(rank) = covar / var. zipf exponent = minus the slope
+    -SAFE_DIVIDE(
+      COVAR_POP(IF(rank_position <= ${zp.max_rank}, LN(rank_position), NULL), IF(rank_position <= ${zp.max_rank}, LN(frequency), NULL)),
+      VAR_POP(IF(rank_position <= ${zp.max_rank}, LN(rank_position), NULL))
+    ) AS zipf_exponent,
+    POW(CORR(IF(rank_position <= ${zp.max_rank}, LN(rank_position), NULL), IF(rank_position <= ${zp.max_rank}, LN(frequency), NULL)), 2) AS fit_r2,
+    COUNTIF(rank_position <= ${zp.max_rank}) AS fitted_points,
+    SAFE_DIVIDE(SUM(IF(rank_position = 1, frequency, 0)), ANY_VALUE(total_hits)) AS top_1_share,
+    SAFE_DIVIDE(SUM(IF(rank_position <= 10, frequency, 0)), ANY_VALUE(total_hits)) AS top_10_share,
+    SAFE_DIVIDE(SUM(IF(rank_position > 100, frequency, 0)), ANY_VALUE(total_hits)) AS tail_share,
+    SAFE_DIVIDE(COUNTIF(frequency = 1), COUNT(*)) AS singleton_share,
+    ARRAY_AGG(IF(rank_position <= 5, STRUCT(entity, frequency), NULL) IGNORE NULLS ORDER BY rank_position LIMIT 5) AS top_entities
+  FROM ranked
+  GROUP BY week, entity_type
+)
+
+SELECT
+  *,
+  fitted_points >= ${zp.min_rank_points} AS is_reliable_fit,
+  zipf_exponent - LAG(zipf_exponent) OVER w AS exponent_change_vs_previous_week,
+  zipf_exponent - AVG(zipf_exponent) OVER (PARTITION BY entity_type ORDER BY week ROWS BETWEEN 8 PRECEDING AND 1 PRECEDING) AS exponent_vs_8_week_avg,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM fit
+WINDOW w AS (PARTITION BY entity_type ORDER BY week)

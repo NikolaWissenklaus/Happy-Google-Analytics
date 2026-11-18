@@ -1,0 +1,93 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 17/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.attribution,
+  name: "attr_additive_hazard",
+  description: "Survival attribution (additive hazard model, Zhang, Wei and Ren 2014): the conversion is an event in TIME, every touch raises the chance of converting for a while (the effect fades with a half life learned from the data) on top of a baseline that exists without any touch. The only model here that splits the conversions between the channels AND the '(baseline)' (people that would convert anyway), and that says how many conversions ONE touch of each channel produces (beta): with the cost per touch it is a marginal ROI. Fitted by maximum likelihood inside BigQuery (JS UDF additive_hazard_attribution) on a weighted sample of the converting and censored journeys of attr_user_journeys",
+  bigquery: {
+    labels: { layer: "marts", domain: "attribution" }
+  },
+  tags: ["marts", "attribution", "daily", "data_science", "attribution_extended"],
+  columns: {
+    channel: "Channel, or '(baseline)' for the conversions the model gives to no touch",
+    beta: "Channels: expected conversions caused by ONE touch. Baseline: conversions per person per day without touches",
+    touches: "Touches of the channel in the sample (weighted back to the population)",
+    attributed_conversions: "Conversions credited to the channel, rescaled to the real total",
+    attributed_value: "Conversion value credited, rescaled to the real total",
+    share: "Share of the conversions (the baseline included)",
+    share_without_baseline: "Share among the channels only, comparable with the other models",
+    half_life_days: "Half life of the effect of a touch with the best likelihood (cfg_attribution_extended.hazard.half_life_grid_days)",
+    conversions_per_1000_touches: "beta * 1000"
+  }
+}
+
+js {
+  const hz = cfg_attribution_extended.hazard;
+}
+
+WITH
+journeys AS (
+  SELECT
+    *,
+    -- deterministic sample, the weight brings it back to the population
+    ROW_NUMBER() OVER (PARTITION BY is_converted ORDER BY FARM_FINGERPRINT(journey_id)) AS sample_rank,
+    COUNT(*) OVER (PARTITION BY is_converted) AS group_size
+  FROM ${ref("attr_user_journeys")}
+  WHERE observation_days > 0
+    AND ARRAY_LENGTH(touches) > 0
+),
+
+sampled AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(group_size, LEAST(group_size, IF(is_converted, ${hz.max_converting_journeys}, ${hz.max_non_converting_journeys}))) AS weight
+  FROM journeys
+  WHERE sample_rank <= IF(is_converted, ${hz.max_converting_journeys}, ${hz.max_non_converting_journeys})
+),
+
+totals AS (
+  SELECT
+    COUNTIF(is_converted) AS total_conversions,
+    SUM(IF(is_converted, conversion_value, 0)) AS total_value
+  FROM ${ref("attr_user_journeys")}
+),
+
+fit AS (
+  SELECT ${ref("additive_hazard_attribution")}(
+    ARRAY_AGG(STRUCT(
+      is_converted AS converted,
+      observation_days AS end_days,
+      weight,
+      COALESCE(conversion_value, 0) AS value,
+      ARRAY(SELECT AS STRUCT t.channel, t.days_from_start AS days FROM UNNEST(touches) AS t) AS touches
+    )),
+    [${hz.half_life_grid_days.map(Number).join(", ")}],
+    ${Number(hz.iterations)}
+  ) AS results
+  FROM sampled
+),
+
+results AS (
+  SELECT r.*
+  FROM fit AS f, UNNEST(f.results) AS r
+)
+
+SELECT
+  (SELECT key_event_name FROM ${ref("seed_key_events")} WHERE is_primary LIMIT 1) AS key_event_name,
+  r.channel,
+  r.beta,
+  r.touches,
+  IF(r.channel = '(baseline)', NULL, r.beta * 1000) AS conversions_per_1000_touches,
+  r.share,
+  IF(r.channel = '(baseline)', NULL, SAFE_DIVIDE(r.share, SUM(IF(r.channel = '(baseline)', 0, r.share)) OVER ())) AS share_without_baseline,
+  r.share * t.total_conversions AS attributed_conversions,
+  SAFE_DIVIDE(r.attributed_value, SUM(r.attributed_value) OVER ()) * t.total_value AS attributed_value,
+  r.half_life_days,
+  r.log_likelihood,
+  t.total_conversions,
+  ${helpers.today()} AS calculated_on,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM results AS r
+CROSS JOIN totals AS t

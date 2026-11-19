@@ -1,0 +1,113 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_travel_search_demand",
+  disabled: !cfg_extras.travel.enabled,
+  description: "Travel, hotels, airlines, bus, events with a date: the demand people search vs what they book, last 180 days. Per origin, destination, lead time band (days between the search and the trip) and trip length: searches, searchers, searchers that booked in the 14 days after (any booking), median lead time and the demand not met (searchers that never booked). 'São Paulo -> Recife with 60+ days of lead time: 9 thousand searchers, 1% book. Price alert and remarketing for that route'",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "vertical", "travel"],
+  columns: {
+    lead_time_band: "Days between the search and the start date of the trip (cfg_extras.travel.lead_time_bands)",
+    booking_rate_14d: "Searchers of the route that booked anything in the 14 days after the first search / searchers (only searches older than 14 days)",
+    unmet_searchers: "Searchers that did not book in 14 days: the demand left on the table"
+  }
+}
+
+js {
+  const t = cfg_extras.travel;
+  const bands = t.lead_time_bands;
+  const bandCase = bands.map((v, i) => `WHEN lead_time_days < ${v} THEN '${String(i + 1).padStart(2, "0")} < ${v}d'`).join("\n      ");
+}
+
+WITH
+searches AS (
+  SELECT
+    event_date,
+    event_ts,
+    user_key,
+    LOWER(TRIM(${ga4.paramStr(t.origin_param)})) AS origin,
+    LOWER(TRIM(${ga4.paramStr(t.destination_param)})) AS destination,
+    SAFE_CAST(${ga4.paramAny(t.start_date_param)} AS DATE) AS start_date,
+    SAFE_CAST(${ga4.paramAny(t.end_date_param)} AS DATE) AS end_date
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.daysAgo(180)}
+    AND event_name = ${helpers.sqlString(t.search_event)}
+    ${helpers.noiseFilter()}
+),
+
+classified AS (
+  SELECT
+    *,
+    DATE_DIFF(start_date, event_date, DAY) AS lead_time_days,
+    DATE_DIFF(end_date, start_date, DAY) AS trip_nights
+  FROM searches
+  WHERE destination IS NOT NULL
+),
+
+route_searchers AS (
+  SELECT
+    COALESCE(origin, '(not set)') AS origin,
+    destination,
+    CASE
+      WHEN lead_time_days IS NULL OR lead_time_days < 0 THEN '(not set)'
+      ${bandCase}
+      ELSE '${String(bands.length + 1).padStart(2, "0")} >= ${bands[bands.length - 1]}d'
+    END AS lead_time_band,
+    CASE
+      WHEN trip_nights IS NULL OR trip_nights < 0 THEN '(not set)'
+      WHEN trip_nights = 0 THEN 'same day'
+      WHEN trip_nights <= 3 THEN '1-3 nights'
+      WHEN trip_nights <= 7 THEN '4-7 nights'
+      ELSE '8+ nights'
+    END AS trip_length,
+    user_key,
+    MIN(event_ts) AS first_search_ts,
+    COUNT(*) AS searches,
+    ANY_VALUE(lead_time_days) AS lead_time_days
+  FROM classified
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+bookings AS (
+  SELECT user_key, event_ts AS booking_ts
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.daysAgo(180)}
+    AND event_name = ${helpers.sqlString(t.booking_event)}
+    ${helpers.noiseFilter()}
+),
+
+searchers_with_outcome AS (
+  SELECT
+    r.origin, r.destination, r.lead_time_band, r.trip_length, r.user_key, r.first_search_ts, r.searches, r.lead_time_days,
+    r.first_search_ts <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 14 DAY) AS is_mature,
+    COUNT(b.booking_ts) > 0 AS booked_14d
+  FROM route_searchers AS r
+  LEFT JOIN bookings AS b
+    ON b.user_key = r.user_key
+    AND b.booking_ts >= r.first_search_ts
+    AND b.booking_ts <= TIMESTAMP_ADD(r.first_search_ts, INTERVAL 14 DAY)
+  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+)
+
+SELECT
+  origin,
+  destination,
+  lead_time_band,
+  trip_length,
+  SUM(searches) AS searches,
+  COUNT(*) AS searchers,
+  COUNTIF(is_mature) AS mature_searchers,
+  COUNTIF(is_mature AND booked_14d) AS booked_searchers,
+  SAFE_DIVIDE(COUNTIF(is_mature AND booked_14d), COUNTIF(is_mature)) AS booking_rate_14d,
+  COUNTIF(is_mature AND NOT booked_14d) AS unmet_searchers,
+  APPROX_QUANTILES(lead_time_days, 100 IGNORE NULLS)[SAFE_OFFSET(50)] AS median_lead_time_days,
+  SAFE_DIVIDE(SUM(searches), COUNT(*)) AS searches_per_searcher,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM searchers_with_outcome
+GROUP BY 1, 2, 3, 4
+HAVING COUNT(*) >= 10

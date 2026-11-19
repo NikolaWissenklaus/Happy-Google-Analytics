@@ -1,0 +1,84 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_advertising_all_channels_daily",
+  description: "GA4 Advertising > Performance > All channels: per day and default channel group, sessions, key events, revenue AND the ads cost of every cost source of the project (Google Ads, Meta Ads, manual), with ROAS, cost per key event and cost per session. GA4 only shows cost for Google Ads and imported cost, here every platform lands in its channel (default_channel_group of the cost source / medium / campaign)",
+  bigquery: {
+    partitionBy: "metric_date",
+    clusterBy: ["default_channel_group"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "costs"],
+  columns: {
+    ads_cost: "Cost of the cost sources (int_costs__unified_daily) mapped to the GA4 default channel group of their source / medium / campaign",
+    return_on_ad_spend: "total_revenue / ads_cost (last non-direct click, like GA4)",
+    users_hll: "HLL sketch of the users, HLL_COUNT.MERGE to count a period"
+  }
+}
+
+WITH
+sessions_side AS (
+  SELECT
+    session_date AS metric_date,
+    session_default_channel_group AS default_channel_group,
+    COUNT(*) AS sessions,
+    COUNT(DISTINCT user_pseudo_id) AS total_users,
+    HLL_COUNT.INIT(user_pseudo_id) AS users_hll,
+    COUNTIF(is_engaged_ga4) AS engaged_sessions,
+    SUM(key_events) AS key_events,
+    SUM(transactions) AS ecommerce_purchases,
+    SUM(revenue) AS total_revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart()}
+  GROUP BY 1, 2
+),
+
+costs_with_channel AS (
+  SELECT
+    cost_date AS metric_date,
+    ${channels.defaultChannelGroup(`(${channels.normalizeSource("LOWER(TRIM(source))")})`, "LOWER(TRIM(medium))", "LOWER(TRIM(COALESCE(campaign, '')))")} AS default_channel_group,
+    cost,
+    clicks,
+    impressions
+  FROM ${ref("fct_ad_costs_daily")}
+  WHERE cost_date >= ${helpers.martWindowStart()}
+),
+
+costs_side AS (
+  SELECT
+    metric_date,
+    default_channel_group,
+    SUM(cost) AS ads_cost,
+    SUM(clicks) AS ads_clicks,
+    SUM(impressions) AS ads_impressions
+  FROM costs_with_channel
+  GROUP BY 1, 2
+)
+
+SELECT
+  COALESCE(s.metric_date, c.metric_date) AS metric_date,
+  COALESCE(s.default_channel_group, c.default_channel_group) AS default_channel_group,
+  COALESCE(s.sessions, 0) AS sessions,
+  COALESCE(s.total_users, 0) AS total_users,
+  s.users_hll,
+  COALESCE(s.engaged_sessions, 0) AS engaged_sessions,
+  COALESCE(s.key_events, 0) AS key_events,
+  COALESCE(s.ecommerce_purchases, 0) AS ecommerce_purchases,
+  COALESCE(s.total_revenue, 0) AS total_revenue,
+  COALESCE(c.ads_cost, 0) AS ads_cost,
+  COALESCE(c.ads_clicks, 0) AS ads_clicks,
+  COALESCE(c.ads_impressions, 0) AS ads_impressions,
+  SAFE_DIVIDE(s.total_revenue, c.ads_cost) AS return_on_ad_spend,
+  SAFE_DIVIDE(c.ads_cost, s.key_events) AS cost_per_key_event,
+  SAFE_DIVIDE(c.ads_cost, s.ecommerce_purchases) AS cost_per_purchase,
+  SAFE_DIVIDE(c.ads_cost, s.sessions) AS cost_per_session,
+  SAFE_DIVIDE(s.sessions, c.ads_clicks) AS sessions_per_ad_click,
+  SAFE_DIVIDE(s.engaged_sessions, s.sessions) AS engagement_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM sessions_side AS s
+FULL OUTER JOIN costs_side AS c
+  ON c.metric_date = s.metric_date
+  AND c.default_channel_group = s.default_channel_group

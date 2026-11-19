@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_regional_bestsellers",
+  description: "What each state buys more (or less) than Brazil, last 365 days. Location quotient per UF x category (share of the category in the UF / share of the category in the country), with a z score so small states do not shout, and the best selling product of the category in the UF. The map for regional campaigns, regional home page / banners, stock in the distribution centers and the 'Nordeste buys 3x more fans' insight",
+  bigquery: {
+    clusterBy: ["geo_uf"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "geo"],
+  columns: {
+    location_quotient: "(units of the category in the UF / units of the UF) / (units of the category in Brazil / units of Brazil). 2 = the UF buys the category twice as much as the country",
+    z_score: "(share in UF - share in Brazil) / standard error of the share in the UF. |z| > 2 = not noise",
+    signal: "over_index | under_index | in line (cfg_extras.regional thresholds and |z| > 2)"
+  }
+}
+
+WITH
+lines AS (
+  SELECT
+    geo_uf,
+    COALESCE(item_category, '(not set)') AS item_category,
+    item_id,
+    COALESCE(quantity, 1) AS units,
+    COALESCE(item_revenue, 0) AS revenue
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.daysAgo(365)}
+    AND geo_uf IS NOT NULL
+),
+
+uf_category AS (
+  SELECT geo_uf, item_category, SUM(units) AS units, SUM(revenue) AS revenue
+  FROM lines
+  GROUP BY 1, 2
+),
+
+uf_totals AS (
+  SELECT geo_uf, SUM(units) AS uf_units FROM lines GROUP BY 1
+),
+
+country_category AS (
+  SELECT item_category, SUM(units) AS country_category_units FROM lines GROUP BY 1
+),
+
+country_total AS (
+  SELECT SUM(units) AS country_units FROM lines
+),
+
+top_item_in_uf AS (
+  SELECT
+    geo_uf,
+    item_category,
+    ARRAY_AGG(STRUCT(item_id, units) ORDER BY units DESC LIMIT 1)[OFFSET(0)] AS top_item
+  FROM (
+    SELECT geo_uf, item_category, item_id, SUM(units) AS units
+    FROM lines
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+
+scored AS (
+  SELECT
+    c.geo_uf,
+    c.item_category,
+    c.units,
+    c.revenue,
+    t.uf_units,
+    SAFE_DIVIDE(c.units, t.uf_units) AS share_in_uf,
+    SAFE_DIVIDE(k.country_category_units, n.country_units) AS share_in_brazil
+  FROM uf_category AS c
+  JOIN uf_totals AS t USING (geo_uf)
+  JOIN country_category AS k USING (item_category)
+  CROSS JOIN country_total AS n
+  WHERE c.units >= ${cfg_extras.regional.min_units}
+)
+
+SELECT
+  s.geo_uf,
+  s.item_category,
+  s.units,
+  s.revenue,
+  s.share_in_uf,
+  s.share_in_brazil,
+  SAFE_DIVIDE(s.share_in_uf, s.share_in_brazil) AS location_quotient,
+  SAFE_DIVIDE(s.share_in_uf - s.share_in_brazil, SQRT(SAFE_DIVIDE(s.share_in_brazil * (1 - s.share_in_brazil), s.uf_units))) AS z_score,
+  RANK() OVER (PARTITION BY s.geo_uf ORDER BY SAFE_DIVIDE(s.share_in_uf, s.share_in_brazil) DESC) AS rank_in_uf_by_lq,
+  ti.top_item.item_id AS top_item_id,
+  di.item_name AS top_item_name,
+  ti.top_item.units AS top_item_units,
+  CASE
+    WHEN SAFE_DIVIDE(s.share_in_uf, s.share_in_brazil) >= ${cfg_extras.regional.over_index}
+      AND ABS(SAFE_DIVIDE(s.share_in_uf - s.share_in_brazil, SQRT(SAFE_DIVIDE(s.share_in_brazil * (1 - s.share_in_brazil), s.uf_units)))) > 2 THEN 'over_index'
+    WHEN SAFE_DIVIDE(s.share_in_uf, s.share_in_brazil) <= ${cfg_extras.regional.under_index}
+      AND ABS(SAFE_DIVIDE(s.share_in_uf - s.share_in_brazil, SQRT(SAFE_DIVIDE(s.share_in_brazil * (1 - s.share_in_brazil), s.uf_units)))) > 2 THEN 'under_index'
+    ELSE 'in line'
+  END AS signal,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM scored AS s
+LEFT JOIN top_item_in_uf AS ti USING (geo_uf, item_category)
+LEFT JOIN ${ref("dim_items")} AS di ON di.item_id = ti.top_item.item_id

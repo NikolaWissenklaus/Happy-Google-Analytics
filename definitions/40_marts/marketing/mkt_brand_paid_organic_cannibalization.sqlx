@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_brand_paid_organic_cannibalization",
+  description: "Are we paying for clicks we would get for free? Per week (last 52): brand Paid Search sessions (campaign / term with cfg_project.brand_terms), the organic brand sessions (Organic Search landing on cfg_extras.brand_organic_landing_types, or the Search Console brand clicks when it is on), the brand cost, and the total brand demand. The slope of total brand sessions on paid brand sessions over the weeks says how much of each paid click is new: slope ~1 = incremental, slope ~0 = the paid click only replaced an organic one. With the incremental cost per session that comes out of it",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "costs", "seo"],
+  columns: {
+    incrementality_slope: "Regression slope of total brand sessions on paid brand sessions across the 52 weeks (same value in every row). 1 = every paid click is extra demand, 0 = every paid click replaced an organic one",
+    paid_share_of_brand: "Paid brand sessions / (paid + organic brand sessions)",
+    incremental_cost_per_session: "Brand cost / (paid brand sessions x incrementality_slope): what an incremental brand visit really costs"
+  }
+}
+
+js {
+  const brandRegex = helpers.regexFromList(cfg_project.brand_terms, false);
+}
+
+WITH
+brand_sessions AS (
+  SELECT
+    ${helpers.weekStart("session_date")} AS week_start,
+    COUNTIF(
+      session_default_channel_group = 'Paid Search'
+      AND REGEXP_CONTAINS(CONCAT(COALESCE(LOWER(session_campaign), ''), ' ', COALESCE(LOWER(session_term), '')), r'(?i)${brandRegex}')
+    ) AS paid_brand_sessions,
+    COUNTIF(session_default_channel_group = 'Organic Search' AND ${helpers.inList("landing_page_type", cfg_extras.brand_organic_landing_types)}) AS organic_brand_sessions_ga4,
+    SUM(IF(
+      session_default_channel_group = 'Paid Search'
+      AND REGEXP_CONTAINS(CONCAT(COALESCE(LOWER(session_campaign), ''), ' ', COALESCE(LOWER(session_term), '')), r'(?i)${brandRegex}'),
+      revenue, 0
+    )) AS paid_brand_revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.weekStart(helpers.daysAgo(364))}
+    AND session_date < ${helpers.weekStart(helpers.today())}
+    ${helpers.martSessionFilter()}
+  GROUP BY 1
+),
+
+brand_cost AS (
+  SELECT ${helpers.weekStart("cost_date")} AS week_start, SUM(cost) AS paid_brand_cost
+  FROM ${ref("fct_ad_costs_daily")}
+  WHERE cost_date >= ${helpers.weekStart(helpers.daysAgo(364))}
+    AND REGEXP_CONTAINS(LOWER(COALESCE(campaign, '')), r'(?i)${brandRegex}')
+  GROUP BY 1
+),
+
+${constants.ENABLE.search_console ? `gsc_brand AS (
+  SELECT ${helpers.weekStart("data_date")} AS week_start, SUM(clicks) AS organic_brand_clicks_gsc
+  FROM ${ref("stg_gsc__site_impressions")}
+  WHERE is_brand_query AND search_type = 'WEB'
+    AND data_date >= ${helpers.weekStart(helpers.daysAgo(364))}
+  GROUP BY 1
+),` : ""}
+
+weekly AS (
+  SELECT
+    b.week_start,
+    b.paid_brand_sessions,
+    b.organic_brand_sessions_ga4,
+    ${constants.ENABLE.search_console ? "g.organic_brand_clicks_gsc" : "CAST(NULL AS INT64) AS organic_brand_clicks_gsc"},
+    ${constants.ENABLE.search_console ? "COALESCE(g.organic_brand_clicks_gsc, b.organic_brand_sessions_ga4)" : "b.organic_brand_sessions_ga4"} AS organic_brand,
+    b.paid_brand_revenue,
+    COALESCE(c.paid_brand_cost, 0) AS paid_brand_cost
+  FROM brand_sessions AS b
+  LEFT JOIN brand_cost AS c USING (week_start)
+  ${constants.ENABLE.search_console ? "LEFT JOIN gsc_brand AS g USING (week_start)" : ""}
+),
+
+with_total AS (
+  SELECT *, paid_brand_sessions + organic_brand AS total_brand
+  FROM weekly
+),
+
+slope AS (
+  SELECT
+    SAFE_DIVIDE(COVAR_SAMP(total_brand, paid_brand_sessions), VAR_SAMP(paid_brand_sessions)) AS incrementality_slope,
+    CORR(paid_brand_sessions, organic_brand) AS corr_paid_vs_organic,
+    COUNT(*) AS weeks
+  FROM with_total
+)
+
+SELECT
+  w.*,
+  SAFE_DIVIDE(w.paid_brand_sessions, w.total_brand) AS paid_share_of_brand,
+  SAFE_DIVIDE(w.paid_brand_cost, w.paid_brand_sessions) AS cost_per_paid_brand_session,
+  s.incrementality_slope,
+  s.corr_paid_vs_organic,
+  s.weeks,
+  SAFE_DIVIDE(w.paid_brand_cost, w.paid_brand_sessions * GREATEST(LEAST(s.incrementality_slope, 1), 0.01)) AS incremental_cost_per_session,
+  SAFE_DIVIDE(w.paid_brand_revenue * GREATEST(LEAST(s.incrementality_slope, 1), 0), w.paid_brand_cost) AS incremental_roas,
+  CASE
+    WHEN s.weeks < 12 THEN 'not enough weeks'
+    WHEN s.incrementality_slope < 0.3 THEN 'mostly cannibal: test pausing brand in a region / some hours'
+    WHEN s.incrementality_slope < 0.7 THEN 'partly incremental: lower the brand bids, keep defense vs competitors'
+    ELSE 'incremental: brand paid brings extra demand'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_total AS w
+CROSS JOIN slope AS s

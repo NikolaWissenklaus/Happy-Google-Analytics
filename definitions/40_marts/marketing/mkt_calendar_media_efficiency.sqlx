@@ -1,0 +1,98 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.marketing,
+  name: "mkt_calendar_media_efficiency",
+  description: "Is media more expensive or more efficient on special days? Calendar (holidays, retail events, salary window, weekend) x paid media (cost of every platform) x GA4 results, last 365 days. Per platform and day type: CPC, CPM, conversion rate, ROAS and CAC against the normal days of the same platform (index = special / normal). 'On Black Friday the CPC goes up 60% but the conversion doubles, ROAS index 1.3: push. On Carnaval CPC is the same and ROAS index 0.6: pull the budget'",
+  bigquery: {
+    labels: { layer: "marts", domain: "marketing" }
+  },
+  tags: ["marts", "marketing", "daily", "costs", "calendar"],
+  columns: {
+    day_type: "retail event / holiday name, 'salary window', 'weekend' or 'normal weekday' (in this priority)",
+    roas_index: "ROAS of the day type / ROAS of the normal weekdays of the same platform. > 1 = the money works better on these days",
+    cpc_index: "CPC of the day type / CPC of the normal weekdays. > 1 = the auction is more expensive"
+  }
+}
+
+WITH
+daily_media AS (
+  SELECT
+    metric_date,
+    platform,
+    SUM(cost) AS cost,
+    SUM(ad_clicks) AS ad_clicks,
+    SUM(ad_impressions) AS ad_impressions,
+    SUM(sessions) AS sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    SUM(new_customers) AS new_customers
+  FROM ${ref("mkt_paid_media_performance")}
+  WHERE metric_date >= ${helpers.daysAgo(365)}
+    AND metric_date < ${helpers.today()}
+  GROUP BY 1, 2
+  HAVING SUM(cost) >= ${cfg_extras.calendar_media_min_daily_cost}
+),
+
+with_day_type AS (
+  SELECT
+    m.*,
+    CASE
+      WHEN c.retail_event IS NOT NULL THEN c.retail_event
+      WHEN c.is_holiday THEN COALESCE(c.holiday_name, 'holiday')
+      WHEN c.is_salary_window THEN 'salary window'
+      WHEN c.is_weekend THEN 'weekend'
+      ELSE 'normal weekday'
+    END AS day_type
+  FROM daily_media AS m
+  JOIN ${ref("dim_calendar")} AS c ON c.date_day = m.metric_date
+),
+
+by_day_type AS (
+  SELECT
+    platform,
+    day_type,
+    COUNT(*) AS days,
+    SUM(cost) AS cost,
+    SUM(ad_clicks) AS ad_clicks,
+    SUM(ad_impressions) AS ad_impressions,
+    SUM(sessions) AS sessions,
+    SUM(transactions) AS transactions,
+    SUM(revenue) AS revenue,
+    SUM(new_customers) AS new_customers,
+    SAFE_DIVIDE(SUM(cost), SUM(ad_clicks)) AS cpc,
+    SAFE_DIVIDE(SUM(cost) * 1000, SUM(ad_impressions)) AS cpm,
+    SAFE_DIVIDE(SUM(transactions), SUM(sessions)) AS conversion_rate,
+    SAFE_DIVIDE(SUM(revenue), SUM(cost)) AS roas,
+    SAFE_DIVIDE(SUM(cost), SUM(new_customers)) AS cac,
+    SAFE_DIVIDE(SUM(cost), COUNT(*)) AS cost_per_day
+  FROM with_day_type
+  GROUP BY 1, 2
+),
+
+normal_baseline AS (
+  SELECT platform, cpc, cpm, conversion_rate, roas, cac, cost_per_day
+  FROM by_day_type
+  WHERE day_type = 'normal weekday'
+)
+
+SELECT
+  d.*,
+  SAFE_DIVIDE(d.cpc, b.cpc) AS cpc_index,
+  SAFE_DIVIDE(d.cpm, b.cpm) AS cpm_index,
+  SAFE_DIVIDE(d.conversion_rate, b.conversion_rate) AS conversion_rate_index,
+  SAFE_DIVIDE(d.roas, b.roas) AS roas_index,
+  SAFE_DIVIDE(d.cac, b.cac) AS cac_index,
+  SAFE_DIVIDE(d.cost_per_day, b.cost_per_day) AS spend_intensity_index,
+  CASE
+    WHEN d.day_type = 'normal weekday' THEN 'baseline'
+    WHEN d.days < 2 THEN 'too few days'
+    WHEN SAFE_DIVIDE(d.roas, b.roas) >= 1.15 AND SAFE_DIVIDE(d.cost_per_day, b.cost_per_day) < 1.5 THEN 'under invested: spend more on these days'
+    WHEN SAFE_DIVIDE(d.roas, b.roas) <= 0.8 THEN 'money works worse: pull back or change the message'
+    ELSE 'in line with normal days'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM by_day_type AS d
+LEFT JOIN normal_baseline AS b USING (platform)

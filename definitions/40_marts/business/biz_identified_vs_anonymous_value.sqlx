@@ -1,0 +1,54 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_identified_vs_anonymous_value",
+  description: "How much a logged in visitor is worth vs an anonymous one, per month, device and channel (last 13 months): share of sessions identified (user_id), conversion, revenue per session, AOV, engagement and the share of the revenue that comes from identified sessions. The business case for login, app, loyalty program and first party data: 'identified sessions are 18% of the traffic and 61% of the revenue, each extra point of login is worth R$ 40k a month'",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "identity"],
+  columns: {
+    value_gap: "Revenue per identified session / revenue per anonymous session",
+    revenue_per_extra_identified_point: "Extra revenue of the month if 1% more of the sessions were identified and behaved like the identified ones (upper bound, identified users are also the more loyal ones)"
+  }
+}
+
+WITH monthly AS (
+  SELECT
+    DATE_TRUNC(session_date, MONTH) AS month_start,
+    COALESCE(device_category, '(not set)') AS device_category,
+    session_default_channel_group,
+    COUNT(*) AS sessions,
+    COUNTIF(is_identified_user) AS identified_sessions,
+    COUNTIF(NOT COALESCE(is_identified_user, FALSE)) AS anonymous_sessions,
+    COUNTIF(is_identified_user AND is_engaged) AS identified_engaged_sessions,
+    COUNTIF(NOT COALESCE(is_identified_user, FALSE) AND is_engaged) AS anonymous_engaged_sessions,
+    SUM(IF(is_identified_user, transactions, 0)) AS identified_transactions,
+    SUM(IF(NOT COALESCE(is_identified_user, FALSE), transactions, 0)) AS anonymous_transactions,
+    SUM(IF(is_identified_user, revenue, 0)) AS identified_revenue,
+    SUM(IF(NOT COALESCE(is_identified_user, FALSE), revenue, 0)) AS anonymous_revenue
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= DATE_TRUNC(DATE_SUB(${helpers.today()}, INTERVAL 12 MONTH), MONTH)
+    ${helpers.martSessionFilter()}
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(identified_sessions, sessions) AS identified_session_share,
+  SAFE_DIVIDE(identified_revenue, identified_revenue + anonymous_revenue) AS identified_revenue_share,
+  SAFE_DIVIDE(identified_engaged_sessions, identified_sessions) AS identified_engagement_rate,
+  SAFE_DIVIDE(anonymous_engaged_sessions, anonymous_sessions) AS anonymous_engagement_rate,
+  SAFE_DIVIDE(identified_transactions, identified_sessions) AS identified_conversion_rate,
+  SAFE_DIVIDE(anonymous_transactions, anonymous_sessions) AS anonymous_conversion_rate,
+  SAFE_DIVIDE(identified_revenue, identified_transactions) AS identified_aov,
+  SAFE_DIVIDE(anonymous_revenue, anonymous_transactions) AS anonymous_aov,
+  SAFE_DIVIDE(identified_revenue, identified_sessions) AS identified_revenue_per_session,
+  SAFE_DIVIDE(anonymous_revenue, anonymous_sessions) AS anonymous_revenue_per_session,
+  SAFE_DIVIDE(SAFE_DIVIDE(identified_revenue, identified_sessions), SAFE_DIVIDE(anonymous_revenue, anonymous_sessions)) AS value_gap,
+  sessions * 0.01 * (COALESCE(SAFE_DIVIDE(identified_revenue, identified_sessions), 0) - COALESCE(SAFE_DIVIDE(anonymous_revenue, anonymous_sessions), 0)) AS revenue_per_extra_identified_point,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM monthly

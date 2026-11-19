@@ -1,0 +1,158 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.product,
+  name: "prod_news_paywall_funnel",
+  disabled: !cfg_extras.news_paywall.enabled,
+  description: "News sites, magazines, any meter / paywall: per week, section and channel (last 26 weeks): readers, article views, readers that hit the paywall, paywall views, subscriptions in the same session of the paywall and in the 7 days after, newsletter sign ups, and the median articles read before the first paywall. 'Politics hits the paywall more, but Economy converts the paywall 3x better: the meter should be tighter in Economy'",
+  bigquery: {
+    labels: { layer: "marts", domain: "product" }
+  },
+  tags: ["marts", "product", "daily", "vertical", "news"],
+  columns: {
+    section: "Section of the article: content_group or the first level of the path (cfg_extras.news_paywall.section_from)",
+    paywall_to_subscribe_7d: "Readers that saw the paywall and subscribed in the 7 days after / readers that saw the paywall"
+  }
+}
+
+js {
+  const n = cfg_extras.news_paywall;
+  const section = n.section_from === "content_group"
+    ? "COALESCE(NULLIF(pv.content_group, '(not set)'), REGEXP_EXTRACT(pv.page_path, r'^/([^/]+)'), '(home)')"
+    : "COALESCE(REGEXP_EXTRACT(pv.page_path, r'^/([^/]+)'), '(home)')";
+}
+
+WITH
+article_views AS (
+  SELECT
+    ${helpers.weekStart("pv.event_date")} AS week_start,
+    pv.user_key,
+    pv.session_key,
+    pv.event_ts,
+    ${section} AS section,
+    COALESCE(pv.session_default_channel_group, 'Unassigned') AS session_default_channel_group
+  FROM ${ref("fct_page_views")} AS pv
+  WHERE pv.event_date >= ${helpers.weekStart(helpers.daysAgo(182))}
+    AND ${helpers.inList("pv.page_type", n.article_page_types)}
+    ${constants.EXCLUDE_BOTS_IN_MARTS ? "AND NOT COALESCE(pv.is_bot_suspect, FALSE)" : ""}
+),
+
+other_events AS (
+  SELECT
+    event_ts,
+    user_key,
+    session_key,
+    CASE
+      WHEN event_name = ${helpers.sqlString(n.paywall_event)} THEN 'paywall'
+      WHEN ${helpers.inList("event_name", n.subscribe_events)} THEN 'subscribe'
+      WHEN event_name = ${helpers.sqlString(n.newsletter_event)} THEN 'newsletter'
+    END AS kind
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.weekStart(helpers.daysAgo(182))}
+    AND ${helpers.inList("event_name", [n.paywall_event, n.newsletter_event].concat(n.subscribe_events))}
+    ${helpers.noiseFilter()}
+),
+
+-- the paywall belongs to the section of the last article read before it in the session
+paywall_hits AS (
+  SELECT
+    o.user_key,
+    o.session_key,
+    o.event_ts AS paywall_ts,
+    ARRAY_AGG(STRUCT(a.week_start, a.section, a.session_default_channel_group) ORDER BY a.event_ts DESC LIMIT 1)[OFFSET(0)] AS ctx
+  FROM other_events AS o
+  JOIN article_views AS a
+    ON a.session_key = o.session_key
+    AND a.event_ts <= o.event_ts
+  WHERE o.kind = 'paywall'
+  GROUP BY 1, 2, 3
+),
+
+paywall_outcome AS (
+  SELECT
+    p.ctx.week_start AS week_start,
+    p.ctx.section AS section,
+    p.ctx.session_default_channel_group AS session_default_channel_group,
+    p.user_key,
+    p.paywall_ts,
+    LOGICAL_OR(s.session_key = p.session_key) AS subscribed_same_session,
+    LOGICAL_OR(s.event_ts IS NOT NULL) AS subscribed_7d
+  FROM paywall_hits AS p
+  LEFT JOIN other_events AS s
+    ON s.user_key = p.user_key
+    AND s.kind = 'subscribe'
+    AND s.event_ts >= p.paywall_ts
+    AND s.event_ts <= TIMESTAMP_ADD(p.paywall_ts, INTERVAL 7 DAY)
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+articles_before_first_paywall AS (
+  SELECT
+    f.week_start,
+    f.section,
+    f.session_default_channel_group,
+    f.user_key,
+    COUNT(a.event_ts) AS articles_before
+  FROM (
+    SELECT week_start, section, session_default_channel_group, user_key, MIN(paywall_ts) AS first_paywall_ts
+    FROM paywall_outcome
+    GROUP BY 1, 2, 3, 4
+  ) AS f
+  LEFT JOIN article_views AS a
+    ON a.user_key = f.user_key
+    AND a.event_ts < f.first_paywall_ts
+  GROUP BY 1, 2, 3, 4
+),
+
+reading AS (
+  SELECT
+    a.week_start,
+    a.section,
+    a.session_default_channel_group,
+    COUNT(DISTINCT a.user_key) AS readers,
+    COUNT(*) AS article_views,
+    COUNT(DISTINCT a.session_key) AS reading_sessions,
+    COUNT(DISTINCT IF(o.kind = 'newsletter', a.user_key, NULL)) AS newsletter_signups
+  FROM article_views AS a
+  LEFT JOIN (SELECT DISTINCT session_key, kind FROM other_events WHERE kind = 'newsletter') AS o USING (session_key)
+  GROUP BY 1, 2, 3
+),
+
+paywall_stats AS (
+  SELECT
+    week_start,
+    section,
+    session_default_channel_group,
+    COUNT(*) AS paywall_views,
+    COUNT(DISTINCT user_key) AS readers_hit_paywall,
+    COUNT(DISTINCT IF(subscribed_same_session, user_key, NULL)) AS subscribed_same_session,
+    COUNT(DISTINCT IF(subscribed_7d, user_key, NULL)) AS subscribed_7d
+  FROM paywall_outcome
+  GROUP BY 1, 2, 3
+),
+
+meter AS (
+  SELECT week_start, section, session_default_channel_group,
+    APPROX_QUANTILES(articles_before, 100)[OFFSET(50)] AS median_articles_before_paywall
+  FROM articles_before_first_paywall
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  r.*,
+  COALESCE(p.paywall_views, 0) AS paywall_views,
+  COALESCE(p.readers_hit_paywall, 0) AS readers_hit_paywall,
+  COALESCE(p.subscribed_same_session, 0) AS subscribed_same_session,
+  COALESCE(p.subscribed_7d, 0) AS subscribed_7d,
+  m.median_articles_before_paywall,
+  SAFE_DIVIDE(r.article_views, r.readers) AS articles_per_reader,
+  SAFE_DIVIDE(p.readers_hit_paywall, r.readers) AS paywall_hit_rate,
+  SAFE_DIVIDE(p.subscribed_same_session, p.readers_hit_paywall) AS paywall_to_subscribe_same_session,
+  SAFE_DIVIDE(p.subscribed_7d, p.readers_hit_paywall) AS paywall_to_subscribe_7d,
+  SAFE_DIVIDE(r.newsletter_signups, r.readers) AS newsletter_signup_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM reading AS r
+LEFT JOIN paywall_stats AS p USING (week_start, section, session_default_channel_group)
+LEFT JOIN meter AS m USING (week_start, section, session_default_channel_group)

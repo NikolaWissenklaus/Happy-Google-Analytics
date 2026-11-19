@@ -1,0 +1,156 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.business,
+  name: "biz_upcoming_events_playbook",
+  description: "The planning sheet of the next special days. For every retail event / holiday of the next cfg_extras.playbook.days_ahead days (dim_calendar): what the same event did LAST time (event day, the warm up days before and the hangover week after, as an index vs a normal day), the channels, categories and products that sold in it, and a revenue estimate for this year (the normal day of today x last year's index). 'Dia das Maes is in 40 days: last year the 14 days before sold 2.1x a normal day, Email and Paid Social carried it, perfumes and bags. Start the campaign on the 26th'",
+  bigquery: {
+    labels: { layer: "marts", domain: "business" }
+  },
+  tags: ["marts", "business", "daily", "calendar"],
+  columns: {
+    event_day_index: "Revenue of the event day last time / normal daily revenue of the 28 days before its warm up",
+    warm_up_index: "Average daily revenue of the warm up days / normal daily revenue",
+    hangover_index: "Average daily revenue of the 7 days after / normal daily revenue. < 1 = the event pulled sales forward",
+    estimated_event_day_revenue: "Average daily revenue of the last 28 days x event_day_index",
+    prep_start_date: "event_date - warm up days: when the campaign should be live"
+  }
+}
+
+js {
+  const warm = cfg_extras.playbook.warm_up_days;
+  const eventName = "COALESCE(retail_event, holiday_name)";
+}
+
+WITH
+upcoming AS (
+  SELECT ${eventName} AS event_name, MIN(date_day) AS event_date
+  FROM ${ref("dim_calendar")}
+  WHERE date_day BETWEEN DATE_ADD(${helpers.today()}, INTERVAL 1 DAY) AND DATE_ADD(${helpers.today()}, INTERVAL ${cfg_extras.playbook.days_ahead} DAY)
+    AND ${eventName} IS NOT NULL
+  GROUP BY 1
+),
+
+last_occurrence AS (
+  SELECT ${eventName} AS event_name, MAX(date_day) AS last_event_date
+  FROM ${ref("dim_calendar")}
+  WHERE date_day BETWEEN ${helpers.daysAgo(400)} AND ${helpers.daysAgo(1)}
+    AND ${eventName} IS NOT NULL
+  GROUP BY 1
+),
+
+pairs AS (
+  SELECT u.event_name, u.event_date, l.last_event_date
+  FROM upcoming AS u
+  LEFT JOIN last_occurrence AS l USING (event_name)
+),
+
+orders AS (
+  SELECT transaction_id, transaction_date, revenue, is_first_purchase, session_default_channel_group
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.daysAgo(400 + warm + 28)}
+),
+
+daily_revenue AS (
+  SELECT transaction_date, SUM(revenue) AS revenue, COUNT(*) AS orders, COUNTIF(is_first_purchase) AS new_customers
+  FROM orders
+  GROUP BY 1
+),
+
+last_time_numbers AS (
+  SELECT
+    p.event_name,
+    SUM(IF(d.transaction_date = p.last_event_date, d.revenue, 0)) AS event_day_revenue,
+    SUM(IF(d.transaction_date = p.last_event_date, d.orders, 0)) AS event_day_orders,
+    SUM(IF(d.transaction_date BETWEEN DATE_SUB(p.last_event_date, INTERVAL ${warm} DAY) AND DATE_SUB(p.last_event_date, INTERVAL 1 DAY), d.revenue, 0)) / ${warm} AS warm_up_daily_revenue,
+    SUM(IF(d.transaction_date BETWEEN DATE_ADD(p.last_event_date, INTERVAL 1 DAY) AND DATE_ADD(p.last_event_date, INTERVAL 7 DAY), d.revenue, 0)) / 7 AS hangover_daily_revenue,
+    SUM(IF(d.transaction_date BETWEEN DATE_SUB(p.last_event_date, INTERVAL ${warm + 28} DAY) AND DATE_SUB(p.last_event_date, INTERVAL ${warm + 1} DAY), d.revenue, 0)) / 28 AS normal_daily_revenue,
+    SUM(IF(d.transaction_date BETWEEN DATE_SUB(p.last_event_date, INTERVAL ${warm} DAY) AND p.last_event_date, d.new_customers, 0)) AS new_customers_in_event
+  FROM pairs AS p
+  JOIN daily_revenue AS d
+    ON d.transaction_date BETWEEN DATE_SUB(p.last_event_date, INTERVAL ${warm + 28} DAY) AND DATE_ADD(p.last_event_date, INTERVAL 7 DAY)
+  GROUP BY 1
+),
+
+event_window_orders AS (
+  SELECT p.event_name, o.transaction_id, o.revenue, o.session_default_channel_group
+  FROM pairs AS p
+  JOIN orders AS o
+    ON o.transaction_date BETWEEN DATE_SUB(p.last_event_date, INTERVAL ${warm} DAY) AND p.last_event_date
+),
+
+top_channels AS (
+  SELECT event_name, ARRAY_AGG(STRUCT(channel, revenue, share) ORDER BY revenue DESC LIMIT 5) AS top_channels
+  FROM (
+    SELECT
+      event_name,
+      COALESCE(session_default_channel_group, 'Unassigned') AS channel,
+      SUM(revenue) AS revenue,
+      SAFE_DIVIDE(SUM(revenue), SUM(SUM(revenue)) OVER (PARTITION BY event_name)) AS share
+    FROM event_window_orders
+    GROUP BY 1, 2
+  )
+  GROUP BY 1
+),
+
+event_window_items AS (
+  SELECT w.event_name, i.item_id, i.item_name, COALESCE(i.item_category, '(not set)') AS item_category, COALESCE(i.item_revenue, 0) AS item_revenue
+  FROM event_window_orders AS w
+  JOIN ${ref("fct_transaction_items")} AS i USING (transaction_id)
+  WHERE i.transaction_date >= ${helpers.daysAgo(400 + warm)}
+),
+
+top_categories AS (
+  SELECT event_name, ARRAY_AGG(STRUCT(item_category, revenue) ORDER BY revenue DESC LIMIT 5) AS top_categories
+  FROM (SELECT event_name, item_category, SUM(item_revenue) AS revenue FROM event_window_items GROUP BY 1, 2)
+  GROUP BY 1
+),
+
+top_items AS (
+  SELECT event_name, ARRAY_AGG(STRUCT(item_id, item_name, revenue) ORDER BY revenue DESC LIMIT 10) AS top_items
+  FROM (SELECT event_name, item_id, ANY_VALUE(item_name) AS item_name, SUM(item_revenue) AS revenue FROM event_window_items GROUP BY 1, 2)
+  GROUP BY 1
+),
+
+current_normal AS (
+  SELECT SUM(revenue) / 28 AS current_daily_revenue
+  FROM daily_revenue
+  WHERE transaction_date BETWEEN ${helpers.daysAgo(28)} AND ${helpers.daysAgo(1)}
+)
+
+SELECT
+  p.event_name,
+  p.event_date,
+  DATE_DIFF(p.event_date, ${helpers.today()}, DAY) AS days_until_event,
+  DATE_SUB(p.event_date, INTERVAL ${warm} DAY) AS prep_start_date,
+  p.last_event_date,
+  n.event_day_revenue,
+  n.event_day_orders,
+  n.normal_daily_revenue,
+  SAFE_DIVIDE(n.event_day_revenue, n.normal_daily_revenue) AS event_day_index,
+  SAFE_DIVIDE(n.warm_up_daily_revenue, n.normal_daily_revenue) AS warm_up_index,
+  SAFE_DIVIDE(n.hangover_daily_revenue, n.normal_daily_revenue) AS hangover_index,
+  n.new_customers_in_event,
+  c.current_daily_revenue,
+  c.current_daily_revenue * SAFE_DIVIDE(n.event_day_revenue, n.normal_daily_revenue) AS estimated_event_day_revenue,
+  c.current_daily_revenue * ${warm} * SAFE_DIVIDE(n.warm_up_daily_revenue, n.normal_daily_revenue) AS estimated_warm_up_revenue,
+  tc.top_channels,
+  tg.top_categories,
+  ti.top_items,
+  CASE
+    WHEN p.last_event_date IS NULL THEN 'no history: first time, plan from a similar event'
+    WHEN SAFE_DIVIDE(n.warm_up_daily_revenue, n.normal_daily_revenue) >= 1.3 THEN 'big event: campaign live on prep_start_date, stock the top items'
+    WHEN SAFE_DIVIDE(n.event_day_revenue, n.normal_daily_revenue) >= 1.3 THEN 'one day event: concentrate media on the day'
+    WHEN SAFE_DIVIDE(n.event_day_revenue, n.normal_daily_revenue) < 0.8 THEN 'dead day: do not waste media, schedule maintenance / deploys'
+    ELSE 'normal day: business as usual'
+  END AS playbook,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM pairs AS p
+LEFT JOIN last_time_numbers AS n USING (event_name)
+LEFT JOIN top_channels AS tc USING (event_name)
+LEFT JOIN top_categories AS tg USING (event_name)
+LEFT JOIN top_items AS ti USING (event_name)
+CROSS JOIN current_normal AS c

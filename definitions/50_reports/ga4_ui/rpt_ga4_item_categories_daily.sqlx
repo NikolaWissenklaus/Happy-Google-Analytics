@@ -1,0 +1,57 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_item_categories_daily",
+  description: "GA4 Reports > Monetization > Ecommerce purchases with the item dimensions instead of the item name: item category (1 and 2), item brand and item list name. Items viewed, added to cart, checked out, purchased, item revenue, refunds, list and promotion views / clicks, with the GA4 rates. The merchandising view by department",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["item_category", "item_brand"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "ecommerce"]
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__event_items"] })}
+}
+
+WITH aggregated AS (
+  SELECT
+    event_date,
+    COALESCE(item_category, '(not set)') AS item_category,
+    COALESCE(item_category2, '(not set)') AS item_category2,
+    COALESCE(item_brand, '(not set)') AS item_brand,
+    COALESCE(item_list_name, '(not set)') AS item_list_name,
+    COUNTIF(event_name = 'view_item') AS items_viewed,
+    SUM(IF(event_name = 'add_to_cart', COALESCE(quantity, 1), 0)) AS items_added_to_cart,
+    SUM(IF(event_name = 'begin_checkout', COALESCE(quantity, 1), 0)) AS items_checked_out,
+    SUM(IF(event_name = 'purchase', COALESCE(quantity, 1), 0)) AS items_purchased,
+    SUM(IF(event_name = 'purchase', COALESCE(item_revenue_fixed, 0), 0)) AS item_revenue,
+    SUM(IF(event_name = 'refund', COALESCE(item_refund, item_value, 0), 0)) AS item_refund_amount,
+    COUNTIF(event_name = 'view_item_list') AS items_viewed_in_list,
+    COUNTIF(event_name = 'select_item') AS items_clicked_in_list,
+    COUNTIF(event_name = 'view_promotion') AS items_viewed_in_promotion,
+    COUNTIF(event_name = 'select_promotion') AS items_clicked_in_promotion,
+    COUNT(DISTINCT IF(event_name = 'purchase', transaction_id, NULL)) AS ecommerce_purchases
+  FROM ${ref("stg_ga4__event_items")}
+  WHERE event_date >= run_from
+    ${helpers.noiseFilter()}
+  GROUP BY 1, 2, 3, 4, 5
+)
+
+SELECT
+  *,
+  SAFE_DIVIDE(items_added_to_cart, items_viewed) AS cart_to_view_rate,
+  SAFE_DIVIDE(items_purchased, items_viewed) AS purchase_to_view_rate,
+  SAFE_DIVIDE(items_clicked_in_list, items_viewed_in_list) AS item_list_click_through_rate,
+  SAFE_DIVIDE(items_clicked_in_promotion, items_viewed_in_promotion) AS item_promotion_click_through_rate,
+  SAFE_DIVIDE(item_refund_amount, item_revenue) AS item_refund_rate,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM aggregated
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

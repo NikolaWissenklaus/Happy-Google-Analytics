@@ -1,0 +1,82 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "incremental",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_enhanced_measurement_daily",
+  description: "GA4 Reports > Engagement > Events, opened by the enhanced measurement parameters the UI only shows after you register custom dimensions: scrolls per page, outbound clicks per link domain, file downloads per file and extension, video starts / progress / completes per title, form starts / submits per form and site searches per term. One long table, report says which one. Keeps cfg_extras.enhanced_measurement_days days",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["report", "event_name"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "engagement"],
+  columns: {
+    report: "scroll | outbound_click | file_download | video | form | site_search",
+    object_name: "page path (scroll), link domain (outbound), file name (download), video title, form id / name, search term",
+    detail: "extra dimension of the report: percent scrolled, file extension, video percent, form destination",
+    users_hll: "HLL sketch of the users, HLL_COUNT.MERGE to count a period"
+  }
+}
+
+pre_operations {
+  ${helpers.incrementalPreOps({ self: self(), incremental: incremental(), model: name(), dateColumn: "event_date", watermarks: ref("ops_incremental_watermarks"), upstream: ["stg_ga4__events"] })}
+}
+
+WITH
+classified AS (
+  SELECT
+    event_date,
+    event_name,
+    user_pseudo_id,
+    session_key,
+    CASE
+      WHEN event_name = 'scroll' THEN 'scroll'
+      WHEN event_name = 'click' AND is_outbound THEN 'outbound_click'
+      WHEN event_name = 'file_download' THEN 'file_download'
+      WHEN event_name IN ('video_start', 'video_progress', 'video_complete') THEN 'video'
+      WHEN event_name IN ('form_start', 'form_submit') THEN 'form'
+      WHEN event_name = 'view_search_results' THEN 'site_search'
+    END AS report,
+    CASE
+      WHEN event_name = 'scroll' THEN page_path
+      WHEN event_name = 'click' THEN link_domain
+      WHEN event_name = 'file_download' THEN file_name
+      WHEN event_name LIKE 'video_%' THEN video_title
+      WHEN event_name LIKE 'form_%' THEN COALESCE(form_id, form_name)
+      WHEN event_name = 'view_search_results' THEN LOWER(TRIM(search_term))
+    END AS object_name,
+    CASE
+      WHEN event_name = 'scroll' THEN CAST(percent_scrolled AS STRING)
+      WHEN event_name = 'file_download' THEN LOWER(file_extension)
+      WHEN event_name LIKE 'video_%' THEN CAST(video_percent AS STRING)
+      WHEN event_name LIKE 'form_%' THEN form_destination
+    END AS detail
+  FROM ${ref("stg_ga4__events")}
+  -- the floor is in the WHERE and not in run_from: the DELETE of the pre operation must still
+  -- see the real run_from, otherwise a backfill would leave a hole
+  WHERE event_date >= GREATEST(run_from, DATE_SUB(${helpers.today()}, INTERVAL ${cfg_extras.enhanced_measurement_days} DAY))
+    AND event_name IN ('scroll', 'click', 'file_download', 'video_start', 'video_progress', 'video_complete', 'form_start', 'form_submit', 'view_search_results')
+    ${helpers.noiseFilter()}
+)
+
+SELECT
+  event_date,
+  report,
+  event_name,
+  COALESCE(object_name, '(not set)') AS object_name,
+  detail,
+  COUNT(*) AS event_count,
+  COUNT(DISTINCT user_pseudo_id) AS total_users,
+  HLL_COUNT.INIT(user_pseudo_id) AS users_hll,
+  COUNT(DISTINCT session_key) AS sessions,
+  SAFE_DIVIDE(COUNT(*), COUNT(DISTINCT user_pseudo_id)) AS event_count_per_user,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM classified
+WHERE report IS NOT NULL
+GROUP BY 1, 2, 3, 4, 5
+
+post_operations {
+  ${helpers.incrementalPostOps({ incremental: incremental(), model: name(), watermarks: ref("ops_incremental_watermarks") })}
+}

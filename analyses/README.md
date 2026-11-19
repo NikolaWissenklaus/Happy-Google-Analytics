@@ -56,3 +56,26 @@ Run after `dataform run --tags insights` (or the daily / weekly runs). 67 needs 
 | `68_export_limits_and_storage.sql` | the 1M events a day limit of the export, the events and params that eat the bytes | mid |
 | `69_monday_insights_feed.sql` | the feed of the week in the order to read, one list per team, a text ready for Slack | junior |
 | `70_analyst_training_exercises.sql` | 12 exercises with solutions, junior to specialist (windows, cohorts, funnels, z test, Wilson, PELT) | all |
+
+## extras pack: more sectors and cross data (71 to 84)
+
+New sectors, questions that cross GA4 with costs, calendar, catalog and identity, and the queries
+over the extras models (`docs/extras.md`, rules in `includes/cfg_extras.js`). Every sector file
+works on the core tables alone; set the event names in the `DECLARE`s at the top and run it as a script.
+
+| file | when | who asks |
+|---|---|---|
+| `71_sector_banking_fintech.sql` | banks, fintechs, insurance, telecom: where the application dies, sessions to decide, the amount that scares, cost per APPROVED | product, media, risk |
+| `72_sector_streaming_video.sql` | streaming, VOD, podcasts: drop off per title, binge hours, titles that sell the plan, fading viewers | content, CRM |
+| `73_sector_news_paywall_newsletters.sql` | news, paywalls: the meter curve, paywall per section, what subscribers read, newsletter as a bridge | newsroom, revenue |
+| `74_sector_travel_tickets_events.sql` | travel, tickets, events: booking window, demand not met, search lead time, sell out velocity | revenue management, media |
+| `75_sector_education_courses.sql` | schools, courses: course -> lead -> enrollment, the season vs last year, content that helps, when to call | admissions, media |
+| `76_sector_marketplace_sellers.sql` | marketplaces: seller scorecard, concentration (Herfindahl), buy box, sellers that bring new customers | marketplace ops, finance |
+| `77_sector_classifieds_auto_real_estate.sql` | classifieds, cars, real estate: listings with no contact, demand x supply by price, serious buyers per channel, hot segments | sales, product |
+| `78_sector_donations_nonprofits.sql` | NGOs, crowdfunding: one time vs recurring, the anchor of the suggested amounts, campaigns that bring donors back | fundraising |
+| `79_browse_here_buy_there.sql` | any: research device x purchase device, weekend research weekday purchase, app x web value | media, board |
+| `80_first_session_predicts_value.sql` | any: what in the first visit predicts the 90 day value (lift table and a points score) | CRM, media, data science |
+| `81_journey_archetypes.sql` | any: the 15 journeys of the first 3 sessions, openers vs closers, what the buyers of the same journey did | marketing, attribution |
+| `82_cross_data_new_marts_tour.sql` | one question per cross data mart: calendar x media, launches, wishlist, regional, events playbook, first category LTV, brand cannibalization, login value | everybody |
+| `83_executive_one_pager.sql` | the board page: month to date vs last month and last year, and the 5 channels that moved the money split in traffic / conversion / ticket | board, CEO |
+| `84_ga4_ui_extra_reports_cookbook.sql` | how to read the new GA4 replicas (monetization cards, all channels ROAS, acquisition cohort grid, leads, enhanced measurement, device models) | analysts |

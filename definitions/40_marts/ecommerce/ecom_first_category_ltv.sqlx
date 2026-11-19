@@ -1,0 +1,113 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_first_category_ltv",
+  description: "Which department makes the best customers? Customers grouped by the main category of their FIRST order (the line with more revenue), last 2 years: first order value, repeat rate and revenue per customer at each horizon of cfg_extras.first_category.horizons (only customers old enough for the horizon), and how much of the later revenue came from OTHER categories (the category is a door to the store or a dead end). Use it to choose what to advertise for acquisition, not only what sells more today",
+  bigquery: {
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily", "cohorts"],
+  columns: {
+    first_category: "Category with the highest revenue in the first order of the customer",
+    cross_category_share: "Revenue after the first order in categories other than the first one / all revenue after the first order. High = the category opens the store",
+    ltv_index: "Revenue per customer at the longest horizon / the same number for all customers"
+  }
+}
+
+js {
+  const horizons = cfg_extras.first_category.horizons;
+  const maxH = Math.max(...horizons);
+}
+
+WITH
+first_orders AS (
+  SELECT transaction_id, user_key, transaction_date, revenue
+  FROM ${ref("fct_transactions")}
+  WHERE is_valid_for_revenue
+    AND is_first_purchase
+    AND transaction_date >= ${helpers.daysAgo(730)}
+    AND user_key IS NOT NULL
+),
+
+first_category AS (
+  SELECT
+    i.transaction_id,
+    ARRAY_AGG(COALESCE(i.item_category, '(not set)') ORDER BY i.item_revenue DESC LIMIT 1)[OFFSET(0)] AS first_category
+  FROM ${ref("fct_transaction_items")} AS i
+  JOIN first_orders AS f USING (transaction_id)
+  WHERE i.transaction_date >= ${helpers.daysAgo(730)}
+  GROUP BY 1
+),
+
+customers AS (
+  SELECT f.user_key, f.transaction_id, f.transaction_date AS first_date, f.revenue AS first_order_value, c.first_category
+  FROM first_orders AS f
+  JOIN first_category AS c USING (transaction_id)
+),
+
+later_lines AS (
+  SELECT
+    c.user_key,
+    DATE_DIFF(i.transaction_date, c.first_date, DAY) AS days_after,
+    COALESCE(i.item_category, '(not set)') = c.first_category AS same_category,
+    COALESCE(i.item_revenue, 0) AS item_revenue,
+    i.transaction_id
+  FROM customers AS c
+  JOIN ${ref("fct_transaction_items")} AS i
+    ON i.user_key = c.user_key
+    AND i.transaction_id != c.transaction_id
+    AND i.transaction_date BETWEEN c.first_date AND DATE_ADD(c.first_date, INTERVAL ${maxH} DAY)
+  WHERE i.is_valid_for_revenue
+    AND i.transaction_date >= ${helpers.daysAgo(730)}
+),
+
+per_customer AS (
+  SELECT
+    c.user_key,
+    c.first_category,
+    c.first_date,
+    c.first_order_value,
+    ${horizons.map(h => `SUM(IF(l.days_after <= ${h}, l.item_revenue, 0)) AS later_revenue_${h}d,
+    COUNT(DISTINCT IF(l.days_after <= ${h}, l.transaction_id, NULL)) > 0 AS repeated_${h}d`).join(",\n    ")},
+    SUM(IF(NOT l.same_category, l.item_revenue, 0)) AS later_revenue_other_categories,
+    SUM(COALESCE(l.item_revenue, 0)) AS later_revenue_all
+  FROM customers AS c
+  LEFT JOIN later_lines AS l USING (user_key)
+  GROUP BY 1, 2, 3, 4
+),
+
+per_category AS (
+  SELECT
+    first_category,
+    COUNT(*) AS customers,
+    AVG(first_order_value) AS avg_first_order_value,
+    ${horizons.map(h => `COUNTIF(first_date <= ${helpers.daysAgo(h)}) AS customers_mature_${h}d,
+    SAFE_DIVIDE(COUNTIF(first_date <= ${helpers.daysAgo(h)} AND repeated_${h}d), COUNTIF(first_date <= ${helpers.daysAgo(h)})) AS repeat_rate_${h}d,
+    AVG(IF(first_date <= ${helpers.daysAgo(h)}, first_order_value + later_revenue_${h}d, NULL)) AS revenue_per_customer_${h}d`).join(",\n    ")},
+    SAFE_DIVIDE(SUM(later_revenue_other_categories), SUM(later_revenue_all)) AS cross_category_share
+  FROM per_customer
+  GROUP BY 1
+),
+
+overall AS (
+  SELECT AVG(IF(first_date <= ${helpers.daysAgo(maxH)}, first_order_value + later_revenue_${maxH}d, NULL)) AS all_revenue_per_customer
+  FROM per_customer
+)
+
+SELECT
+  p.*,
+  SAFE_DIVIDE(p.revenue_per_customer_${maxH}d, o.all_revenue_per_customer) AS ltv_index,
+  SAFE_DIVIDE(p.revenue_per_customer_${maxH}d, p.avg_first_order_value) AS ltv_to_first_order_ratio,
+  CASE
+    WHEN p.customers_mature_${maxH}d < ${cfg_extras.first_category.min_customers} THEN 'too few customers yet'
+    WHEN SAFE_DIVIDE(p.revenue_per_customer_${maxH}d, o.all_revenue_per_customer) >= 1.2 AND p.cross_category_share >= 0.5 THEN 'door to the store: use it for acquisition'
+    WHEN SAFE_DIVIDE(p.revenue_per_customer_${maxH}d, o.all_revenue_per_customer) >= 1.2 THEN 'loyal niche: retention, replenishment, subscriptions'
+    WHEN SAFE_DIVIDE(p.revenue_per_customer_${maxH}d, o.all_revenue_per_customer) <= 0.8 THEN 'one and done: sell it, but do not pay acquisition for it'
+    ELSE 'average'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_category AS p
+CROSS JOIN overall AS o

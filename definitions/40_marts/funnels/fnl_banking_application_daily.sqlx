@@ -1,0 +1,89 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.funnels,
+  name: "fnl_banking_application_daily",
+  disabled: !cfg_extras.banking.enabled,
+  description: "Banks, fintechs, insurance, telecom: the 'simulate -> start application -> submit -> approved' funnel of cfg_extras.banking.steps per day, product (credit card, loan, account...), amount band, channel and device, last 400 days. Users per step (a user counts once per step per day), step rates, and the median minutes from the first step to submit. 'Personal loan above R$ 20k: 40% simulate, 4% submit. The amount band is where the trust breaks'",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["product", "session_default_channel_group"],
+    labels: { layer: "marts", domain: "funnels" }
+  },
+  tags: ["marts", "funnels", "daily", "vertical", "banking"],
+  columns: {
+    product: "Value of the cfg_extras.banking.product_param param of the first step of the day ('(not set)' when missing)",
+    amount_band: "Band of the simulated / requested amount (cfg_extras.banking.amount_bands)"
+  }
+}
+
+js {
+  const b = cfg_extras.banking;
+  const steps = b.steps;
+  const stepCase = steps.map((s, i) => `WHEN event_name = ${helpers.sqlString(s.event_name)}${s.condition ? ` AND (${s.condition})` : ""} THEN ${i + 1}`).join("\n      ");
+  const bands = b.amount_bands;
+  const bandCase = bands.map((v, i) => `WHEN amount < ${v} THEN '${String(i + 1).padStart(2, "0")} < ${v}'`).join("\n      ");
+}
+
+WITH
+step_events AS (
+  SELECT
+    event_date,
+    event_ts,
+    user_key,
+    session_key,
+    CASE
+      ${stepCase}
+    END AS step_number,
+    ${ga4.paramStr(b.product_param)} AS product_param,
+    ${ga4.paramNum(b.amount_param)} AS amount_param,
+    COALESCE(session_default_channel_group, 'Unassigned') AS session_default_channel_group
+  FROM ${ref("fct_events")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+    AND ${helpers.inList("event_name", steps.map(s => s.event_name))}
+    ${helpers.noiseFilter()}
+),
+
+user_day AS (
+  SELECT
+    event_date,
+    user_key,
+    ARRAY_AGG(product_param IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS product,
+    MAX(amount_param) AS amount,
+    ARRAY_AGG(session_default_channel_group ORDER BY event_ts LIMIT 1)[OFFSET(0)] AS session_default_channel_group,
+    MAX(step_number) AS deepest_step,
+    MIN(event_ts) AS first_step_ts,
+    MIN(IF(step_number = ${steps.length > 2 ? steps.length - 1 : steps.length}, event_ts, NULL)) AS submit_ts
+  FROM step_events
+  WHERE step_number IS NOT NULL
+  GROUP BY 1, 2
+),
+
+with_context AS (
+  SELECT
+    u.*,
+    CASE
+      WHEN amount IS NULL THEN '(not set)'
+      ${bandCase}
+      ELSE '${String(bands.length + 1).padStart(2, "0")} >= ${bands[bands.length - 1]}'
+    END AS amount_band,
+    COALESCE(d.main_device, '(not set)') AS device_category
+  FROM user_day AS u
+  LEFT JOIN ${ref("dim_users")} AS d USING (user_key)
+)
+
+SELECT
+  event_date,
+  COALESCE(product, '(not set)') AS product,
+  amount_band,
+  session_default_channel_group,
+  device_category,
+  ${steps.map((s, i) => `COUNTIF(deepest_step >= ${i + 1}) AS users_${s.name}`).join(",\n  ")},
+  ${steps.slice(1).map((s, i) => `SAFE_DIVIDE(COUNTIF(deepest_step >= ${i + 2}), COUNTIF(deepest_step >= ${i + 1})) AS rate_${steps[i].name}_to_${s.name}`).join(",\n  ")},
+  SAFE_DIVIDE(COUNTIF(deepest_step >= ${steps.length}), COUNTIF(deepest_step >= 1)) AS rate_end_to_end,
+  APPROX_QUANTILES(TIMESTAMP_DIFF(submit_ts, first_step_ts, MINUTE), 100 IGNORE NULLS)[SAFE_OFFSET(50)] AS median_minutes_to_submit,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_context
+GROUP BY 1, 2, 3, 4, 5

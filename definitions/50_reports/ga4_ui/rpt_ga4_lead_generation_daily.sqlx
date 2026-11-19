@@ -1,0 +1,69 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_lead_generation_daily",
+  description: "GA4 Reports > Business objectives > Generate leads: the Lead acquisition report (leads generated, qualified, converted per first user and session channel and lead source) and the Lead disqualification and conversion report (disqualified / closed not converted with the reason). One long table, lead_stage says the event. Event and param names in cfg_extras.lead_events / lead_params",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["lead_stage", "first_user_default_channel_group"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "leads"],
+  columns: {
+    lead_stage: "generate | qualify | disqualify | working | close_convert | close_unconvert",
+    reason: "disqualified_lead_reason for disqualify, unconvert_lead_reason for close_unconvert, NULL otherwise",
+    users_hll: "HLL sketch of the users, HLL_COUNT.MERGE to count a period"
+  }
+}
+
+js {
+  const leadEvents = cfg_extras.lead_events;
+  const stageCase = Object.keys(leadEvents)
+    .map(stage => `WHEN e.event_name = ${helpers.sqlString(leadEvents[stage])} THEN '${stage}'`)
+    .join("\n      ");
+}
+
+WITH
+lead_events AS (
+  SELECT
+    e.event_date,
+    CASE
+      ${stageCase}
+    END AS lead_stage,
+    e.user_key,
+    e.user_pseudo_id,
+    e.session_key,
+    COALESCE(e.session_default_channel_group, 'Unassigned') AS session_default_channel_group,
+    COALESCE(${ga4.paramStr(cfg_extras.lead_params.source)}, '(not set)') AS lead_source,
+    ${ga4.paramStr(cfg_extras.lead_params.status)} AS lead_status,
+    CASE
+      WHEN e.event_name = ${helpers.sqlString(leadEvents.disqualify)} THEN ${ga4.paramStr(cfg_extras.lead_params.disqualified_reason)}
+      WHEN e.event_name = ${helpers.sqlString(leadEvents.close_unconvert)} THEN ${ga4.paramStr(cfg_extras.lead_params.unconvert_reason)}
+    END AS reason,
+    COALESCE(e.event_value, 0) AS event_value
+  FROM ${ref("fct_events")} AS e
+  WHERE e.event_date >= ${helpers.martWindowStart()}
+    AND ${helpers.inList("e.event_name", Object.values(leadEvents))}
+    ${helpers.noiseFilter("e")}
+)
+
+SELECT
+  l.event_date,
+  l.lead_stage,
+  COALESCE(u.first_channel, '(not set)') AS first_user_default_channel_group,
+  l.session_default_channel_group,
+  l.lead_source,
+  COALESCE(l.lead_status, '(not set)') AS lead_status,
+  COALESCE(l.reason, IF(l.lead_stage IN ('disqualify', 'close_unconvert'), '(not set)', NULL)) AS reason,
+  COUNT(*) AS event_count,
+  COUNT(DISTINCT l.user_pseudo_id) AS total_users,
+  HLL_COUNT.INIT(l.user_pseudo_id) AS users_hll,
+  COUNT(DISTINCT l.session_key) AS sessions,
+  SUM(l.event_value) AS lead_value,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM lead_events AS l
+LEFT JOIN ${ref("dim_users")} AS u ON u.user_key = l.user_key
+GROUP BY 1, 2, 3, 4, 5, 6, 7

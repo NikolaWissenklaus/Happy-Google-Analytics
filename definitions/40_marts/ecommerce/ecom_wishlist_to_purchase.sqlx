@@ -1,0 +1,105 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_wishlist_to_purchase",
+  description: "The wishlist as a demand signal (last 180 days): per product, how many people saved it, how many of them bought it within cfg_extras.wishlist.conversion_window_days days (same user, same item), how many bought a substitute of the same category instead, the median days from saving to buying, the wishlists still open and the price now against the price when they saved it. action says what to do: price drop alert, back in stock push, reminder or nothing",
+  bigquery: {
+    clusterBy: ["item_category"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"],
+  columns: {
+    wishlist_conversion_rate: "Mature adds (older than the window) bought by the same user within the window / mature adds",
+    substitute_rate: "Mature adds where the user bought ANOTHER product of the same category instead (and not the saved one)",
+    open_wishlists: "Adds of the last 180 days not bought (nor a substitute) yet: the demand still waiting",
+    price_change_since_add: "dim_items.current_price / average price when saved - 1. Negative = cheaper now"
+  }
+}
+
+js {
+  const win = cfg_extras.wishlist.conversion_window_days;
+  const botFilter = constants.EXCLUDE_BOTS_IN_MARTS ? "AND NOT COALESCE(is_bot_suspect, FALSE)" : "";
+}
+
+WITH
+adds AS (
+  SELECT
+    user_key,
+    item_id,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    MIN(event_ts) AS added_ts,
+    ARRAY_AGG(price IGNORE NULLS ORDER BY event_ts LIMIT 1)[SAFE_OFFSET(0)] AS price_at_add
+  FROM ${ref("fct_item_interactions")}
+  WHERE event_date >= ${helpers.daysAgo(180)}
+    AND event_name = ${helpers.sqlString(cfg_extras.wishlist.event_name)}
+    AND user_key IS NOT NULL
+    AND item_id IS NOT NULL
+    ${botFilter}
+  GROUP BY 1, 2
+),
+
+purchases AS (
+  SELECT user_key, item_id, item_category, transaction_ts
+  FROM ${ref("fct_transaction_items")}
+  WHERE transaction_date >= ${helpers.daysAgo(180)}
+    AND is_valid_for_revenue
+),
+
+matched AS (
+  SELECT
+    a.user_key,
+    a.item_id,
+    a.item_name,
+    a.item_category,
+    a.added_ts,
+    a.price_at_add,
+    a.added_ts <= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${win} DAY) AS is_mature,
+    MIN(IF(p.item_id = a.item_id, p.transaction_ts, NULL)) AS bought_ts,
+    COALESCE(LOGICAL_OR(p.item_id != a.item_id AND p.item_category = a.item_category), FALSE) AS bought_substitute
+  FROM adds AS a
+  LEFT JOIN purchases AS p
+    ON p.user_key = a.user_key
+    AND p.transaction_ts >= a.added_ts
+    AND p.transaction_ts < TIMESTAMP_ADD(a.added_ts, INTERVAL ${win} DAY)
+  GROUP BY 1, 2, 3, 4, 5, 6, 7
+),
+
+per_item AS (
+  SELECT
+    item_id,
+    ANY_VALUE(item_name) AS item_name,
+    ANY_VALUE(item_category) AS item_category,
+    COUNT(*) AS wishlist_adds,
+    COUNTIF(is_mature) AS mature_adds,
+    COUNTIF(is_mature AND bought_ts IS NOT NULL) AS mature_adds_bought,
+    COUNTIF(is_mature AND bought_ts IS NULL AND bought_substitute) AS mature_adds_substituted,
+    COUNTIF(bought_ts IS NULL AND NOT bought_substitute) AS open_wishlists,
+    APPROX_QUANTILES(TIMESTAMP_DIFF(bought_ts, added_ts, HOUR) / 24, 100 IGNORE NULLS)[SAFE_OFFSET(50)] AS median_days_to_buy,
+    AVG(price_at_add) AS avg_price_at_add
+  FROM matched
+  GROUP BY 1
+  HAVING COUNT(*) >= ${cfg_extras.wishlist.min_adds_per_item}
+)
+
+SELECT
+  p.*,
+  SAFE_DIVIDE(p.mature_adds_bought, p.mature_adds) AS wishlist_conversion_rate,
+  SAFE_DIVIDE(p.mature_adds_substituted, p.mature_adds) AS substitute_rate,
+  i.current_price,
+  SAFE_DIVIDE(i.current_price, p.avg_price_at_add) - 1 AS price_change_since_add,
+  i.days_since_last_seen,
+  p.open_wishlists * COALESCE(i.current_price, p.avg_price_at_add) * COALESCE(SAFE_DIVIDE(p.mature_adds_bought, p.mature_adds), 0) AS expected_revenue_open_wishlists,
+  CASE
+    WHEN SAFE_DIVIDE(i.current_price, p.avg_price_at_add) <= 0.95 AND p.open_wishlists > 0 THEN 'price drop alert: it is cheaper than when they saved it'
+    WHEN i.days_since_last_seen >= 7 AND p.open_wishlists > 0 THEN 'not seen for a week: check stock, then back in stock alert'
+    WHEN SAFE_DIVIDE(p.mature_adds_substituted, p.mature_adds) > SAFE_DIVIDE(p.mature_adds_bought, p.mature_adds) THEN 'people save it and buy another one: check price / reviews / size'
+    WHEN p.median_days_to_buy IS NOT NULL AND p.open_wishlists > 0 THEN 'reminder around the median days to buy'
+    ELSE 'nothing to do'
+  END AS action,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM per_item AS p
+LEFT JOIN ${ref("dim_items")} AS i USING (item_id)

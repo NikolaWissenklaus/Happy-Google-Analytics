@@ -1,0 +1,126 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.ecommerce,
+  name: "ecom_launch_cannibalization",
+  description: "Did the launch grow the category or just steal from its siblings? For every product first seen in the last cfg_extras.launch.lookback_days days: its revenue in the N days after the launch against what the OTHER products of the same category sold in the N days before and after, corrected by how the rest of the store moved in the same period (seasonality, Black Friday...). cannibalized_revenue is what the siblings lost beyond the store trend, incremental_revenue is what the launch really added. 'The new model sold R$ 80k, but R$ 60k of it came out of the old model: the real gain is R$ 20k'",
+  bigquery: {
+    clusterBy: ["item_category"],
+    labels: { layer: "marts", domain: "ecommerce" }
+  },
+  tags: ["marts", "ecommerce", "daily"],
+  columns: {
+    store_trend: "Revenue of the other categories after / before. 1.2 = the whole store grew 20% in the period, so the siblings were expected to grow 20% too",
+    expected_siblings_revenue_after: "Siblings revenue before x store_trend: what they would sell without the launch",
+    cannibalized_revenue: "expected - actual revenue of the siblings, only when positive",
+    cannibalization_rate: "cannibalized_revenue / launch revenue. 0 = pure gain, 1 = every real of the launch came from the siblings",
+    other_launches_same_category: "Other launches of the same category in the same window. > 0 = the effect is shared, read with care"
+  }
+}
+
+js {
+  const w = cfg_extras.launch.window_days;
+}
+
+WITH
+launches AS (
+  SELECT item_id, item_name, item_category, first_seen_date
+  FROM ${ref("dim_items")}
+  WHERE first_seen_date BETWEEN ${helpers.daysAgo(cfg_extras.launch.lookback_days)} AND ${helpers.daysAgo(w)}
+    AND item_category IS NOT NULL
+),
+
+daily_item_sales AS (
+  SELECT
+    transaction_date,
+    item_id,
+    item_category,
+    SUM(COALESCE(quantity, 1)) AS units,
+    SUM(COALESCE(item_revenue, 0)) AS revenue
+  FROM ${ref("fct_transaction_items")}
+  WHERE is_valid_for_revenue
+    AND transaction_date >= ${helpers.daysAgo(cfg_extras.launch.lookback_days + w)}
+  GROUP BY 1, 2, 3
+),
+
+sales_around_launch AS (
+  SELECT
+    l.item_id AS launch_item_id,
+    l.item_name,
+    l.item_category,
+    l.first_seen_date,
+    s.item_id AS sold_item_id,
+    s.item_category AS sold_category,
+    s.transaction_date >= l.first_seen_date AS is_after,
+    s.units,
+    s.revenue
+  FROM launches AS l
+  JOIN daily_item_sales AS s
+    ON s.transaction_date BETWEEN DATE_SUB(l.first_seen_date, INTERVAL ${w} DAY) AND DATE_ADD(l.first_seen_date, INTERVAL ${w - 1} DAY)
+),
+
+per_launch AS (
+  SELECT
+    launch_item_id AS item_id,
+    item_name,
+    item_category,
+    first_seen_date,
+    SUM(IF(sold_item_id = launch_item_id AND is_after, units, 0)) AS launch_units,
+    SUM(IF(sold_item_id = launch_item_id AND is_after, revenue, 0)) AS launch_revenue,
+    SUM(IF(sold_category = item_category AND sold_item_id != launch_item_id AND NOT is_after, revenue, 0)) AS siblings_revenue_before,
+    SUM(IF(sold_category = item_category AND sold_item_id != launch_item_id AND is_after, revenue, 0)) AS siblings_revenue_after,
+    SUM(IF(COALESCE(sold_category, '') != item_category AND NOT is_after, revenue, 0)) AS rest_of_store_revenue_before,
+    SUM(IF(COALESCE(sold_category, '') != item_category AND is_after, revenue, 0)) AS rest_of_store_revenue_after
+  FROM sales_around_launch
+  GROUP BY 1, 2, 3, 4
+),
+
+concurrent_launches AS (
+  SELECT a.item_id, COUNT(b.item_id) AS other_launches_same_category
+  FROM launches AS a
+  LEFT JOIN launches AS b
+    ON b.item_category = a.item_category
+    AND b.item_id != a.item_id
+    AND ABS(DATE_DIFF(b.first_seen_date, a.first_seen_date, DAY)) < ${w}
+  GROUP BY 1
+),
+
+with_expectation AS (
+  SELECT
+    p.*,
+    c.other_launches_same_category,
+    SAFE_DIVIDE(p.rest_of_store_revenue_after, p.rest_of_store_revenue_before) AS store_trend,
+    p.siblings_revenue_before * COALESCE(SAFE_DIVIDE(p.rest_of_store_revenue_after, p.rest_of_store_revenue_before), 1) AS expected_siblings_revenue_after
+  FROM per_launch AS p
+  LEFT JOIN concurrent_launches AS c USING (item_id)
+  WHERE p.launch_units >= ${cfg_extras.launch.min_units_after}
+)
+
+SELECT
+  item_id,
+  item_name,
+  item_category,
+  first_seen_date,
+  ${w} AS window_days,
+  launch_units,
+  launch_revenue,
+  siblings_revenue_before,
+  siblings_revenue_after,
+  store_trend,
+  expected_siblings_revenue_after,
+  GREATEST(expected_siblings_revenue_after - siblings_revenue_after, 0) AS cannibalized_revenue,
+  SAFE_DIVIDE(GREATEST(expected_siblings_revenue_after - siblings_revenue_after, 0), launch_revenue) AS cannibalization_rate,
+  launch_revenue - GREATEST(expected_siblings_revenue_after - siblings_revenue_after, 0) AS incremental_revenue,
+  SAFE_DIVIDE(siblings_revenue_after + launch_revenue, expected_siblings_revenue_after) - 1 AS category_lift_vs_expected,
+  other_launches_same_category,
+  CASE
+    WHEN siblings_revenue_before = 0 THEN 'new category: all incremental'
+    WHEN SAFE_DIVIDE(GREATEST(expected_siblings_revenue_after - siblings_revenue_after, 0), launch_revenue) >= 0.7 THEN 'replacement: the launch moved sales, did not create them'
+    WHEN SAFE_DIVIDE(GREATEST(expected_siblings_revenue_after - siblings_revenue_after, 0), launch_revenue) >= 0.3 THEN 'partial cannibalization'
+    WHEN siblings_revenue_after > expected_siblings_revenue_after * 1.1 THEN 'halo: the siblings sold more too'
+    ELSE 'incremental'
+  END AS verdict,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM with_expectation

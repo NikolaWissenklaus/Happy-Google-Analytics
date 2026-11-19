@@ -1,0 +1,79 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_user_acquisition_cohort",
+  description: "GA4 Reports > Acquisition > User acquisition cohort: users acquired per month and first user default channel group, and what they did in the months after (month 0..12): active users, retention, purchasers, revenue and the cumulative revenue per acquired user. 'Paid Social brings a lot of people in January, how many are still around in April and how much did they spend?'",
+  bigquery: {
+    clusterBy: ["first_user_default_channel_group"],
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "retention"],
+  columns: {
+    cohort_month: "Month of the first visit of the user (dim_users.first_seen_date)",
+    month_number: "0 = the acquisition month, 1 = the next month...",
+    new_users: "Size of the cohort (users first seen in the month through the channel)",
+    retention_rate: "active_users / new_users",
+    cumulative_revenue_per_user: "Revenue of the cohort from month 0 to month_number / new_users (the LTV curve)",
+    is_complete_month: "FALSE for the current month (still growing, do not compare)"
+  }
+}
+
+WITH
+cohort_users AS (
+  SELECT
+    user_key,
+    DATE_TRUNC(first_seen_date, MONTH) AS cohort_month,
+    COALESCE(first_channel, '(not set)') AS first_user_default_channel_group
+  FROM ${ref("dim_users")}
+  WHERE first_seen_date >= DATE_TRUNC(DATE_SUB(${helpers.today()}, INTERVAL 12 MONTH), MONTH)
+),
+
+cohort_sizes AS (
+  SELECT cohort_month, first_user_default_channel_group, COUNT(*) AS new_users
+  FROM cohort_users
+  GROUP BY 1, 2
+),
+
+activity_by_month AS (
+  SELECT
+    c.cohort_month,
+    c.first_user_default_channel_group,
+    DATE_DIFF(DATE_TRUNC(d.activity_date, MONTH), c.cohort_month, MONTH) AS month_number,
+    COUNT(DISTINCT d.user_key) AS active_users,
+    COUNT(DISTINCT IF(d.transactions > 0, d.user_key, NULL)) AS purchasers,
+    SUM(d.sessions) AS sessions,
+    SUM(d.engagement_time_sec) AS engagement_time_sec,
+    SUM(d.transactions) AS transactions,
+    SUM(d.revenue) AS revenue
+  FROM cohort_users AS c
+  JOIN ${ref("fct_user_daily")} AS d USING (user_key)
+  WHERE d.activity_date >= DATE_TRUNC(DATE_SUB(${helpers.today()}, INTERVAL 12 MONTH), MONTH)
+  GROUP BY 1, 2, 3
+)
+
+SELECT
+  a.cohort_month,
+  a.first_user_default_channel_group,
+  a.month_number,
+  s.new_users,
+  a.active_users,
+  a.purchasers,
+  a.sessions,
+  a.engagement_time_sec,
+  a.transactions,
+  a.revenue,
+  SAFE_DIVIDE(a.active_users, s.new_users) AS retention_rate,
+  SAFE_DIVIDE(a.purchasers, s.new_users) AS purchaser_rate,
+  SAFE_DIVIDE(a.engagement_time_sec, a.active_users) AS engagement_sec_per_active_user,
+  SAFE_DIVIDE(
+    SUM(a.revenue) OVER (PARTITION BY a.cohort_month, a.first_user_default_channel_group ORDER BY a.month_number),
+    s.new_users
+  ) AS cumulative_revenue_per_user,
+  DATE_ADD(a.cohort_month, INTERVAL a.month_number + 1 MONTH) <= ${helpers.today()} AS is_complete_month,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM activity_by_month AS a
+JOIN cohort_sizes AS s USING (cohort_month, first_user_default_channel_group)
+WHERE a.month_number BETWEEN 0 AND 12

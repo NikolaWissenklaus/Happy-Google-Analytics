@@ -84,3 +84,25 @@ difference is above ~2-3% for sessions, look at `docs/troubleshooting.md`.
 UA formulas kept on purpose: bounce = one page without interaction events, avg time on page =
 time on page / (pageviews - exits), unique pageviews = sessions with the page, unique events =
 sessions with the event.
+
+## GA4 (ga4_reports), extras pack
+
+Added later (`docs/extras.md`), same rules of the replicas above.
+
+| GA4 UI | table |
+|---|---|
+| Acquisition > Traffic acquisition (session primary channel group) | `rpt_ga4_custom_channel_acquisition_daily` |
+| Acquisition > Traffic acquisition (manual source / medium / campaign / term / ad content) | `rpt_ga4_manual_campaigns_daily` |
+| Acquisition > Google Ads campaigns | `rpt_ga4_google_ads_campaigns_daily` |
+| Acquisition > User acquisition cohort | `rpt_ga4_user_acquisition_cohort` |
+| Engagement > Events (enhanced measurement parameters) | `rpt_ga4_enhanced_measurement_daily` |
+| Monetization > Overview | `rpt_ga4_monetization_overview_daily` |
+| Monetization > Ecommerce purchases (item category / brand / item list) | `rpt_ga4_item_categories_daily` |
+| Business objectives > Generate leads (Lead acquisition, Lead disqualification and conversion) | `rpt_ga4_lead_generation_daily` |
+| Tech > Tech details (device brand / model) | `rpt_ga4_device_models_daily` |
+| Retention (session number bands) | `rpt_ga4_new_established_daily` |
+| Explorations > Free form with Hostname | `rpt_ga4_hostnames_daily` |
+| Explorations > Free form with Transaction ID | `rpt_ga4_transactions` |
+| Advertising > Performance > All channels | `rpt_ga4_advertising_all_channels_daily` |
+| Search Console > Queries | `rpt_ga4_search_console_queries_daily` (`enable_search_console`) |
+| Search Console > Google organic search traffic | `rpt_ga4_google_organic_search_traffic` (`enable_search_console`) |

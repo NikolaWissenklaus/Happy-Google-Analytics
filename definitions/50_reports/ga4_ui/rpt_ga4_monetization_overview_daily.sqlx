@@ -1,0 +1,103 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "table",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_monetization_overview_daily",
+  description: "GA4 Reports > Monetization > Overview, the cards per day: total revenue (purchases + in-app + ads), purchase revenue, total purchasers, first time purchasers, ARPU, ARPPU, average purchase revenue, refunds and the share of revenue of first purchases. Bots kept like the UI, plus the 'valid' revenue of the project next to it (is_valid_for_revenue) so the gap is visible",
+  bigquery: {
+    partitionBy: "metric_date",
+    labels: { layer: "reports", flavor: "ga4" }
+  },
+  tags: ["reports", "ga4_report", "daily", "ecommerce"],
+  columns: {
+    total_revenue: "GA4 total revenue = purchase revenue + in-app purchase revenue + publisher ad revenue",
+    purchase_revenue: "Revenue of every purchase GA4 counts (tests and outliers included, like the UI)",
+    valid_purchase_revenue: "The official revenue of the project (is_valid_for_revenue)",
+    arpu: "Average revenue per active user (total revenue / active users)",
+    arppu: "Average revenue per paying user (total revenue / purchasers)",
+    purchasers_hll: "HLL sketch of the purchasers, HLL_COUNT.MERGE to count a period",
+    active_users_hll: "HLL sketch of the active users, HLL_COUNT.MERGE to count a period"
+  }
+}
+
+WITH
+users_side AS (
+  SELECT
+    session_date AS metric_date,
+    COUNT(DISTINCT IF(${metrics.activeUser()}, user_pseudo_id, NULL)) AS active_users,
+    HLL_COUNT.INIT(IF(${metrics.activeUser()}, user_pseudo_id, NULL)) AS active_users_hll
+  FROM ${ref("fct_sessions")}
+  WHERE session_date >= ${helpers.martWindowStart()}
+  GROUP BY 1
+),
+
+purchases_side AS (
+  SELECT
+    transaction_date AS metric_date,
+    COUNT(*) AS ecommerce_purchases,
+    COUNT(DISTINCT user_pseudo_id) AS total_purchasers,
+    HLL_COUNT.INIT(user_pseudo_id) AS purchasers_hll,
+    COUNT(DISTINCT IF(is_first_purchase, user_pseudo_id, NULL)) AS first_time_purchasers,
+    SUM(COALESCE(revenue, 0)) AS purchase_revenue,
+    SUM(IF(is_valid_for_revenue, revenue, 0)) AS valid_purchase_revenue,
+    SUM(IF(is_valid_for_revenue AND is_first_purchase, revenue, 0)) AS first_purchase_revenue,
+    SUM(COALESCE(shipping_value, 0)) AS shipping_amount,
+    SUM(COALESCE(tax_value, 0)) AS tax_amount,
+    SUM(COALESCE(refunded_value, 0)) AS refund_amount,
+    SUM(COALESCE(item_quantity, 0)) AS items_purchased
+  FROM ${ref("fct_transactions")}
+  WHERE transaction_date >= ${helpers.martWindowStart()}
+  GROUP BY 1
+),
+
+app_and_ads_side AS (
+  SELECT
+    event_date AS metric_date,
+    SUM(IF(event_name = 'in_app_purchase', COALESCE(event_value, 0), 0)) AS in_app_purchase_revenue,
+    SUM(IF(event_name = 'ad_impression', COALESCE(event_value, 0), 0)) AS publisher_ad_revenue
+  FROM ${ref("stg_ga4__events")}
+  WHERE event_date >= ${helpers.martWindowStart()}
+    AND event_name IN ('in_app_purchase', 'ad_impression')
+    ${helpers.noiseFilter()}
+  GROUP BY 1
+),
+
+joined AS (
+  SELECT
+    u.metric_date,
+    u.active_users,
+    u.active_users_hll,
+    COALESCE(p.ecommerce_purchases, 0) AS ecommerce_purchases,
+    COALESCE(p.total_purchasers, 0) AS total_purchasers,
+    p.purchasers_hll,
+    COALESCE(p.first_time_purchasers, 0) AS first_time_purchasers,
+    COALESCE(p.purchase_revenue, 0) AS purchase_revenue,
+    COALESCE(p.valid_purchase_revenue, 0) AS valid_purchase_revenue,
+    COALESCE(p.first_purchase_revenue, 0) AS first_purchase_revenue,
+    COALESCE(p.shipping_amount, 0) AS shipping_amount,
+    COALESCE(p.tax_amount, 0) AS tax_amount,
+    COALESCE(p.refund_amount, 0) AS refund_amount,
+    COALESCE(p.items_purchased, 0) AS items_purchased,
+    COALESCE(a.in_app_purchase_revenue, 0) AS in_app_purchase_revenue,
+    COALESCE(a.publisher_ad_revenue, 0) AS publisher_ad_revenue
+  FROM users_side AS u
+  LEFT JOIN purchases_side AS p USING (metric_date)
+  LEFT JOIN app_and_ads_side AS a USING (metric_date)
+)
+
+SELECT
+  *,
+  purchase_revenue + in_app_purchase_revenue + publisher_ad_revenue AS total_revenue,
+  SAFE_DIVIDE(purchase_revenue + in_app_purchase_revenue + publisher_ad_revenue, active_users) AS arpu,
+  SAFE_DIVIDE(purchase_revenue + in_app_purchase_revenue + publisher_ad_revenue, total_purchasers) AS arppu,
+  SAFE_DIVIDE(purchase_revenue, active_users) AS average_purchase_revenue_per_user,
+  SAFE_DIVIDE(purchase_revenue, ecommerce_purchases) AS average_purchase_revenue,
+  SAFE_DIVIDE(first_time_purchasers, total_purchasers) AS first_time_purchaser_share,
+  SAFE_DIVIDE(first_purchase_revenue, valid_purchase_revenue) AS first_purchase_revenue_share,
+  SAFE_DIVIDE(total_purchasers, active_users) AS purchaser_conversion_rate,
+  SAFE_DIVIDE(refund_amount, purchase_revenue) AS refund_rate,
+  purchase_revenue - valid_purchase_revenue AS revenue_ga4_ui_minus_valid,
+  CURRENT_TIMESTAMP() AS loaded_at
+FROM joined

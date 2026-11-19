@@ -1,0 +1,45 @@
+-- author: Francisco Lucas / Nikola Wissenklaus / Chico
+-- v1: 18/11/2026
+
+config {
+  type: "view",
+  schema: constants.SCHEMAS.reports_ga4,
+  name: "rpt_ga4_transactions",
+  description: "GA4 Explorations > free form with Transaction ID: one row per transaction with the GA4 column names (purchase revenue, shipping, tax, refund, items, order coupon, payment type, first time purchase) and the session source / medium / channel, plus the flags of the project (test, outlier, deferred payment, times sent) so the 'why is this order in GA4 and not in the ERP' talk is one query",
+  tags: ["reports", "ga4_report", "daily", "ecommerce"]
+}
+
+SELECT
+  transaction_date AS date,
+  transaction_ts,
+  transaction_id,
+  revenue AS purchase_revenue,
+  shipping_value AS shipping_amount,
+  tax_value AS tax_amount,
+  refunded_value AS refund_amount,
+  net_revenue,
+  item_quantity AS items_purchased,
+  unique_items,
+  coupon AS order_coupon,
+  payment_type,
+  shipping_tier,
+  currency,
+  is_first_purchase AS is_first_time_purchase,
+  order_number,
+  days_since_previous_order,
+  session_source,
+  session_medium,
+  session_campaign,
+  session_default_channel_group,
+  landing_page_path AS landing_page,
+  device_category,
+  geo_uf AS region_uf,
+  geo_city AS city,
+  times_sent,
+  is_test_transaction,
+  is_deferred_payment,
+  is_revenue_outlier,
+  has_full_refund,
+  is_bot_suspect,
+  is_valid_for_revenue
+FROM ${ref("fct_transactions")}
